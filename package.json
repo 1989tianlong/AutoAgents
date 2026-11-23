@@ -1,7 +1,7 @@
 {
   "name": "autoagents",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test:ui": "node tests/ui/sessions.e2e.mjs",
-    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+    "test:rust": "cargo test --workspace"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.5",

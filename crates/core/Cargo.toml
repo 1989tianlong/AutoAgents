@@ -1,0 +1,35 @@
+[package]
+name = "autoagents-core"
+description = "AutoAgents 核心库：Agent 适配、会话执行、节点服务与加密传输（桌面应用与 agentd 共用）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+libc.workspace = true
+futures-util.workspace = true
+sysinfo.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+rcgen.workspace = true
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+subtle.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

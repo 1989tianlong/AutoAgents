@@ -1,25 +1,50 @@
-mod adapters;
 mod chat;
 mod db;
 mod discovery;
 mod github;
 mod models;
+mod nodes;
+mod nodes_remote;
 mod tasks;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use tokio::sync::mpsc;
 
-/// 全局应用状态：SQLite 连接、GitHub 连接状态、运行中的 Agent 会话。
+/// 全局应用状态：SQLite 连接、GitHub 连接状态、本机的机器侧服务、运行中的会话。
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub gh: Mutex<Option<github::GithubState>>,
-    /// 运行中的 Agent 子进程：会话 id → 子进程
-    running: Mutex<HashMap<i64, tokio::process::Child>>,
-    /// 已请求停止的会话
-    cancelled: Mutex<HashSet<i64>>,
+    /// 本机的机器侧服务：与远程节点上 agentd 提供的是同一个服务
+    pub service: Arc<autoagents_core::service::Service>,
+    /// 对话事件总线：本机与各节点的过程事件都汇到这里，按会话归档
+    pub events: mpsc::UnboundedSender<chat::NodeEvent>,
     /// 运行中的一轮对话及其实时内容（界面据此校正状态）
-    live: Mutex<HashMap<i64, chat::LiveTurn>>,
+    pub live: Mutex<HashMap<i64, chat::LiveTurn>>,
+    /// 把会话事件推给界面
+    pub sink: Arc<dyn chat::Sink>,
+}
+
+impl AppState {
+    /// 组装状态并启动事件归档任务。
+    pub fn new(
+        db: rusqlite::Connection,
+        service: Arc<autoagents_core::service::Service>,
+        sink: Arc<dyn chat::Sink>,
+    ) -> Arc<Self> {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Self {
+            db: Mutex::new(db),
+            gh: Mutex::new(None),
+            service,
+            events,
+            live: Mutex::new(HashMap::new()),
+            sink,
+        });
+        chat::dispatch(state.clone(), events_rx);
+        state
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -30,13 +55,18 @@ pub fn run() {
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
             let conn = db::init(&dir.join("autoagents.db"))?;
-            app.manage(Arc::new(AppState {
-                db: Mutex::new(conn),
-                gh: Mutex::new(None),
-                running: Mutex::new(HashMap::new()),
-                cancelled: Mutex::new(HashSet::new()),
-                live: Mutex::new(HashMap::new()),
-            }));
+            let service = autoagents_core::service::Service::new(
+                autoagents_core::service::ServiceOptions {
+                    flavor: "桌面应用内置",
+                    ..Default::default()
+                },
+            );
+            let state = AppState::new(
+                conn,
+                service,
+                Arc::new(chat::TauriSink(app.handle().clone())),
+            );
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

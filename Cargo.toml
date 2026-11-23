@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/node", "src-tauri"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0"
+authors = ["1989tianlong"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "macros", "io-util", "sync", "net", "fs", "rt"] }
+toml = { version = "1", features = ["preserve_order"] }
+libc = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.30"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+webpki-roots = "1"
+rcgen = "0.14"
+x25519-dalek = "3"
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
+zeroize = "1"
+base64 = "0.22"
+subtle = "2"
+url = "2"
+sysinfo = "0.40"
+
+# 优化参考：https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,24 +1,19 @@
-//! 托管会话：以无头模式驱动 CLI Agent，流式输出到前端并落库。
+//! 托管会话（控制端）：把一轮对话发给某台机器上的 Agent，流式输出到前端并落库。
 //!
-//! 各 Agent 的命令与协议差异见 `adapters`；一轮对话的流程是统一的：
-//! 拉起子进程 → 逐行解析 → 推送 `chat-event` → 结束后落库。
+//! 本机与远程节点走同一条路：请求经 [`crate::nodes`] 送到机器侧的服务，
+//! 过程事件汇入事件总线，由 [`dispatch`] 按会话归档：
+//! 推送 `chat-event` → 留一份实时快照 → 结束后落库。
 
-use crate::adapters::{self, TurnEvent, TurnState, TurnSpec};
+use autoagents_core::adapters;
+use autoagents_core::runner::{TurnEvent, TurnParams};
+use crate::nodes;
 use crate::AppState;
 use rusqlite::params;
 use serde::Serialize;
-use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
-
-/// 进程异常退出时，附在错误信息里的 stderr 长度上限（字符数）
-const STDERR_TAIL_CHARS: usize = 600;
-
-/// 进程自行退出（保存会话、关闭拉起的子进程）的等待时间，超过就连同进程组一起结束
-const EXIT_GRACE: Duration = Duration::from_secs(5);
+use tokio::sync::mpsc;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +23,8 @@ pub struct ChatSession {
     pub title: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
+    /// 会话所在机器的节点 id
+    pub node_id: String,
     pub created_at: String,
 }
 
@@ -41,10 +38,12 @@ pub struct ChatMessage {
     pub cost_usd: Option<f64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// 这一轮从发出到结束的耗时
+    pub duration_ms: Option<i64>,
     pub created_at: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum ChatEvent {
     #[serde(rename = "delta")]
@@ -78,14 +77,66 @@ pub enum ChatEvent {
     },
 }
 
-/// 一轮对话的全部输入
+impl ChatEvent {
+    pub fn session_id(&self) -> i64 {
+        match self {
+            ChatEvent::Delta { session_id, .. }
+            | ChatEvent::Notice { session_id, .. }
+            | ChatEvent::Replace { session_id, .. }
+            | ChatEvent::Done { session_id, .. }
+            | ChatEvent::Error { session_id, .. } => *session_id,
+        }
+    }
+}
+
+/// 把事件送到界面。运行时是 Tauri 的事件推送，测试里换成收集器。
+pub trait Sink: Send + Sync + 'static {
+    fn send(&self, event: ChatEvent);
+}
+
+/// Tauri 的事件推送：所有窗口都会收到
+pub struct TauriSink(pub AppHandle);
+
+impl Sink for TauriSink {
+    fn send(&self, event: ChatEvent) {
+        if let Err(e) = self.0.emit("chat-event", event) {
+            eprintln!("[chat] 推送事件失败：{e}");
+        }
+    }
+}
+
+/// 事件总线上的一则对话事件：来自哪台机器、内容是什么
+pub struct NodeEvent {
+    pub node: String,
+    pub event: TurnEvent,
+}
+
+/// 一轮对话的输入
 struct Turn {
-    session_id: i64,
     adapter: String,
     resume: Option<String>,
     model: Option<String>,
-    workdir: PathBuf,
+    /// 机器上的路径，原样回传（可能是 `~` 开头）
+    workdir: String,
     prompt: String,
+}
+
+fn turn_params(session_id: i64, turn: &Turn) -> TurnParams {
+    TurnParams {
+        turn_id: session_id.to_string(),
+        adapter: turn.adapter.clone(),
+        model: turn.model.clone(),
+        resume: turn.resume.clone(),
+        workdir: Some(turn.workdir.clone()),
+        prompt: turn.prompt.clone(),
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct Usage {
+    cost_usd: Option<f64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
 }
 
 fn insert_message(
@@ -93,19 +144,26 @@ fn insert_message(
     session_id: i64,
     role: &str,
     content: &str,
-    cost_usd: Option<f64>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
+    usage: Usage,
+    duration_ms: Option<i64>,
 ) {
     let db = state.db.lock().unwrap();
     let _ = db.execute(
-        "INSERT INTO messages (session_id, role, content, cost_usd, input_tokens, output_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![session_id, role, content, cost_usd, input_tokens, output_tokens],
+        "INSERT INTO messages (session_id, role, content, cost_usd, input_tokens, output_tokens, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            session_id,
+            role,
+            content,
+            usage.cost_usd,
+            usage.input_tokens,
+            usage.output_tokens,
+            duration_ms
+        ],
     );
 }
 
-fn emit(app: &AppHandle, state: &AppState, session_id: i64, event: ChatEvent) {
+fn emit(state: &AppState, session_id: i64, event: ChatEvent) {
     // 同时留一份在内存里：窗口不可见时推送事件可能没有送达，界面会据此校正状态
     if let Ok(mut live) = state.live.lock() {
         if let Some(turn) = live.get_mut(&session_id) {
@@ -117,16 +175,13 @@ fn emit(app: &AppHandle, state: &AppState, session_id: i64, event: ChatEvent) {
             }
         }
     }
-    if let Err(e) = app.emit("chat-event", event) {
-        eprintln!("[chat] 推送事件失败：{e}");
-    }
+    state.sink.send(event);
 }
 
-/// 本轮失败：写入系统消息并通知前端
-fn fail(app: &AppHandle, state: &AppState, session_id: i64, message: &str) {
-    insert_message(state, session_id, "system", message, None, None, None);
+/// 本轮以失败收尾：写入系统消息、通知前端、从运行中摘掉
+fn fail(state: &AppState, session_id: i64, message: &str) {
+    insert_message(state, session_id, "system", message, Usage::default(), None);
     emit(
-        app,
         state,
         session_id,
         ChatEvent::Error {
@@ -134,6 +189,7 @@ fn fail(app: &AppHandle, state: &AppState, session_id: i64, message: &str) {
             message: message.to_string(),
         },
     );
+    state.live.lock().unwrap().remove(&session_id);
 }
 
 /// 首次拿到外部会话标识就落库：应用中途退出后，会话仍然可以续聊
@@ -145,229 +201,262 @@ fn remember_ref(state: &AppState, session_id: i64, external_ref: &str) {
     );
 }
 
-/// 校验工作目录：支持 `~` 前缀；留空用主目录；目录必须存在
-fn resolve_workdir(input: Option<&str>) -> Result<PathBuf, String> {
-    let home = crate::discovery::home_dir();
-    let dir = match input.map(str::trim).filter(|s| !s.is_empty()) {
-        None => home,
-        Some(s) => match s.strip_prefix('~') {
-            Some(rest) => home.join(rest.trim_start_matches('/')),
-            None => PathBuf::from(s),
-        },
-    };
-    if dir.is_dir() {
-        Ok(dir)
-    } else {
-        Err(format!("工作目录不存在：{}", dir.display()))
-    }
-}
-
-/// 执行一轮对话：无论成败，结束后把它从「运行中」摘掉。
-async fn run_turn(app: AppHandle, state: Arc<AppState>, turn: Turn) {
-    let session_id = turn.session_id;
-    run_turn_inner(app, state.clone(), turn).await;
-    state.live.lock().unwrap().remove(&session_id);
-}
-
-/// 拉起 Agent 进程，逐行解析输出，流式推送到前端，结束后落库。
-async fn run_turn_inner(app: AppHandle, state: Arc<AppState>, turn: Turn) {
-    let session_id = turn.session_id;
-    let Some(bin) = adapters::resolve_binary(&turn.adapter) else {
-        fail(
-            &app,
-            &state,
-            session_id,
-            &format!(
-                "未找到 {} 的可执行文件，请确认已安装后到 Agents 页重新扫描",
-                turn.adapter
-            ),
-        );
-        return;
-    };
-    let spec = TurnSpec {
-        adapter: &turn.adapter,
-        bin: &bin,
-        prompt: &turn.prompt,
-        model: turn.model.as_deref(),
-        resume: turn.resume.as_deref(),
-        workdir: &turn.workdir,
-    };
-    let mut child = match adapters::build_command(&spec).spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            fail(
-                &app,
-                &state,
-                session_id,
-                &format!("启动 {} 失败：{e}", bin.display()),
-            );
-            return;
+/// 归档一则对话事件：只处理仍在运行、且正是这台机器上那一轮的事件
+/// （断线重连后，旧连接迟到的事件会被丢弃）。
+fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) {
+    let started = {
+        let live = state.live.lock().unwrap();
+        match live.get(&session_id) {
+            Some(turn) if turn.node == node => turn.started,
+            _ => return,
         }
     };
-    let stderr = child.stderr.take();
-    let stdout = child.stdout.take();
-
-    // 登记为运行中，供 chat_stop 终止；停止请求可能先于登记到达
-    if state.cancelled.lock().unwrap().contains(&session_id) {
-        let _ = child.start_kill();
+    match event {
+        TurnEvent::Session { r#ref, .. } => remember_ref(state, session_id, &r#ref),
+        TurnEvent::Delta { text, .. } => {
+            emit(state, session_id, ChatEvent::Delta { session_id, text })
+        }
+        TurnEvent::Notice { text, .. } => {
+            emit(state, session_id, ChatEvent::Notice { session_id, text })
+        }
+        TurnEvent::System { message, .. } => {
+            insert_message(state, session_id, "system", &message, Usage::default(), None)
+        }
+        TurnEvent::Failed { message, .. } => fail(state, session_id, &message),
+        TurnEvent::Finished {
+            text,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            ..
+        } => {
+            let usage = Usage {
+                cost_usd,
+                input_tokens,
+                output_tokens,
+            };
+            insert_message(
+                state,
+                session_id,
+                "assistant",
+                &text,
+                usage,
+                Some(started.elapsed().as_millis() as i64),
+            );
+            emit(
+                state,
+                session_id,
+                ChatEvent::Replace {
+                    session_id,
+                    text: text.clone(),
+                },
+            );
+            emit(
+                state,
+                session_id,
+                ChatEvent::Done {
+                    session_id,
+                    cost_usd: usage.cost_usd,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            );
+            state.live.lock().unwrap().remove(&session_id);
+        }
     }
-    state.running.lock().unwrap().insert(session_id, child);
+}
 
-    // 持续排空 stderr（写满缓冲区会阻塞子进程），并保留尾部用于异常诊断
-    let stderr_tail = Arc::new(Mutex::new(String::new()));
-    if let Some(stderr) = stderr {
-        let tail = Arc::clone(&stderr_tail);
-        tauri::async_runtime::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let mut tail = tail.lock().unwrap();
-                        tail.push_str(&String::from_utf8_lossy(&buf));
-                        let excess = tail.chars().count().saturating_sub(STDERR_TAIL_CHARS);
-                        if excess > 0 {
-                            let cut = tail
-                                .char_indices()
-                                .nth(excess)
-                                .map_or(tail.len(), |(i, _)| i);
-                            tail.drain(..cut);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    let mut st = TurnState::default();
-    let mut failure: Option<String> = None;
-    if let Some(stdout) = stdout {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+/// 事件总线 → 会话归档。应用启动时启动一个，常驻。
+pub fn dispatch(state: Arc<AppState>, mut rx: mpsc::UnboundedReceiver<NodeEvent>) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(NodeEvent { node, event }) = rx.recv().await {
+            let Ok(session_id) = event.turn_id().parse::<i64>() else {
                 continue;
             };
-            let mut events = Vec::new();
-            adapters::parse_line(&turn.adapter, &v, &mut st, &mut events);
-            for event in events {
-                match event {
-                    TurnEvent::Session(id) => remember_ref(&state, session_id, &id),
-                    TurnEvent::Delta(text) => {
-                        emit(&app, &state, session_id, ChatEvent::Delta { session_id, text })
-                    }
-                    TurnEvent::Notice(text) => {
-                        emit(&app, &state, session_id, ChatEvent::Notice { session_id, text })
-                    }
-                    TurnEvent::Failed(message) => failure = Some(message),
-                }
-            }
-            // 终态已到：不必等进程退出（它拉起的子进程可能还占着输出管道）
-            if st.finished {
-                break;
-            }
-        }
-    }
-
-    // 收回子进程：被 chat_stop 取走时已经终止
-    let child = state.running.lock().unwrap().remove(&session_id);
-    let cancelled = state.cancelled.lock().unwrap().remove(&session_id);
-
-    if let Some(message) = failure {
-        fail(&app, &state, session_id, &message);
-        reap(child);
-        return;
-    }
-    if st.final_text.is_empty() {
-        let mut message = if cancelled {
-            "已停止".to_string()
-        } else {
-            "Agent 没有返回任何内容".to_string()
-        };
-        let stderr = stderr_tail.lock().unwrap().clone();
-        if !cancelled && !stderr.is_empty() {
-            message.push_str(&format!("：{}", adapters::clip(&stderr, 300)));
-        }
-        fail(&app, &state, session_id, &message);
-        reap(child);
-        return;
-    }
-    if !st.finished && !cancelled {
-        // 没等到终态输出就断了：看进程是怎么退的，异常退出时提醒输出可能不完整
-        let mut child = child;
-        let status = match child.as_mut() {
-            Some(child) => child.wait().await.ok(),
-            None => None,
-        };
-        if status.is_some_and(|status| !status.success()) {
-            let code = status
-                .and_then(|status| status.code())
-                .map_or_else(|| "信号".to_string(), |c| c.to_string());
-            insert_message(
-                &state,
-                session_id,
-                "system",
-                &format!("Agent 进程以状态 {code} 退出，以上输出可能不完整"),
-                None,
-                None,
-                None,
-            );
-        }
-        complete(&app, &state, session_id, &st);
-        return;
-    }
-    // 终态已到（或已停止）：内容是完整的，直接收尾。Agent 自己的收尾（保存会话、
-    // 关掉拉起的 MCP 服务）可能要好几秒，放到后台等，不拖住界面。
-    complete(&app, &state, session_id, &st);
-    reap(child);
-}
-
-/// 本轮正常结束：回答落库，用完整文本校正流式预览后通知前端。
-fn complete(app: &AppHandle, state: &AppState, session_id: i64, st: &TurnState) {
-    insert_message(
-        state,
-        session_id,
-        "assistant",
-        &st.final_text,
-        st.cost_usd,
-        st.input_tokens,
-        st.output_tokens,
-    );
-    emit(
-        app,
-        state,
-        session_id,
-        ChatEvent::Replace {
-            session_id,
-            text: st.final_text.clone(),
-        },
-    );
-    emit(
-        app,
-        state,
-        session_id,
-        ChatEvent::Done {
-            session_id,
-            cost_usd: st.cost_usd,
-            input_tokens: st.input_tokens,
-            output_tokens: st.output_tokens,
-        },
-    );
-}
-
-/// 后台回收 Agent 进程：给它一点时间自行退出（保存会话、关闭拉起的子进程），
-/// 超时就连同整个进程组一起结束。
-fn reap(child: Option<tokio::process::Child>) {
-    let Some(mut child) = child else {
-        return;
-    };
-    tauri::async_runtime::spawn(async move {
-        if tokio::time::timeout(EXIT_GRACE, child.wait()).await.is_err() {
-            adapters::kill_process_group(&mut child);
-            let _ = child.wait().await;
+            handle(&state, session_id, &node, event);
         }
     });
+}
+
+/// 登记为运行中并发出这一轮。先登记再启动：此后任何一次状态查询都能看到这个会话，
+/// 事件总线上的事件也都有地方归档。之后的收尾由事件总线上的终态事件触发。
+fn spawn_turn(state: &Arc<AppState>, session_id: i64, turn: Turn, node: String) {
+    state.live.lock().unwrap().insert(
+        session_id,
+        LiveTurn {
+            node: node.clone(),
+            ..Default::default()
+        },
+    );
+    let state = Arc::clone(state);
+    tauri::async_runtime::spawn(async move {
+        let params = serde_json::to_value(turn_params(session_id, &turn)).expect("序列化对话参数");
+        // 没能启动的（机器掉线、目录被删……）：这一轮以失败收尾
+        if let Err(e) = nodes::call(&state, &node, "turn.start", &params).await {
+            fail(&state, session_id, &e);
+        }
+    });
+}
+
+/// 开启新会话并发送第一条消息。model 为空时沿用 Agent 自身配置的默认模型；
+/// node_id 为空时在本机执行。
+pub async fn start(
+    state: &Arc<AppState>,
+    node_id: Option<&str>,
+    adapter: &str,
+    model: Option<&str>,
+    workdir: Option<&str>,
+    prompt: &str,
+) -> Result<i64, String> {
+    if !adapters::is_supported(adapter) {
+        return Err(format!("「{adapter}」的会话适配尚未实现"));
+    }
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("消息不能为空".into());
+    }
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let workdir = workdir
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty());
+    let node = nodes::normalize(node_id);
+    // 机器在线、目录存在才建会话，免得留下一开口就失败的记录
+    nodes::ensure_ready(state, &node, workdir.as_deref()).await?;
+    // 工作目录留空时由机器侧取它的主目录（`~` 指的是那台机器上的主目录）
+    let workdir = workdir.unwrap_or_else(|| "~".to_string());
+    let title: String = prompt.chars().take(24).collect();
+    let sid = {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO sessions (adapter, title, model, workdir, node_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![adapter, title, model, workdir, node],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', ?2)",
+            params![id, prompt],
+        )
+        .map_err(|e| e.to_string())?;
+        id
+    };
+    let turn = Turn {
+        adapter: adapter.to_string(),
+        resume: None,
+        model,
+        workdir,
+        prompt,
+    };
+    spawn_turn(state, sid, turn, node);
+    Ok(sid)
+}
+
+/// 在已有会话中续聊：沿用该会话的机器、Agent、模型与工作目录。
+pub async fn send(state: &Arc<AppState>, session_id: i64, prompt: &str) -> Result<(), String> {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("消息不能为空".into());
+    }
+    let (adapter, resume, model, workdir, node) = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT adapter, external_ref, model, workdir, node_id FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(|_| format!("会话不存在：#{session_id}"))?
+    };
+    if !adapters::is_supported(&adapter) {
+        return Err("该会话的 Agent 暂不支持续聊".into());
+    }
+    let node = nodes::normalize(node.as_deref());
+    // 升级前创建的会话没有记录工作目录，留空让机器侧取它的主目录
+    let workdir = workdir.unwrap_or_default();
+    // 同一会话同一时间只跑一轮：先登记占住，后面任何一步失败再摘掉
+    {
+        let mut live = state.live.lock().unwrap();
+        if live.contains_key(&session_id) {
+            return Err("该会话上一轮还在运行，请等它结束或先停止".into());
+        }
+        live.insert(
+            session_id,
+            LiveTurn {
+                node: node.clone(),
+                ..Default::default()
+            },
+        );
+    }
+    let undo = |state: &AppState| state.live.lock().unwrap().remove(&session_id);
+    if let Err(e) = nodes::ensure_ready(state, &node, Some(&workdir)).await {
+        undo(state);
+        return Err(e);
+    }
+    {
+        let db = state.db.lock().unwrap();
+        if let Err(e) = db.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', ?2)",
+            params![session_id, prompt],
+        ) {
+            drop(db);
+            undo(state);
+            return Err(e.to_string());
+        }
+    }
+    let turn = Turn {
+        adapter,
+        resume,
+        model,
+        workdir,
+        prompt,
+    };
+    // 已经登记过；这里只负责发出
+    let st = Arc::clone(state);
+    tauri::async_runtime::spawn(async move {
+        let params = serde_json::to_value(turn_params(session_id, &turn)).expect("序列化对话参数");
+        if let Err(e) = nodes::call(&st, &node, "turn.start", &params).await {
+            fail(&st, session_id, &e);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_start(
+    state: State<'_, Arc<AppState>>,
+    node_id: Option<String>,
+    adapter: String,
+    model: Option<String>,
+    workdir: Option<String>,
+    prompt: String,
+) -> Result<i64, String> {
+    start(
+        &state,
+        node_id.as_deref(),
+        &adapter,
+        model.as_deref(),
+        workdir.as_deref(),
+        &prompt,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn chat_send(
+    state: State<'_, Arc<AppState>>,
+    session_id: i64,
+    prompt: String,
+) -> Result<(), String> {
+    send(&state, session_id, &prompt).await
 }
 
 #[tauri::command]
@@ -375,7 +464,7 @@ pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>
     let db = state.db.lock().unwrap();
     let mut stmt = db
         .prepare(
-            "SELECT id, adapter, title, model, workdir, created_at FROM sessions ORDER BY id DESC LIMIT 100",
+            "SELECT id, adapter, title, model, workdir, node_id, created_at FROM sessions ORDER BY id DESC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -386,7 +475,10 @@ pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>
                 title: row.get(2)?,
                 model: row.get(3)?,
                 workdir: row.get(4)?,
-                created_at: row.get(5)?,
+                node_id: row
+                    .get::<_, Option<String>>(5)?
+                    .unwrap_or_else(|| nodes::LOCAL.to_string()),
+                created_at: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -403,7 +495,7 @@ pub fn chat_messages(
     let db = state.db.lock().unwrap();
     let mut stmt = db
         .prepare(
-            "SELECT id, session_id, role, content, cost_usd, input_tokens, output_tokens, created_at
+            "SELECT id, session_id, role, content, cost_usd, input_tokens, output_tokens, duration_ms, created_at
              FROM messages WHERE session_id = ?1 ORDER BY id",
         )
         .map_err(|e| e.to_string())?;
@@ -417,7 +509,8 @@ pub fn chat_messages(
                 cost_usd: row.get(4)?,
                 input_tokens: row.get(5)?,
                 output_tokens: row.get(6)?,
-                created_at: row.get(7)?,
+                duration_ms: row.get(7)?,
+                created_at: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -426,147 +519,37 @@ pub fn chat_messages(
     Ok(rows)
 }
 
-/// 开启新会话并发送第一条消息。model 为空时沿用 Agent 自身配置的默认模型。
-#[tauri::command]
-pub async fn chat_start(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    adapter: String,
-    model: Option<String>,
-    workdir: Option<String>,
-    prompt: String,
-) -> Result<i64, String> {
-    if !adapters::is_supported(&adapter) {
-        return Err(format!("「{adapter}」的会话适配尚未实现"));
-    }
-    let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
-        return Err("消息不能为空".into());
-    }
-    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-    let workdir = resolve_workdir(workdir.as_deref())?;
-    let title: String = prompt.chars().take(24).collect();
-    let sid = {
-        let db = state.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO sessions (adapter, title, model, workdir) VALUES (?1, ?2, ?3, ?4)",
-            params![adapter, title, model, workdir.to_string_lossy()],
-        )
-        .map_err(|e| e.to_string())?;
-        let id = db.last_insert_rowid();
-        db.execute(
-            "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', ?2)",
-            params![id, prompt],
-        )
-        .map_err(|e| e.to_string())?;
-        id
-    };
-    // 先登记为运行中再启动：此后任何一次状态查询都能看到这个会话
-    state.live.lock().unwrap().insert(sid, LiveTurn::default());
-    let st = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        run_turn(
-            app,
-            st,
-            Turn {
-                session_id: sid,
-                adapter,
-                resume: None,
-                model,
-                workdir,
-                prompt,
-            },
-        )
-        .await;
-    });
-    Ok(sid)
-}
-
-/// 在已有会话中续聊：沿用该会话的 Agent、模型与工作目录。
-#[tauri::command]
-pub async fn chat_send(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    session_id: i64,
-    prompt: String,
-) -> Result<(), String> {
-    let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
-        return Err("消息不能为空".into());
-    }
-    let (adapter, resume, model, workdir) = {
-        let db = state.db.lock().unwrap();
-        db.query_row(
-            "SELECT adapter, external_ref, model, workdir FROM sessions WHERE id = ?1",
-            params![session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .map_err(|_| format!("会话不存在：#{session_id}"))?
-    };
-    if !adapters::is_supported(&adapter) {
-        return Err("该会话的 Agent 暂不支持续聊".into());
-    }
-    // 升级前创建的会话没有记录工作目录，退回主目录
-    let workdir = resolve_workdir(workdir.as_deref())?;
-    // 同一会话同一时间只跑一轮
-    if state.live.lock().unwrap().contains_key(&session_id) {
-        return Err("该会话上一轮还在运行，请等它结束或先停止".into());
-    }
-    {
-        let db = state.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', ?2)",
-            params![session_id, prompt],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    // 先登记为运行中再启动：此后任何一次状态查询都能看到这个会话
-    state.live.lock().unwrap().insert(session_id, LiveTurn::default());
-    let st = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        run_turn(
-            app,
-            st,
-            Turn {
-                session_id,
-                adapter,
-                resume,
-                model,
-                workdir,
-                prompt,
-            },
-        )
-        .await;
-    });
-    Ok(())
-}
-
 /// 运行中的一轮对话目前的界面内容。
-#[derive(Default)]
 pub struct LiveTurn {
     text: String,
     activity: Option<String>,
+    node: String,
+    started: Instant,
 }
 
-#[derive(Serialize)]
+impl Default for LiveTurn {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            activity: None,
+            node: String::new(),
+            started: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveTurnInfo {
     pub session_id: i64,
     pub text: String,
     pub activity: Option<String>,
+    pub node_id: String,
 }
 
 /// 正在运行的会话及其实时输出。界面以它为准：窗口不可见时推送事件可能没有送达，
 /// 重新可见（或定时）时据此补登记、补收尾。
-#[tauri::command]
-pub fn chat_live(state: State<'_, Arc<AppState>>) -> Vec<LiveTurnInfo> {
+pub fn live(state: &Arc<AppState>) -> Vec<LiveTurnInfo> {
     let live = state.live.lock().unwrap();
     let mut list: Vec<LiveTurnInfo> = live
         .iter()
@@ -574,6 +557,7 @@ pub fn chat_live(state: State<'_, Arc<AppState>>) -> Vec<LiveTurnInfo> {
             session_id: *id,
             text: turn.text.clone(),
             activity: turn.activity.clone(),
+            node_id: turn.node.clone(),
         })
         .collect();
     list.sort_by_key(|turn| turn.session_id);
@@ -581,15 +565,293 @@ pub fn chat_live(state: State<'_, Arc<AppState>>) -> Vec<LiveTurnInfo> {
 }
 
 /// 停止正在运行的一轮对话；已产出的文本会保留。
-#[tauri::command]
-pub fn chat_stop(state: State<'_, Arc<AppState>>, session_id: i64) -> Result<(), String> {
-    state.cancelled.lock().unwrap().insert(session_id);
-    if let Some(mut child) = state.running.lock().unwrap().remove(&session_id) {
-        // 连同 Agent 拉起的子进程一起结束，再回收进程
-        adapters::kill_process_group(&mut child);
-        tauri::async_runtime::spawn(async move {
-            let _ = child.wait().await;
-        });
-    }
+pub async fn stop(state: &Arc<AppState>, session_id: i64) -> Result<(), String> {
+    let node = {
+        let live = state.live.lock().unwrap();
+        live.get(&session_id)
+            .map(|turn| turn.node.clone())
+            .ok_or_else(|| format!("会话 #{session_id} 没有在运行"))?
+    };
+    nodes::call(
+        &state,
+        &node,
+        "turn.stop",
+        &serde_json::json!({ "turnId": session_id.to_string() }),
+    )
+    .await?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn chat_live(state: State<'_, Arc<AppState>>) -> Vec<LiveTurnInfo> {
+    live(&state)
+}
+
+#[tauri::command]
+pub async fn chat_stop(state: State<'_, Arc<AppState>>, session_id: i64) -> Result<(), String> {
+    stop(&state, session_id).await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use autoagents_core::runner::BinaryResolver;
+    use autoagents_core::service::{Service, ServiceOptions};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// 收集推给界面的事件
+    #[derive(Clone, Default)]
+    struct Collector(Arc<Mutex<Vec<ChatEvent>>>);
+
+    impl Sink for Collector {
+        fn send(&self, event: ChatEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// 造一个冒充 claude 的脚本，并返回只认它的服务
+    fn fake_agent(script: &str) -> (PathBuf, Arc<Service>) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::mem::forget(dir);
+        let fake = bin.clone();
+        let service = Service::new(ServiceOptions {
+            resolve: Some(Arc::new(move |_: &str| Some(fake.clone())) as BinaryResolver),
+            ..Default::default()
+        });
+        (bin, service)
+    }
+
+    fn test_state(service: Arc<Service>) -> (Arc<AppState>, Collector) {
+        let collector = Collector::default();
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let state = AppState::new(db, service, Arc::new(collector.clone()));
+        (state, collector)
+    }
+
+    type Row = (String, String, Option<f64>, Option<i64>);
+
+    fn rows(state: &AppState, session_id: i64) -> Vec<Row> {
+        let db = state.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT role, content, cost_usd, duration_ms FROM messages WHERE session_id = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// 等这一轮从运行中摘掉
+    async fn settle(state: &AppState, session_id: i64) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state.live.lock().unwrap().contains_key(&session_id) {
+            assert!(Instant::now() < deadline, "会话 #{session_id} 一直停在运行中");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    const OK: &str = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}}' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}}' '{"type":"result","is_error":false,"result":"hello","total_cost_usd":0.02,"usage":{"input_tokens":5,"output_tokens":2}}'"#;
+
+    /// 完整一轮：用户消息落库 → 事件推给界面 → 回答带用量与耗时落库 → 会话标识记住
+    #[tokio::test]
+    async fn turn_streams_persists_and_settles() {
+        let (_, service) = fake_agent(OK);
+        let (state, collector) = test_state(service);
+        let id = start(&state, None, "claude-cli", Some("glm-5.3"), Some("~"), "hi").await.unwrap();
+        settle(&state, id).await;
+        let rows = rows(&state, id);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("user", "hi"));
+        assert_eq!((rows[1].0.as_str(), rows[1].1.as_str()), ("assistant", "hello"));
+        assert_eq!(rows[1].2, Some(0.02));
+        assert!(rows[1].3.is_some(), "回答要带耗时");
+
+        let events: Vec<ChatEvent> = collector.0.lock().unwrap().iter().cloned().collect();
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap()["type"].as_str().unwrap().to_string())
+            .collect();
+        // 增量只推给界面，不落库；结束时用完整文本校正
+        assert_eq!(kinds, ["delta", "delta", "replace", "done"]);
+        assert!(events.iter().all(|e| e.session_id() == id));
+        let ChatEvent::Done { cost_usd, input_tokens, output_tokens, .. } = &events[3] else {
+            panic!("最后一则应当是 Done：{events:?}");
+        };
+        assert_eq!((*cost_usd, *input_tokens, *output_tokens), (Some(0.02), Some(5), Some(2)));
+
+        let db = state.db.lock().unwrap();
+        let (r#ref, node, model): (String, String, String) = db
+            .query_row(
+                "SELECT external_ref, node_id, model FROM sessions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((r#ref.as_str(), node.as_str(), model.as_str()), ("s1", "local", "glm-5.3"));
+    }
+
+    /// 窗口不可见、事件全丢：靠 live 快照也能看到进度，结束后快照清空
+    #[tokio::test]
+    async fn live_snapshot_tracks_progress() {
+        let (_, service) = fake_agent(OK);
+        let (state, _) = test_state(service);
+        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        settle(&state, id).await;
+        let running = live(&state);
+        assert!(running.is_empty(), "结束后不应再有运行中的会话：{running:?}");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_bad_input_without_creating_a_session() {
+        let (bin, service) = fake_agent(OK);
+        let (state, _) = test_state(service);
+        assert!(start(&state, None, "zcode", None, None, "hi").await.unwrap_err().contains("适配"));
+        assert!(start(&state, None, "claude-cli", None, None, "  ").await.unwrap_err().contains("不能为空"));
+        let missing = bin.parent().unwrap().join("no-such-dir");
+        let err = start(&state, None, "claude-cli", None, Some(&missing.to_string_lossy()), "hi")
+            .await
+            .unwrap_err();
+        assert!(err.contains("工作目录不存在"), "{err}");
+        assert!(start(&state, Some("nope"), "claude-cli", None, None, "hi")
+            .await
+            .unwrap_err()
+            .contains("不在线"));
+        let db = state.db.lock().unwrap();
+        let count: i64 = db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "校验失败不应留下会话记录");
+    }
+
+    /// 续聊带上外部会话标识与模型；同一会话不能同时跑两轮
+    #[tokio::test]
+    async fn send_resumes_and_is_exclusive() {
+        // 把收到的参数原样当作回答带回来，便于断言命令行
+        let echo = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' "{\"type\":\"result\",\"is_error\":false,\"result\":\"$*\"}""#;
+        let (_, service) = fake_agent(echo);
+        let (state, _) = test_state(service);
+        let id = start(&state, None, "claude-cli", Some("glm-5.3"), None, "one").await.unwrap();
+        settle(&state, id).await;
+        assert!(send(&state, id, "two").await.is_ok());
+        settle(&state, id).await;
+        let history = rows(&state, id);
+        assert_eq!(history.len(), 4, "两轮各一条用户消息、一条回答");
+        assert!(history[1].1.contains("--model glm-5.3"), "{}", history[1].1);
+        assert!(!history[1].1.contains("--resume"), "首轮不应续聊：{}", history[1].1);
+        assert!(history[3].1.contains("--resume s1"), "续聊要带上会话标识：{}", history[3].1);
+        assert!(history[3].1.contains("--model glm-5.3"), "{}", history[3].1);
+        assert!(send(&state, 9999, "x").await.unwrap_err().contains("不存在"));
+        assert!(send(&state, id, " ").await.unwrap_err().contains("不能为空"));
+
+        // 运行中再发：拒绝，且不落用户消息
+        let (_, slow) = fake_agent("sleep 30");
+        let (state, _) = test_state(slow);
+        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        assert!(state.live.lock().unwrap().contains_key(&id));
+        assert!(send(&state, id, "again").await.unwrap_err().contains("还在运行"));
+        assert_eq!(rows(&state, id).len(), 1);
+        stop(&state, id).await.unwrap();
+        settle(&state, id).await;
+        assert!(stop(&state, id).await.unwrap_err().contains("没有在运行"));
+    }
+
+    /// 中途停止：已经流出来的文本保留为回答
+    #[tokio::test]
+    async fn stop_keeps_partial_output() {
+        let partial = r#"printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"部分"}}}'
+sleep 30"#;
+        let (_, service) = fake_agent(partial);
+        let (state, collector) = test_state(service);
+        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        // 等第一个增量到达再停
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.live.lock().unwrap().get(&id).is_some_and(|t| t.text == "部分") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "没有收到增量");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop(&state, id).await.unwrap();
+        settle(&state, id).await;
+        let history = rows(&state, id);
+        assert_eq!(history.len(), 3, "{history:?}");
+        assert_eq!((history[1].0.as_str(), history[1].1.as_str()), ("system", "已停止：完整回答尚未生成，以上是已经产出的内容"));
+        assert_eq!((history[2].0.as_str(), history[2].1.as_str()), ("assistant", "部分"));
+        let events = collector.0.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChatEvent::Done { .. })));
+        assert!(!events.iter().any(|e| matches!(e, ChatEvent::Error { .. })));
+    }
+
+    /// Agent 启动不了：错误以系统消息出现，会话不卡在运行中
+    #[tokio::test]
+    async fn launch_failure_is_reported() {
+        let service = Service::new(ServiceOptions {
+            resolve: Some(Arc::new(|_: &str| None) as BinaryResolver),
+            ..Default::default()
+        });
+        let (state, collector) = test_state(service);
+        let id = start(&state, None, "codex-cli", None, None, "hi").await.unwrap();
+        settle(&state, id).await;
+        let rows = rows(&state, id);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "system");
+        assert!(rows[1].1.contains("未找到"), "{}", rows[1].1);
+        assert!(matches!(
+            collector.0.lock().unwrap().last(),
+            Some(ChatEvent::Error { session_id, .. }) if *session_id == id
+        ));
+    }
+
+    /// 不是这台机器上那一轮的事件、已结束会话的迟到事件：一律忽略
+    #[tokio::test]
+    async fn stale_events_are_ignored() {
+        let (_, service) = fake_agent("sleep 30");
+        let (state, _) = test_state(service);
+        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        let stale = TurnEvent::Finished {
+            turn_id: "424242".into(),
+            text: "迟到的".into(),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            incomplete: false,
+        };
+        let _ = state.events.send(NodeEvent {
+            node: "local".into(),
+            event: stale,
+        });
+        // 来源机器对不上的增量也不采纳
+        let _ = state.events.send(NodeEvent {
+            node: "other-machine".into(),
+            event: TurnEvent::Delta {
+                turn_id: id.to_string(),
+                text: "串线".into(),
+            },
+        });
+        let _ = state.events.send(NodeEvent {
+            node: "local".into(),
+            event: TurnEvent::Delta {
+                turn_id: id.to_string(),
+                text: "本机".into(),
+            },
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.live.lock().unwrap().get(&id).is_some_and(|t| t.text != "本机") {
+            assert!(Instant::now() < deadline, "本机的增量应当被采纳");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop(&state, id).await.unwrap();
+        settle(&state, id).await;
+        let db = state.db.lock().unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM sessions WHERE id = 424242", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

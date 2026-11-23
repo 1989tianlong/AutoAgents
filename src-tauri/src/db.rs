@@ -24,7 +24,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             adapter      TEXT NOT NULL,
             title        TEXT NOT NULL,
             model        TEXT,
-            -- Agent 的工作目录；grok / pi 的续聊依赖它保持一致
+            -- Agent 的工作目录（机器上的路径）；grok / pi 的续聊依赖它保持一致
             workdir      TEXT,
             -- Agent 侧的会话标识，用于续聊
             external_ref TEXT,
@@ -45,6 +45,16 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             model      TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (adapter, model)
+        );
+        -- 统一事件流：机器、会话、任务、部署的动态与审计都在这里
+        CREATE TABLE IF NOT EXISTS events (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts      TEXT DEFAULT (datetime('now')),
+            kind    TEXT NOT NULL,
+            level   TEXT NOT NULL DEFAULT 'info',
+            source  TEXT,
+            message TEXT NOT NULL,
+            link    TEXT
         );",
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
@@ -54,6 +64,17 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE sessions ADD COLUMN workdir TEXT",
         "ALTER TABLE messages ADD COLUMN input_tokens INTEGER",
         "ALTER TABLE messages ADD COLUMN output_tokens INTEGER",
+        "ALTER TABLE sessions ADD COLUMN node_id TEXT",
+        "ALTER TABLE messages ADD COLUMN duration_ms INTEGER",
+        "ALTER TABLE tasks ADD COLUMN node_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN adapter TEXT",
+        "ALTER TABLE tasks ADD COLUMN model TEXT",
+        "ALTER TABLE tasks ADD COLUMN workdir TEXT",
+        "ALTER TABLE tasks ADD COLUMN session_id INTEGER",
+        "ALTER TABLE tasks ADD COLUMN detail TEXT",
+        "ALTER TABLE tasks ADD COLUMN base_branch TEXT",
+        "ALTER TABLE tasks ADD COLUMN pr_url TEXT",
+        "ALTER TABLE tasks ADD COLUMN pr_number INTEGER",
     ] {
         let _ = conn.execute(column, []);
     }

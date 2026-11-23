@@ -71,6 +71,8 @@ pub struct TurnState {
     pub finished: bool,
     /// 本轮是否出现过流式增量
     streamed_any: bool,
+    /// 流式增量累计的预览文本：中途停止时，完整文本还没到，用它作为本轮结果
+    pub streamed: String,
     /// claude / grok：是否开启了逐字流式（工具调用提示已由 stream_event 给出）
     partial_seen: bool,
     thinking_notified: bool,
@@ -91,6 +93,7 @@ impl TurnState {
     /// 记录流式增量，只用于实时预览
     fn push_delta(&mut self, text: &str) -> TurnEvent {
         self.streamed_any = true;
+        self.streamed.push_str(text);
         TurnEvent::Delta(text.to_string())
     }
 
@@ -197,11 +200,42 @@ pub fn build_command(spec: &TurnSpec) -> Command {
         use std::os::unix::process::CommandExt;
         cmd.as_std_mut().process_group(0);
     }
+    // Windows：从图形界面启动时不弹出控制台窗口
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = &mut cmd;
     cmd
 }
 
-/// 结束子进程及其整个进程组（子进程启动时被放进了以自己为首的进程组）。
-pub(crate) fn kill_process_group(child: &mut CommandChild) {
+/// Unix：向整个进程组发 SIGKILL（负 pid 表示进程组）。
+///
+/// 只发信号、不回收：组长保持僵尸状态，它的 pid 就不会被别的进程复用，
+/// 之后再次按这个 pid 找进程组一定是安全的。
+#[cfg(unix)]
+pub fn signal_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+/// Windows：按进程树结束（`taskkill /T`）。
+#[cfg(windows)]
+pub fn signal_group(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// 结束子进程连同它拉起的所有子进程。
+/// Unix 上子进程是独立进程组的组长，整组结束；Windows 上按进程树结束。
+pub fn kill_process_group(child: &mut CommandChild) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // 负 pid 表示整个进程组
@@ -209,11 +243,19 @@ pub(crate) fn kill_process_group(child: &mut CommandChild) {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ = child.start_kill();
 }
 
 /// 截断为单行，用于过程提示与错误信息。
-pub(crate) fn clip(text: &str, max: usize) -> String {
+pub fn clip(text: &str, max: usize) -> String {
     let line = text.trim().lines().next().unwrap_or("");
     if line.chars().count() <= max {
         line.to_string()
