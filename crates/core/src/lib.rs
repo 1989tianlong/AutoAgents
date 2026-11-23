@@ -10,7 +10,12 @@
 
 pub mod adapters;
 pub mod discovery;
+pub mod link;
 pub mod machine;
 pub mod models;
+pub mod net;
+pub mod protocol;
+pub mod relay;
 pub mod runner;
+pub mod secure;
 pub mod service;

@@ -309,12 +309,12 @@ version = "0.2.0"
 dependencies = [
  "autoagents-core",
  "base64 0.22.1",
- "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml 1.2.2+spec-1.1.0",
- "zeroize",
 ]
 
 [[package]]

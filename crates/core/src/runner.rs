@@ -104,6 +104,27 @@ impl TurnEvent {
     }
 }
 
+impl TurnEvent {
+    /// 换一个对话标识（节点侧给各连接的对话加前缀，避免不同控制端撞号）
+    pub fn map_turn_id(self, map: impl FnOnce(String) -> String) -> Self {
+        match self {
+            TurnEvent::Session { turn_id, r#ref } => TurnEvent::Session { turn_id: map(turn_id), r#ref },
+            TurnEvent::Delta { turn_id, text } => TurnEvent::Delta { turn_id: map(turn_id), text },
+            TurnEvent::Notice { turn_id, text } => TurnEvent::Notice { turn_id: map(turn_id), text },
+            TurnEvent::Failed { turn_id, message } => TurnEvent::Failed { turn_id: map(turn_id), message },
+            TurnEvent::System { turn_id, message } => TurnEvent::System { turn_id: map(turn_id), message },
+            TurnEvent::Finished { turn_id, text, cost_usd, input_tokens, output_tokens, incomplete } => TurnEvent::Finished {
+                turn_id: map(turn_id),
+                text,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                incomplete,
+            },
+        }
+    }
+}
+
 /// 校验工作目录：支持 `~` 前缀；留空用主目录；目录必须存在
 pub fn resolve_workdir(input: Option<&str>) -> Result<PathBuf, String> {
     let home = discovery::home_dir();
