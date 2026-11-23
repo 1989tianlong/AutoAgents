@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { discoverAgents } from "../lib/api";
+import { CHAT_ADAPTERS } from "../lib/types";
 import { Badge, Empty, LevelBadge, PageHeader } from "../components/ui";
 
 export default function Agents() {
@@ -57,8 +58,10 @@ export default function Agents() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/70 bg-slate-900/40">
-              {agents.map((a) => (
-                <tr key={a.id} className="transition hover:bg-slate-800/30">
+              {agents.map((a) => {
+                const chatOk = (CHAT_ADAPTERS as readonly string[]).includes(a.adapter);
+                return (
+                  <tr key={a.id} className="transition hover:bg-slate-800/30">
                   <td className="px-4 py-3">
                     <div className="font-medium text-white">{a.name}</div>
                     <div className="text-xs text-slate-500">{a.adapter}</div>
@@ -80,22 +83,23 @@ export default function Agents() {
                   </td>
                   <td className="px-4 py-3">
                     <button
-                      onClick={() => navigate(`/sessions?adapter=${a.adapter}`)}
-                      disabled={a.adapter !== "claude-cli"}
+                      onClick={() => chatOk && navigate(`/sessions?adapter=${a.adapter}`)}
+                      disabled={!chatOk}
                       title={
-                        a.adapter === "claude-cli"
+                        chatOk
                           ? "开启托管会话（流式对话）"
                           : a.kind === "desktop"
                             ? "桌面 Agent 深度控制将在 M4 支持"
-                            : "该 Agent 的会话适配将在后续版本开放"
+                            : "该 Agent 暂不支持会话"
                       }
                       className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 transition enabled:hover:border-sky-600 enabled:hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      {a.adapter === "claude-cli" ? "💬 会话" : "会话"}
+                      {chatOk ? "💬 会话" : "会话"}
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

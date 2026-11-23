@@ -26,6 +26,7 @@ pub struct AppInfo {
     pub os: String,
     pub arch: String,
     pub hostname: String,
+    pub home: String,
 }
 
 /// 内置 CLI Agent 清单：(二进制名, 展示名, adapter, 能力等级)
@@ -47,6 +48,17 @@ const DESKTOP_PATTERNS: &[(&str, &str, &str)] = &[
     ("claude", "Claude Desktop", "claude-desktop"),
 ];
 
+/// 用户主目录；也是会话工作目录的默认值。
+pub(crate) fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 查找可执行文件的目录：PATH + 常见安装位置。
+/// 从 Dock / Finder 启动的 GUI 应用拿不到 shell 的 PATH，
+/// 所以 nvm、homebrew 这些目录必须在这里兜底。
 pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var("PATH")
         .unwrap_or_default()
@@ -54,18 +66,54 @@ pub(crate) fn search_dirs() -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .collect();
-    let home = std::env::var("HOME").unwrap_or_default();
-    // 常见安装位置兜底（PATH 未覆盖时）
-    for extra in [
-        format!("{home}/.local/bin"),
-        "/opt/homebrew/bin".to_string(),
-        "/usr/local/bin".to_string(),
-    ] {
-        if !dirs.iter().any(|d| d.to_string_lossy() == extra) {
-            dirs.push(PathBuf::from(extra));
+    let home = home_dir();
+    let mut extra: Vec<PathBuf> = [
+        home.join(".local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        home.join(".grok/bin"),
+        home.join(".bun/bin"),
+        home.join(".cargo/bin"),
+    ]
+    .into_iter()
+    .collect();
+    // nvm 管理的 node：按版本号降序，优先命中较新版本里安装的 CLI
+    if let Ok(versions) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+        let mut nv: Vec<(Vec<u64>, PathBuf)> = versions
+            .flatten()
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let key = name
+                    .trim_start_matches('v')
+                    .split('.')
+                    .filter_map(|part| part.parse::<u64>().ok())
+                    .collect();
+                (key, entry.path().join("bin"))
+            })
+            .collect();
+        nv.sort_by(|a, b| b.0.cmp(&a.0));
+        extra.extend(nv.into_iter().map(|(_, bin)| bin));
+    }
+    for dir in extra {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     dirs
+}
+
+/// 拉起 Agent 子进程时使用的 PATH：当前 PATH 补上 `search_dirs`。
+/// npm 安装的 CLI（claude / codex / pi）靠 `#!/usr/bin/env node` 启动，
+/// GUI 应用的 PATH 里没有 node，不补齐会直接起不来。
+pub(crate) fn child_path() -> std::ffi::OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
+    for dir in search_dirs() {
+        if !paths.contains(&dir) {
+            paths.push(dir);
+        }
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| current.clone())
 }
 
 pub(crate) fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -164,6 +212,7 @@ pub fn app_info() -> AppInfo {
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
         hostname,
+        home: home_dir().to_string_lossy().into_owned(),
     }
 }
 

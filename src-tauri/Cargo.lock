@@ -212,6 +212,7 @@ name = "autoagents"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -220,6 +221,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "toml 1.2.2+spec-1.1.0",
 ]
 
 [[package]]
