@@ -23,6 +23,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             adapter      TEXT NOT NULL,
             title        TEXT NOT NULL,
+            model        TEXT,
             external_ref TEXT,
             created_at   TEXT DEFAULT (datetime('now'))
         );
@@ -36,5 +37,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         );",
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
+    // 轻量迁移：旧库补列（列已存在则忽略报错）
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
     Ok(conn)
 }

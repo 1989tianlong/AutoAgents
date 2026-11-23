@@ -84,6 +84,7 @@ export interface ChatSession {
   id: number;
   adapter: string;
   title: string;
+  model: string | null;
   createdAt: string;
 }
 

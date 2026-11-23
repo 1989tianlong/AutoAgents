@@ -39,9 +39,12 @@ export default function Machines() {
             <p className="mt-1 text-xs leading-5 text-slate-500">
               在目标机器安装 agentd 并输入配对码（M2 开放）
             </p>
-            <code className="mt-3 block rounded-md bg-slate-950 px-3 py-1.5 text-xs text-emerald-400">
-              curl -fsSL https://autoagents.dev/install.sh | sh
-            </code>
+            <div className="mt-3 rounded-md border border-dashed border-slate-700 bg-slate-950 px-3 py-2 text-left">
+              <div className="text-[10px] text-slate-500">示例命令 · M2 上线后生效（当前为虚构地址）</div>
+              <code className="mt-0.5 block font-mono text-xs text-slate-600">
+                # curl -fsSL https://autoagents.dev/install.sh | sh
+              </code>
+            </div>
           </div>
         </Card>
       </div>

@@ -4,9 +4,18 @@ import { useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import { chatMessages, chatSend, chatSessions, chatStart, discoverAgents } from "../lib/api";
 import type { ChatEvent } from "../lib/types";
+import { Badge } from "../components/ui";
 
 /** 已实现流式会话的 adapter */
 const SUPPORTED = ["claude-cli"];
+
+/** claude cli 的模型选项（--model，留空跟随其默认配置） */
+const MODELS = [
+  { value: "", label: "默认" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "opus", label: "Opus" },
+  { value: "haiku", label: "Haiku" },
+];
 
 export default function Sessions() {
   const [params] = useSearchParams();
@@ -15,6 +24,7 @@ export default function Sessions() {
   const agents = useQuery({ queryKey: ["agents"], queryFn: discoverAgents });
   const [selected, setSelected] = useState<number | null>(null);
   const [adapter, setAdapter] = useState(params.get("adapter") ?? "claude-cli");
+  const [model, setModel] = useState("");
   const messages = useQuery({
     queryKey: ["chatMessages", selected],
     queryFn: () => chatMessages(selected!),
@@ -68,7 +78,7 @@ export default function Sessions() {
     try {
       if (selected == null) {
         const use = SUPPORTED.includes(adapter) ? adapter : "claude-cli";
-        const id = await chatStart(use, text);
+        const id = await chatStart(use, model || null, text);
         selectedRef.current = id; // 立即更新，避免错过早期流事件
         setSelected(id);
       } else {
@@ -82,6 +92,7 @@ export default function Sessions() {
   };
 
   const cliAgents = agents.data?.filter((a) => a.kind === "cli" && a.level !== "L1") ?? [];
+  const curSession = sessions.data?.find((s) => s.id === selected);
 
   return (
     <div className="flex h-full">
@@ -160,6 +171,22 @@ export default function Sessions() {
               </div>
             </div>
 
+            <div className="mt-4">
+              <div className="mb-2 text-xs text-slate-500">模型</div>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.currentTarget.value)}
+                className="w-56 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-sky-600 focus:outline-none"
+              >
+                {MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                    {m.value ? `（--model ${m.value}）` : "（跟随 Claude 配置）"}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <Composer
               value={input}
               onChange={setInput}
@@ -170,6 +197,13 @@ export default function Sessions() {
           </div>
         ) : (
           <>
+            <div className="flex items-center gap-2 border-b border-slate-800/80 px-6 py-2 text-xs text-slate-500">
+              <span>{curSession?.adapter ?? adapter}</span>
+              {curSession?.model && <Badge tone="violet">{curSession.model}</Badge>}
+              <span className="ml-auto truncate pr-2 text-slate-600">
+                {curSession?.title ?? ""}
+              </span>
+            </div>
             <div className="flex-1 overflow-y-auto p-6">
               <div className="mx-auto max-w-3xl space-y-4">
                 {messages.data?.map((m) => (

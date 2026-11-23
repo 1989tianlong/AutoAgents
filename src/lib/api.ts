@@ -45,7 +45,7 @@ export const taskDelete = (id: number) => invoke<void>("task_delete", { id });
 export const chatSessions = () => invoke<ChatSession[]>("chat_sessions");
 export const chatMessages = (sessionId: number) =>
   invoke<ChatMessage[]>("chat_messages", { sessionId });
-export const chatStart = (adapter: string, prompt: string) =>
-  invoke<number>("chat_start", { adapter, prompt });
+export const chatStart = (adapter: string, model: string | null, prompt: string) =>
+  invoke<number>("chat_start", { adapter, model, prompt });
 export const chatSend = (sessionId: number, prompt: string) =>
   invoke<void>("chat_send", { sessionId, prompt });

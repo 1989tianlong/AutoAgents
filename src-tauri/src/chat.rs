@@ -20,6 +20,7 @@ pub struct ChatSession {
     pub id: i64,
     pub adapter: String,
     pub title: String,
+    pub model: Option<String>,
     pub created_at: String,
 }
 
@@ -65,7 +66,14 @@ fn emit(app: &AppHandle, event: ChatEvent) {
 }
 
 /// 执行一轮对话：spawn claude 进程，流式转发到前端，结束落库。
-async fn run_turn(app: AppHandle, state: Arc<AppState>, session_id: i64, resume: Option<String>, prompt: String) {
+async fn run_turn(
+    app: AppHandle,
+    state: Arc<AppState>,
+    session_id: i64,
+    resume: Option<String>,
+    model: Option<String>,
+    prompt: String,
+) {
     let bin = claude_binary();
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("-p")
@@ -73,6 +81,9 @@ async fn run_turn(app: AppHandle, state: Arc<AppState>, session_id: i64, resume:
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose");
+    if let Some(m) = &model {
+        cmd.arg("--model").arg(m);
+    }
     if let Some(r) = &resume {
         cmd.arg("--resume").arg(r);
     }
@@ -166,7 +177,7 @@ async fn run_turn(app: AppHandle, state: Arc<AppState>, session_id: i64, resume:
 pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>, String> {
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, adapter, title, created_at FROM sessions ORDER BY id DESC LIMIT 100")
+        .prepare("SELECT id, adapter, title, model, created_at FROM sessions ORDER BY id DESC LIMIT 100")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -174,7 +185,8 @@ pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>
                 id: row.get(0)?,
                 adapter: row.get(1)?,
                 title: row.get(2)?,
-                created_at: row.get(3)?,
+                model: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -209,12 +221,13 @@ pub fn chat_messages(
     Ok(rows)
 }
 
-/// 开启新会话并发送第一条消息。
+/// 开启新会话并发送第一条消息（model 为 None 时跟随 claude 配置的默认模型）。
 #[tauri::command]
 pub async fn chat_start(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     adapter: String,
+    model: Option<String>,
     prompt: String,
 ) -> Result<i64, String> {
     if !SUPPORTED_ADAPTERS.contains(&adapter.as_str()) {
@@ -226,12 +239,13 @@ pub async fn chat_start(
     if prompt.is_empty() {
         return Err("消息不能为空".into());
     }
+    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
     let title: String = prompt.chars().take(24).collect();
     let sid = {
         let db = state.db.lock().unwrap();
         db.execute(
-            "INSERT INTO sessions (adapter, title) VALUES (?1, ?2)",
-            params![adapter, title],
+            "INSERT INTO sessions (adapter, title, model) VALUES (?1, ?2, ?3)",
+            params![adapter, title, model],
         )
         .map_err(|e| e.to_string())?;
         let id = db.last_insert_rowid();
@@ -244,7 +258,7 @@ pub async fn chat_start(
     };
     let st = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        run_turn(app, st, sid, None, prompt).await;
+        run_turn(app, st, sid, None, model, prompt).await;
     });
     Ok(sid)
 }
@@ -261,13 +275,19 @@ pub async fn chat_send(
     if prompt.is_empty() {
         return Err("消息不能为空".into());
     }
-    let (adapter, resume) = {
+    let (adapter, resume, model) = {
         let db = state.db.lock().unwrap();
         let row = db
             .query_row(
-                "SELECT adapter, external_ref FROM sessions WHERE id = ?1",
+                "SELECT adapter, external_ref, model FROM sessions WHERE id = ?1",
                 params![session_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .map_err(|e| format!("会话不存在: {e}"))?;
         row
@@ -285,7 +305,7 @@ pub async fn chat_send(
     }
     let st = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        run_turn(app, st, session_id, resume, prompt).await;
+        run_turn(app, st, session_id, resume, model, prompt).await;
     });
     Ok(())
 }
