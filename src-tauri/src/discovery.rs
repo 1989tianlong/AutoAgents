@@ -47,7 +47,7 @@ const DESKTOP_PATTERNS: &[(&str, &str, &str)] = &[
     ("claude", "Claude Desktop", "claude-desktop"),
 ];
 
-fn search_dirs() -> Vec<PathBuf> {
+pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
@@ -68,7 +68,7 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.iter().find_map(|d| {
         let p = d.join(binary);
         p.is_file().then_some(p)

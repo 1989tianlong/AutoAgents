@@ -1,9 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { discoverAgents } from "../lib/api";
 import { Badge, Empty, LevelBadge, PageHeader } from "../components/ui";
 
 export default function Agents() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const {
     data: agents,
     isFetching,
@@ -78,15 +80,18 @@ export default function Agents() {
                   </td>
                   <td className="px-4 py-3">
                     <button
-                      disabled={a.level === "L1"}
+                      onClick={() => navigate(`/sessions?adapter=${a.adapter}`)}
+                      disabled={a.adapter !== "claude-cli"}
                       title={
-                        a.level === "L1"
-                          ? "桌面 Agent 深度控制将在 M4 支持"
-                          : "托管会话将在 M1 后续版本开放"
+                        a.adapter === "claude-cli"
+                          ? "开启托管会话（流式对话）"
+                          : a.kind === "desktop"
+                            ? "桌面 Agent 深度控制将在 M4 支持"
+                            : "该 Agent 的会话适配将在后续版本开放"
                       }
                       className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 transition enabled:hover:border-sky-600 enabled:hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      会话
+                      {a.adapter === "claude-cli" ? "💬 会话" : "会话"}
                     </button>
                   </td>
                 </tr>

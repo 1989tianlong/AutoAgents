@@ -1,13 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { discoverAgents, getAppInfo } from "../lib/api";
+import { discoverAgents, getAppInfo, githubStatus, tasksList } from "../lib/api";
 import { Badge, Card, PageHeader, StatCard } from "../components/ui";
 
 export default function Dashboard() {
   const { data: agents } = useQuery({ queryKey: ["agents"], queryFn: discoverAgents });
   const { data: info } = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo });
+  const { data: tasks } = useQuery({ queryKey: ["tasks"], queryFn: tasksList });
+  const { data: ghUser } = useQuery({
+    queryKey: ["ghStatus"],
+    queryFn: githubStatus,
+    retry: false,
+  });
   const cli = agents?.filter((a) => a.kind === "cli").length ?? 0;
   const desktop = agents?.filter((a) => a.kind === "desktop").length ?? 0;
+  const running = tasks?.filter((t) => t.status === "running" || t.status === "reviewing").length ?? 0;
 
   return (
     <div className="mx-auto max-w-6xl p-8">
@@ -20,8 +27,12 @@ export default function Dashboard() {
           value={agents ? agents.length : "…"}
           sub={`CLI ${cli} · 桌面 ${desktop}`}
         />
-        <StatCard label="进行中任务" value={0} sub="看板" />
-        <StatCard label="今日 Token" value="—" sub="用量统计 M4" />
+        <StatCard label="进行中任务" value={tasks ? running : "…"} sub={`共 ${tasks?.length ?? 0} 条`} />
+        <StatCard
+          label="GitHub"
+          value={ghUser ? ghUser.login : "未连接"}
+          sub={ghUser ? "已连接" : "去 GitHub 页连接"}
+        />
       </div>
 
       <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">

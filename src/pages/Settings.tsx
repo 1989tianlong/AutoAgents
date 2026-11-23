@@ -1,7 +1,14 @@
 import type { ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { githubStatus } from "../lib/api";
 import { Badge, Card, PageHeader } from "../components/ui";
 
 export default function Settings() {
+  const { data: ghUser } = useQuery({
+    queryKey: ["ghStatus"],
+    queryFn: githubStatus,
+    retry: false,
+  });
   return (
     <div className="mx-auto max-w-3xl p-8">
       <PageHeader title="设置" desc="大部分选项将随后续里程碑逐步生效" />
@@ -17,8 +24,14 @@ export default function Settings() {
       </Section>
 
       <Section title="GitHub">
-        <Row label="账号" desc="未连接" />
-        <Row label="仓库授权" desc="连接后选择纳管的仓库" />
+        <Row
+          label="账号"
+          desc={ghUser ? `已连接：${ghUser.login}` : "未连接（在 GitHub 页连接）"}
+          badge={
+            ghUser ? <Badge tone="emerald">已连接</Badge> : <Badge tone="slate">未连接</Badge>
+          }
+        />
+        <Row label="凭据存储" desc="PAT 加密存于本机 Keychain（com.tianlong.autoagents）" />
       </Section>
 
       <Section title="部署">
