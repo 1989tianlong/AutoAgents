@@ -11,23 +11,67 @@ use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const HUB: &str = "hub-e2e";
 
+/// 起了一个子进程，并把它的标准错误收进内存（出错时好打出来看）
+struct Process {
+    child: Child,
+    log: Arc<Mutex<String>>,
+}
+
+impl Process {
+    fn spawn(mut command: Command, name: &str) -> Self {
+        let mut child = command.stderr(Stdio::piped()).spawn().unwrap_or_else(|e| panic!("启动 {name}：{e}"));
+        let log = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&log);
+        let stderr = child.stderr.take().expect("标准错误");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut text = String::new();
+            let mut reader = stderr;
+            // 一直读到管道关闭（进程退出）
+            let _ = reader.read_to_string(&mut text);
+            *sink.lock().unwrap() = text;
+        });
+        Self { child, log }
+    }
+}
+
 /// 测试结束（包括断言失败）时把起的进程都收掉
 struct Processes {
-    children: Vec<Child>,
+    procs: Vec<Process>,
     /// 中继的标准输出要一直有人拿着：管道一旦关掉，它再写日志就会被 SIGPIPE 结束
     _relay_stdout: Option<BufReader<std::process::ChildStdout>>,
 }
 
+impl Processes {
+    fn dump(&self) -> String {
+        let mut text = String::new();
+        for (i, proc) in self.procs.iter().enumerate() {
+            text.push_str(&format!("--- 进程 {i} 的标准错误（尾部）：\n{}\n", clip_tail(&proc.log.lock().unwrap(), 3000)));
+        }
+        text
+    }
+}
+
+fn clip_tail(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        text.to_string()
+    } else {
+        chars[chars.len() - max_chars..].iter().collect()
+    }
+}
+
 impl Drop for Processes {
     fn drop(&mut self) {
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        for proc in &mut self.procs {
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
         }
     }
 }
@@ -40,14 +84,18 @@ struct Relay {
 
 /// 起一个中继（端口由系统分配），等它打印连接串
 fn start_relay(data_dir: &Path, processes: &mut Processes) -> Relay {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_autoagents-relay"))
-        .args(["--listen", "127.0.0.1:0", "--data-dir"])
-        .arg(data_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("启动 autoagents-relay");
-    let stdout = child.stdout.take().expect("中继的标准输出");
+    let mut child = Process::spawn(
+        {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_autoagents-relay"));
+            command
+                .args(["--listen", "127.0.0.1:0", "--data-dir"])
+                .arg(data_dir)
+                .stdout(Stdio::piped());
+            command
+        },
+        "autoagents-relay",
+    );
+    let stdout = child.child.stdout.take().expect("中继的标准输出");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -57,7 +105,7 @@ fn start_relay(data_dir: &Path, processes: &mut Processes) -> Relay {
             "中继提前退出了"
         );
         if let Some(text) = line.trim().strip_prefix("autoagents://relay?") {
-            processes.children.push(child);
+            processes.procs.push(child);
             processes._relay_stdout = Some(reader);
             return parse_relay_string(text);
         }
@@ -89,13 +137,11 @@ fn start_agentd(data_dir: &Path, relay: &Relay, code: Option<&str>, processes: &
         .arg("home-pc")
         .args(["--relay", &relay.addr, "--token", &relay.token, "--fp"])
         .arg(relay.pin.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
     if let Some(code) = code {
         command.args(["--pair", code]);
     }
-    let child = command.spawn().expect("启动 agentd");
-    processes.children.push(child);
+    processes.procs.push(Process::spawn(command, "agentd"));
 }
 
 async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
@@ -135,7 +181,7 @@ async fn wait_link(relay: &Relay, node_id: &str, psk: Psk) -> HubLink {
 async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts() {
     let tmp = TempDir::new().unwrap();
     let mut processes = Processes {
-        children: Vec::new(),
+        procs: Vec::new(),
         _relay_stdout: None,
     };
     let relay = start_relay(&tmp.path().join("relay"), &mut processes);
@@ -208,7 +254,9 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     assert!(again.is_err(), "配对码不该能重复使用");
 
     // 之后凭长期密钥连接：请求都转发得到
-    let link = connect(&relay, &node_id, long_term, None).await.unwrap();
+    let link = connect(&relay, &node_id, long_term, None)
+        .await
+        .unwrap_or_else(|e| panic!("配对之后凭长期密钥连不上：{e}\n{}", processes.dump()));
     let agents = link.call("agents.list", json!({})).await.unwrap();
     assert!(agents.is_array(), "{agents}");
     let listed = link
@@ -227,7 +275,8 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     link.close();
 
     // agentd 重启（机器重启、服务更新）：不重新配对，凭保存的密钥照样连得上
-    let mut agentd = processes.children.pop().expect("agentd");
+    let mut agentd = processes.procs.pop().expect("agentd");
+    let agentd = &mut agentd.child;
     agentd.kill().unwrap();
     agentd.wait().unwrap();
     wait_for("中继把下线的机器摘掉", || {

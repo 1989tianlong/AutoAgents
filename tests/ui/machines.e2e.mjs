@@ -162,7 +162,10 @@ check("按机器分组", await page.getByRole("heading", { name: "本机", exact
 check("列出所有机器上的 Agent", (await page.locator("tbody tr").count()) === 6, `行数=${await page.locator("tbody tr").count()}`);
 await page.locator("tbody tr", { hasText: "Claude CLI" }).nth(1).getByRole("button", { name: /会话/ }).click();
 await page.getByRole("heading", { name: "与 Agent 对话" }).waitFor();
-check("会话页选中的是那台机器", await page.locator("button.bg-sky-950\\/50", { hasText: "家里的 Mac" }).first().isVisible());
+check(
+  "会话页选中的是那台机器",
+  await waitFor(() => page.locator("button.bg-sky-950\\/50", { hasText: "家里的 Mac" }).first().isVisible()),
+);
 check("只列出那台机器上的 Agent", (await page.locator("button", { hasText: /^(Claude CLI|Codex CLI|Grok CLI|Pi Agent)$/ }).count()) === 1);
 
 console.log("\n[9] 活动页：事件带文案与归类，能跳回会话");
