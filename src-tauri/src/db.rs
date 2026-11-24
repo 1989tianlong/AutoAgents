@@ -92,6 +92,13 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE tasks ADD COLUMN base_branch TEXT",
         "ALTER TABLE tasks ADD COLUMN pr_url TEXT",
         "ALTER TABLE tasks ADD COLUMN pr_number INTEGER",
+        "ALTER TABLE tasks ADD COLUMN worktree TEXT",
+        "ALTER TABLE tasks ADD COLUMN base_sha TEXT",
+        "ALTER TABLE tasks ADD COLUMN head_sha TEXT",
+        "ALTER TABLE tasks ADD COLUMN failure TEXT",
+        "ALTER TABLE tasks ADD COLUMN auto_pr INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN checks TEXT",
+        "ALTER TABLE tasks ADD COLUMN instructions TEXT",
     ] {
         let _ = conn.execute(column, []);
     }

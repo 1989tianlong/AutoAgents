@@ -72,8 +72,8 @@ export default function GitHub() {
         issueNumber: i.number,
         issueUrl: i.htmlUrl,
       }),
-    onSuccess: () => {
-      setNotice("已创建任务（含 agent/issue-N 分支名），前往「任务」看板查看");
+    onSuccess: (task) => {
+      setNotice(`已创建任务「${task.title}」，启动后 Agent 会在独立的工作树里实现它`);
       qc.invalidateQueries({ queryKey: ["tasks"] });
     },
     onError: (e) => setNotice(String(e)),

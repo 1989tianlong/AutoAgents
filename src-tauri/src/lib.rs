@@ -5,6 +5,7 @@ mod events;
 mod github;
 mod models;
 mod nodes;
+mod pipeline;
 mod remote;
 mod secrets;
 mod tasks;
@@ -35,6 +36,12 @@ pub struct AppState {
     pub remote: Arc<remote::RemoteManager>,
     /// 本机的机器信息：第一次取到后沿用
     pub local_info: Mutex<Option<autoagents_core::machine::MachineInfo>>,
+    /// GitHub API 的地址（测试里指向本地的假服务器）
+    pub gh_api: Mutex<String>,
+    /// 任务流水线的运行时状态（正在收尾的任务）
+    pub pipeline: pipeline::Pipeline,
+    /// 任务流水线挂在会话上的钩子
+    pub turn_hooks: Mutex<chat::TurnHooks>,
 }
 
 impl AppState {
@@ -63,8 +70,27 @@ impl AppState {
             secrets,
             remote: Arc::new(remote),
             local_info: Mutex::new(None),
+            gh_api: Mutex::new(github::DEFAULT_API.to_string()),
+            pipeline: pipeline::Pipeline::default(),
+            turn_hooks: Mutex::new(chat::TurnHooks::default()),
         });
         chat::dispatch(state.clone(), events_rx);
+        // 一轮对话开始、结束时通知任务流水线（挂在会话上的钩子，同样拿弱引用）
+        {
+            let (started, ended) = (Arc::downgrade(&state), Arc::downgrade(&state));
+            *state.turn_hooks.lock().unwrap() = chat::TurnHooks {
+                started: Some(Arc::new(move |session_id| {
+                    if let Some(state) = started.upgrade() {
+                        pipeline::turn_started(&state, session_id);
+                    }
+                })),
+                ended: Some(Arc::new(move |session_id, ok| {
+                    if let Some(state) = ended.upgrade() {
+                        pipeline::turn_ended(&state, session_id, ok);
+                    }
+                })),
+            };
+        }
         // 机器掉线时结束它上面正在运行的对话。拿弱引用，免得状态与自己互相引用
         let weak = Arc::downgrade(&state);
         state.remote.set_on_offline(Arc::new(move |node| {
@@ -100,6 +126,8 @@ pub fn run() {
             app.manage(state.clone());
             // 连上配对过的机器、开始跟踪中继（都在后台，不拖慢启动）
             state.remote.start_all();
+            // 接着跟踪各个任务的 PR
+            pipeline::start_polling(state.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -112,9 +140,21 @@ pub fn run() {
             github::github_issues,
             github::github_prs,
             tasks::tasks_list,
+            tasks::task_get,
             tasks::task_create_issue,
+            tasks::task_create_manual,
             tasks::task_set_status,
             tasks::task_delete,
+            // 任务流水线
+            pipeline::task_start,
+            pipeline::task_submit,
+            pipeline::task_fix,
+            pipeline::task_refresh,
+            pipeline::tasks_refresh,
+            pipeline::task_abort,
+            pipeline::task_diff,
+            pipeline::task_diff_file,
+            pipeline::repo_clone,
             models::agent_models,
             models::model_remember,
             chat::chat_sessions,

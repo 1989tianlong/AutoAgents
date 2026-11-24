@@ -511,6 +511,14 @@ export default function Sessions() {
               <Badge tone={curSession?.nodeId === "local" ? "sky" : "emerald"}>
                 {machineName(curSession?.nodeId)}
               </Badge>
+              {curSession?.taskId != null && (
+                <button
+                  onClick={() => navigate(`/tasks?t=${curSession.taskId}`)}
+                  className="text-xs text-violet-400 hover:text-violet-300"
+                >
+                  任务 #{curSession.taskId} →
+                </button>
+              )}
               {isRunning && <Badge tone="sky">运行中</Badge>}
               {curSession?.workdir && (
                 <span

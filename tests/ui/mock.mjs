@@ -24,7 +24,70 @@ const MOCK = () => {
     relay: null,
     /** 活动记录 */
     events: [],
+    /** 任务流水线 */
+    tasks: [],
+    taskDiffs: {},
+    taskPatches: {},
+    /** 为 true 时，下一次刷新把审查中的任务标成已合并 */
+    mergePr: false,
+    cloneCalls: [],
+    ghUser: null,
   };
+  let nextTask = 4;
+  let nextSessionId = 60;
+  const now = "2026-11-24 03:00:00";
+  const makeTask = (fields) => ({
+    id: nextTask++,
+    title: "",
+    source: "issue",
+    repo: "octo/demo",
+    issueNumber: null,
+    issueUrl: null,
+    agentId: null,
+    status: "pending",
+    branch: null,
+    createdAt: now,
+    updatedAt: now,
+    nodeId: null,
+    adapter: null,
+    model: null,
+    workdir: null,
+    worktree: null,
+    baseBranch: null,
+    baseSha: null,
+    headSha: null,
+    sessionId: null,
+    prNumber: null,
+    prUrl: null,
+    detail: null,
+    failure: null,
+    instructions: null,
+    autoPr: false,
+    checks: null,
+    ...fields,
+  });
+  state.tasks.push(
+    makeTask({
+      id: 1, title: "修复登录态过期后白屏", issueNumber: 7, issueUrl: "https://github.com/octo/demo/issues/7", branch: "agent/issue-7",
+    }),
+    makeTask({
+      id: 2, title: "给部署页补测试", issueNumber: 3, issueUrl: "https://github.com/octo/demo/issues/3", branch: "agent/issue-3",
+      status: "reviewing", nodeId: "local", adapter: "claude-cli", model: "sonnet", workdir: "/Users/tester/code/demo",
+      worktree: "/Users/tester/code/demo-wt/agent-issue-3", baseBranch: "main", baseSha: "aaa", headSha: "bbb", sessionId: 41,
+      prNumber: 101, prUrl: "https://github.com/octo/demo/pull/101",
+      detail: "PR #101 等审查：1 项通过，0 项进行中，1 项失败",
+      checks: [
+        { name: "build", state: "failure", url: "https://github.com/octo/demo/actions/runs/1" },
+        { name: "lint", state: "success", url: "https://github.com/octo/demo/actions/runs/2" },
+      ],
+    }),
+    makeTask({
+      id: 3, title: "升级依赖", source: "manual", status: "failed", instructions: "把依赖都升到最新", branch: "agent/task-3",
+      nodeId: "local", adapter: "claude-cli", workdir: "/Users/tester/code/demo", worktree: "/Users/tester/code/demo-wt/agent-task-3",
+      baseBranch: "main", sessionId: 42, detail: "出错了，可以重试", failure: "这一轮没有完成：这台机器上同时运行的对话已达上限（8）",
+    }),
+  );
+  nextTask = 4;
   const machineInfo = (name, home) => ({
     name, hostname: name, os: "macos", arch: "arm64", kernel: "25.5.0", version: "0.2.0",
     flavor: "桌面应用内置", home, uptimeS: 3600, cpuCount: 12, memTotal: 16 * 1024 ** 3,
@@ -80,7 +143,7 @@ const MOCK = () => {
       listeners.delete(eventId);
       return null;
     },
-    app_info: () => ({ name: "autoagents", version: "0.1.0", os: "macos", arch: "aarch64", hostname: "test", home: "/Users/tester" }),
+    app_info: () => ({ name: "autoagents", version: "0.2.0", os: "macos", arch: "aarch64", hostname: "test", home: "/Users/tester" }),
     discover_agents: () => agents,
     // ---------- 机器 ----------
     agents_all: () =>
@@ -202,8 +265,110 @@ const MOCK = () => {
       byMachine: [{ name: "本机", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 }],
       topSessions: [{ name: "hello", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 }],
     }),
-    github_status: () => null,
-    tasks_list: () => [],
+    github_status: () => state.ghUser,
+    github_connect: () => {
+      state.ghUser = { login: "octo", name: "Octo Cat", avatarUrl: null };
+      return state.ghUser;
+    },
+    github_disconnect: () => {
+      state.ghUser = null;
+      return null;
+    },
+    github_repos: () => [
+      {
+        id: 1, fullName: "octo/demo", private: false, description: "演示仓库", openIssues: 2, updatedAt: null,
+        htmlUrl: "https://github.com/octo/demo", defaultBranch: "main", sshUrl: "git@github.com:octo/demo.git",
+      },
+    ],
+    github_issues: () => [
+      {
+        number: 9, title: "首页加载太慢", body: "首屏要 5 秒。", state: "open", author: "octo", labels: ["performance"],
+        updatedAt: null, htmlUrl: "https://github.com/octo/demo/issues/9",
+      },
+    ],
+    github_prs: () => [],
+    tasks_list: () => state.tasks,
+    task_get: ({ id }) => {
+      const task = state.tasks.find((t) => t.id === id);
+      if (!task) throw new Error(`任务不存在：#${id}`);
+      return task;
+    },
+    task_create_issue: ({ title, repo, issueNumber, issueUrl }) => {
+      const task = makeTask({ title, repo, issueNumber, issueUrl, branch: `agent/issue-${issueNumber}` });
+      state.tasks.unshift(task);
+      return task;
+    },
+    task_create_manual: ({ title, repo, instructions }) => {
+      const task = makeTask({ title, repo, instructions, source: "manual" });
+      task.branch = `agent/task-${task.id}`;
+      state.tasks.unshift(task);
+      return task;
+    },
+    task_set_status: ({ id, status }) => {
+      Object.assign(state.tasks.find((t) => t.id === id), { status });
+      return null;
+    },
+    task_delete: ({ id }) => {
+      state.tasks = state.tasks.filter((t) => t.id !== id);
+      return null;
+    },
+    task_start: ({ id, nodeId, adapter, model, workdir, baseBranch, autoPr }) => {
+      const task = state.tasks.find((t) => t.id === id);
+      if (!workdir.includes("demo")) throw new Error("确认仓库位置失败：fatal: not a git repository (or any of the parent directories): .git");
+      const sessionId = nextSessionId++;
+      Object.assign(task, {
+        status: "running", nodeId, adapter, model, workdir, autoPr,
+        worktree: `${workdir}-wt/${task.branch.replace("/", "-")}`,
+        baseBranch: baseBranch ?? "main", baseSha: "aaa", headSha: null, prNumber: null, prUrl: null, checks: null,
+        failure: null, detail: "Agent 正在处理", sessionId,
+      });
+      // 流水线开的会话：会话页能链回任务
+      state.sessions.unshift({
+        id: sessionId, adapter, title: task.title, model, workdir: task.worktree, nodeId, taskId: task.id, createdAt: now,
+      });
+      state.messages.set(sessionId, []);
+      return task;
+    },
+    task_submit: ({ id }) => {
+      const task = state.tasks.find((t) => t.id === id);
+      const number = 100 + id;
+      Object.assign(task, {
+        status: "reviewing", prNumber: number, prUrl: `https://github.com/octo/demo/pull/${number}`, headSha: "bbb",
+        detail: `PR #${number} 等审查：1 项通过，1 项进行中，1 项失败`,
+        checks: [
+          { name: "build", state: "failure", url: "https://github.com/octo/demo/actions/runs/1" },
+          { name: "lint", state: "success", url: null },
+          { name: "test", state: "pending", url: null },
+        ],
+      });
+      delete state.taskDiffs[id];
+      return task;
+    },
+    task_fix: ({ id }) => {
+      Object.assign(state.tasks.find((t) => t.id === id), { status: "running", detail: "Agent 正在修复检查指出的问题" });
+      return null;
+    },
+    task_refresh: ({ id }) => {
+      const task = state.tasks.find((t) => t.id === id);
+      if (state.mergePr && task.status === "reviewing") {
+        Object.assign(task, { status: "done", detail: `PR #${task.prNumber} 已合并` });
+      }
+      return task;
+    },
+    tasks_refresh: () => 0,
+    task_abort: ({ id }) => {
+      Object.assign(state.tasks.find((t) => t.id === id), { status: "failed", detail: "出错了，可以重试", failure: "这一轮没有完成：已停止" });
+      return null;
+    },
+    task_diff: ({ id }) => {
+      const task = state.tasks.find((t) => t.id === id);
+      return state.taskDiffs[id] ?? { worktree: task.worktree ?? "", branch: task.branch, baseBranch: task.baseBranch, ahead: 0, stat: "", entries: [] };
+    },
+    task_diff_file: ({ path }) => state.taskPatches[path] ?? "",
+    repo_clone: ({ nodeId, url, dir }) => {
+      state.cloneCalls.push({ nodeId, url, dir });
+      return dir;
+    },
     chat_sessions: () => state.sessions,
     chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],
     chat_live: () => state.live.map((l) => ({ ...l, nodeId: "local" })),
@@ -316,6 +481,23 @@ const MOCK = () => {
         id: state.events.length + 1, ts: "2026-11-24 01:00:00", kind: "node.paired", level: "info",
         source: name, message: "已配对并添加这台机器", link: "#/machines",
       });
+    },
+    /** 模拟 Agent 做完一轮：工作树里有了改动，任务进入「待确认」 */
+    agentDone: (id) => {
+      const task = state.tasks.find((t) => t.id === id);
+      Object.assign(task, { status: "changes", detail: "2 个文件有改动，等你确认" });
+      state.taskDiffs[id] = {
+        worktree: task.worktree, branch: task.branch, baseBranch: task.baseBranch, ahead: 0,
+        stat: "1 file changed, 3 insertions(+)",
+        entries: [
+          { path: "src/app/greet.ts", status: "M" },
+          { path: "src/app/new.ts", status: "?" },
+        ],
+      };
+      state.taskPatches = {
+        "src/app/greet.ts": "@@ -1,3 +1,4 @@\n import { greet } from \"./lib\";\n-old line\n+new line\n export const page = greet();\n",
+        "src/app/new.ts": "--- /dev/null\n+++ b/src/app/new.ts\n@@ -0,0 +1,1 @@\n+export const fresh = 1;\n",
+      };
     },
     lastCall: (cmd) => [...state.calls].reverse().find((c) => c.cmd === cmd) ?? null,
     listenerCount: () => [...listeners.values()].filter((l) => l.event === "chat-event").length,

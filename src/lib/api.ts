@@ -5,6 +5,7 @@ import type {
   AppInfo,
   ChatMessage,
   ChatSession,
+  DiffView,
   DiscoveredAgent,
   EventCounts,
   GhIssue,
@@ -60,10 +61,46 @@ export const taskCreateIssue = (p: {
   repo: string;
   issueNumber: number;
   issueUrl: string;
-}) => invoke<number>("task_create_issue", p);
+}) => invoke<Task>("task_create_issue", p);
 export const taskSetStatus = (id: number, status: string) =>
   invoke<void>("task_set_status", { id, status });
 export const taskDelete = (id: number) => invoke<void>("task_delete", { id });
+export const taskGet = (id: number) => invoke<Task>("task_get", { id });
+
+/** 手动建一个任务：一段需求说明，不经过 Issue */
+export const taskCreateManual = (p: { title: string; repo: string; instructions: string }) =>
+  invoke<Task>("task_create_manual", p);
+
+/** 启动任务：在那台机器上准备工作树，把需求交给 Agent */
+export const taskStart = (p: {
+  id: number;
+  nodeId: string;
+  adapter: string;
+  model: string | null;
+  workdir: string;
+  baseBranch: string | null;
+  autoPr: boolean;
+}) => invoke<Task>("task_start", p);
+
+/** 人工确认改动之后：提交、推送、开 PR */
+export const taskSubmit = (id: number) => invoke<Task>("task_submit", { id });
+
+/** PR 的检查没通过：把失败的日志交给 Agent 修 */
+export const taskFix = (id: number) => invoke<void>("task_fix", { id });
+export const taskRefresh = (id: number) => invoke<Task>("task_refresh", { id });
+export const tasksRefresh = () => invoke<number>("tasks_refresh");
+
+/** 停止任务正在跑的这一轮 */
+export const taskAbort = (id: number) => invoke<void>("task_abort", { id });
+
+/** 任务工作树里的改动 */
+export const taskDiff = (id: number) => invoke<DiffView>("task_diff", { id });
+export const taskDiffFile = (id: number, path: string, untracked: boolean) =>
+  invoke<string>("task_diff_file", { id, path, untracked });
+
+/** 把仓库克隆到那台机器上 */
+export const repoClone = (nodeId: string, url: string, dir: string) =>
+  invoke<string>("repo_clone", { nodeId, url, dir });
 
 // ---------- 会话 ----------
 

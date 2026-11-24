@@ -26,6 +26,8 @@ pub struct ChatSession {
     pub workdir: Option<String>,
     /// 会话所在机器的节点 id
     pub node_id: String,
+    /// 这个会话属于哪个任务（任务流水线开的会话才有）
+    pub task_id: Option<i64>,
     pub created_at: String,
 }
 
@@ -220,6 +222,7 @@ fn fail(state: &AppState, session_id: i64, message: &str) {
         },
     );
     state.live.lock().unwrap().remove(&session_id);
+    turn_ended_hook(state, session_id, false);
 }
 
 /// 机器掉线（或被要求重连）：它上面正在运行的对话不可能再有结果了，以失败收尾。
@@ -265,6 +268,7 @@ fn note_started(state: &AppState, session_id: i64, turn: &Turn, node: &str) {
         &event_source(state, node, &turn.adapter),
         &format!("开始一轮：{}", clip_title(&turn.prompt)),
     );
+    turn_started_hook(state, session_id);
 }
 
 fn clip_title(text: &str) -> String {
@@ -365,6 +369,7 @@ fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) 
                 },
             );
             state.live.lock().unwrap().remove(&session_id);
+            turn_ended_hook(state, session_id, true);
         }
     }
 }
@@ -388,6 +393,26 @@ fn fmt_duration(ms: i64) -> String {
         format!("{}.{:.0} 秒", ms / 1000, (ms % 1000) / 100)
     } else {
         format!("{} 分 {} 秒", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// 任务流水线挂在会话上的两个钩子：一轮开始、一轮结束。
+/// 拿弱引用，免得状态与自己互相引用。
+#[derive(Clone, Default)]
+pub struct TurnHooks {
+    pub started: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    pub ended: Option<Arc<dyn Fn(i64, bool) + Send + Sync>>,
+}
+
+fn turn_started_hook(state: &AppState, session_id: i64) {
+    if let Some(hook) = state.turn_hooks.lock().unwrap().started.clone() {
+        hook(session_id);
+    }
+}
+
+fn turn_ended_hook(state: &AppState, session_id: i64, ok: bool) {
+    if let Some(hook) = state.turn_hooks.lock().unwrap().ended.clone() {
+        hook(session_id, ok);
     }
 }
 
@@ -614,8 +639,10 @@ pub async fn chat_send(
 pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>, String> {
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare(
-            "SELECT id, adapter, title, model, workdir, node_id, created_at FROM sessions ORDER BY id DESC LIMIT 100",
+        .prepare_cached(
+            "SELECT s.id, s.adapter, s.title, s.model, s.workdir, s.node_id, s.created_at,
+                    (SELECT t.id FROM tasks t WHERE t.session_id = s.id ORDER BY t.id DESC LIMIT 1)
+             FROM sessions s ORDER BY s.id DESC LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -630,6 +657,7 @@ pub fn chat_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<ChatSession>
                     .get::<_, Option<String>>(5)?
                     .unwrap_or_else(|| nodes::LOCAL.to_string()),
                 created_at: row.get(6)?,
+                task_id: row.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?

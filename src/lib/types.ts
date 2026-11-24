@@ -61,11 +61,17 @@ export interface GhRepo {
   openIssues: number;
   updatedAt: string | null;
   htmlUrl: string;
+  /** 合并 PR 的目标分支；任务没指定基础分支时以它为准 */
+  defaultBranch: string;
+  /** `git@github.com:owner/repo.git`：在机器上克隆时用它 */
+  sshUrl: string;
 }
 
 export interface GhIssue {
   number: number;
   title: string;
+  /** 正文（Markdown） */
+  body: string | null;
   state: string;
   author: string;
   labels: string[];
@@ -87,12 +93,21 @@ export interface GhPr {
 
 // ---------- 任务 ----------
 
-export type TaskStatus = "pending" | "running" | "reviewing" | "done" | "failed";
+/** 任务的流转：待启动 → 进行中 →（待确认 →）审查中 → 已完成；任何一步都可能失败 */
+export type TaskStatus = "pending" | "running" | "changes" | "reviewing" | "done" | "failed";
+
+/** PR 上的一项检查（CI 的一个 job，或别人上报的一个状态） */
+export interface GhCheck {
+  name: string;
+  state: "pending" | "success" | "failure" | "skipped";
+  url: string | null;
+}
 
 export interface Task {
   id: number;
   title: string;
-  source: string;
+  /** `issue`：从 Issue 转来的；`manual`：直接写的一段需求 */
+  source: "issue" | "manual";
   repo: string | null;
   issueNumber: number | null;
   issueUrl: string | null;
@@ -101,6 +116,48 @@ export interface Task {
   branch: string | null;
   createdAt: string;
   updatedAt: string;
+  /** 在哪台机器上做 */
+  nodeId: string | null;
+  adapter: string | null;
+  model: string | null;
+  /** 仓库在那台机器上的位置 */
+  workdir: string | null;
+  /** 这个任务专用的工作树 */
+  worktree: string | null;
+  baseBranch: string | null;
+  baseSha: string | null;
+  /** 最近一次推送的提交 */
+  headSha: string | null;
+  /** Agent 的全部往来都在这个会话里 */
+  sessionId: number | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  /** 最近一步的说明 */
+  detail: string | null;
+  /** 失败原因 */
+  failure: string | null;
+  /** 手动任务的需求说明 */
+  instructions: string | null;
+  /** Agent 做完后不等确认，直接提交并开 PR */
+  autoPr: boolean;
+  checks: GhCheck[] | null;
+}
+
+export interface DiffEntry {
+  path: string;
+  /** `M` 修改、`A` 新增、`D` 删除、`R` 重命名、`U` 冲突、`?` 未跟踪 */
+  status: string;
+}
+
+/** 任务的工作树里相对起点提交的改动 */
+export interface DiffView {
+  worktree: string;
+  branch: string | null;
+  baseBranch: string | null;
+  /** 比起点多出来的提交数 */
+  ahead: number;
+  stat: string;
+  entries: DiffEntry[];
 }
 
 // ---------- 会话 ----------
@@ -113,6 +170,8 @@ export interface ChatSession {
   workdir: string | null;
   /** 会话所在机器的节点 id（`local` 表示本机） */
   nodeId: string;
+  /** 这个会话属于哪个任务（流水线开的会话才有） */
+  taskId: number | null;
   createdAt: string;
 }
 
