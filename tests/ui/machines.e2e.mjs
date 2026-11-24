@@ -160,11 +160,19 @@ await goto("#/agents", "Agents");
 await page.getByRole("heading", { name: "家里的 Mac", exact: true }).waitFor();
 check("按机器分组", await page.getByRole("heading", { name: "本机", exact: true }).isVisible());
 check("列出所有机器上的 Agent", (await page.locator("tbody tr").count()) === 6, `行数=${await page.locator("tbody tr").count()}`);
-await page.locator("tbody tr", { hasText: "Claude CLI" }).nth(1).getByRole("button", { name: /会话/ }).click();
+// 在「家里的 Mac」那一组里找，不依赖各组的先后
+const homeGroup = page
+  .locator("section")
+  .filter({ has: page.getByRole("heading", { name: "家里的 Mac", exact: true }) });
+await homeGroup.locator("tbody tr", { hasText: "Claude CLI" }).getByRole("button", { name: /会话/ }).click();
 await page.getByRole("heading", { name: "与 Agent 对话" }).waitFor();
 check(
   "会话页选中的是那台机器",
-  await waitFor(() => page.locator("button.bg-sky-950\\/50", { hasText: "家里的 Mac" }).first().isVisible()),
+  await waitFor(() =>
+    page
+      .getByRole("button", { name: "家里的 Mac", exact: true })
+      .evaluate((el) => el.className.includes("bg-sky-950")),
+  ),
 );
 check("只列出那台机器上的 Agent", (await page.locator("button", { hasText: /^(Claude CLI|Codex CLI|Grok CLI|Pi Agent)$/ }).count()) === 1);
 

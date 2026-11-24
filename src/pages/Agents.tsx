@@ -27,7 +27,8 @@ export default function Agents() {
       if (a === "local") return -1;
       if (b === "local") return 1;
       const name = (id: string) => byMachine.get(id)?.[0]?.nodeName ?? id;
-      return name(a).localeCompare(name(b));
+      // 固定按中文规则排：不指定的话，中文名和外文名谁在前取决于系统（macOS 与 Linux 的结果就不一样）
+      return name(a).localeCompare(name(b), "zh");
     });
   }, [agents]);
 
