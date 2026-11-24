@@ -76,6 +76,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    restore_sigpipe();
     let (command, options) = match parse() {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -95,6 +96,19 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+/// 输出被提前关掉（比如 `agentd info | head`）时像其它命令行工具一样安静地退出，
+/// 而不是因为写不进去而崩溃。Rust 默认忽略 SIGPIPE，这里改回系统的默认处理。
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: 只设置本进程的信号处理方式
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
 
 fn usage() -> String {
     format!(
@@ -795,18 +809,17 @@ async fn install(options: Options) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let home = autoagents_core::discovery::home_dir();
-        let dir = home.join(".config/systemd/user");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
-        let unit = dir.join("autoagents-agentd.service");
-        let name = unit.file_name().unwrap().to_string_lossy().into_owned();
-        let content = format!(
-            "[Unit]\nDescription=AutoAgents agentd\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart={exe} --data-dir {data}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
-        );
-        std::fs::write(&unit, content).map_err(|e| format!("写入 {} 失败：{e}", unit.display()))?;
+        // systemd 单元文件里带空格的路径要加引号
+        let quote = |text: &str| {
+            if text.contains(char::is_whitespace) {
+                format!("\"{text}\"")
+            } else {
+                text.to_string()
+            }
+        };
+        let exec = format!("{} --data-dir {}", quote(&exe), quote(&data));
         let run = |args: &[&str]| -> Result<(), String> {
             let out = std::process::Command::new("systemctl")
-                .args(["--user"])
                 .args(args)
                 .output()
                 .map_err(|e| format!("运行 systemctl 失败：{e}"))?;
@@ -820,10 +833,55 @@ async fn install(options: Options) -> Result<(), String> {
                 ))
             }
         };
-        run(&["daemon-reload"])?;
-        run(&["enable", "--now", &name])?;
-        println!("已安装为 systemd 用户服务并启动（{}）。", unit.display());
-        println!("要让它在你没有登录时也保持运行：sudo loginctl enable-linger $USER");
+        let has_systemd = Path::new("/run/systemd/system").exists();
+        if unsafe { libc::getuid() } == 0 && has_systemd {
+            // 服务器上常直接用 root：这时 `systemctl --user` 多半连不上会话总线，注册成系统服务
+            let unit = Path::new("/etc/systemd/system/autoagents-agentd.service");
+            std::fs::write(
+                unit,
+                format!(
+                    "[Unit]\nDescription=AutoAgents agentd\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart={exec}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )
+            .map_err(|e| format!("写入 {} 失败：{e}", unit.display()))?;
+            run(&["daemon-reload"])?;
+            run(&["enable", "--now", "autoagents-agentd.service"])?;
+            println!("已安装为 systemd 系统服务并启动（{}）。", unit.display());
+            println!("它以 root 身份运行；只让它在授权过的目录里干活的话，加上 --allow 重新安装。");
+        } else if has_systemd {
+            let home = autoagents_core::discovery::home_dir();
+            let dir = home.join(".config/systemd/user");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
+            let unit = dir.join("autoagents-agentd.service");
+            std::fs::write(
+                &unit,
+                format!(
+                    "[Unit]\nDescription=AutoAgents agentd\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nExecStart={exec}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
+                ),
+            )
+            .map_err(|e| format!("写入 {} 失败：{e}", unit.display()))?;
+            run(&["--user", "daemon-reload"])?;
+            run(&["--user", "enable", "--now", "autoagents-agentd.service"])?;
+            println!("已安装为 systemd 用户服务并启动（{}）。", unit.display());
+            // 没有登录时也要保持运行；没有权限就算了，提示一句
+            let user = autoagents_core::discovery::home_dir()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !user.is_empty()
+                && std::process::Command::new("loginctl")
+                    .args(["enable-linger", &user])
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            {
+                println!("已允许它在没有登录时也保持运行。");
+            } else {
+                println!("要让它在你没有登录时也保持运行：sudo loginctl enable-linger $USER");
+            }
+        } else {
+            println!("这台机器上没有 systemd，没法注册成服务。请自行保持下面这条命令运行（写进启动脚本、容器入口或进程管理器）：");
+            println!("  {exec}");
+        }
     }
     #[cfg(not(unix))]
     {
@@ -852,18 +910,27 @@ fn uninstall() -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let home = autoagents_core::discovery::home_dir();
-        let unit = home
-            .join(".config/systemd/user")
-            .join("autoagents-agentd.service");
+        // root 身份装的是系统服务，否则是用户服务；两处都清一遍
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "disable", "--now", "autoagents-agentd.service"])
             .output();
-        let _ = std::fs::remove_file(&unit);
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "--now", "autoagents-agentd.service"])
+            .output();
+        for unit in [
+            autoagents_core::discovery::home_dir()
+                .join(".config/systemd/user/autoagents-agentd.service"),
+            PathBuf::from("/etc/systemd/system/autoagents-agentd.service"),
+        ] {
+            let _ = std::fs::remove_file(unit);
+        }
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .output();
-        println!("已停止并移除服务。配置保留在 ~/.autoagents，重新安装会继续沿用。");
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .output();
+        println!("已停止并移除服务。配置保留在数据目录里，重新安装会继续沿用。");
     }
     #[cfg(not(unix))]
     {

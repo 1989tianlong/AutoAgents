@@ -1,0 +1,115 @@
+# 打 v* 标签：跑完测试后构建 agentd 与 autoagents-relay（Linux 用静态链接的 musl，拷到哪都能跑），
+# 连同 SHA256SUMS 发到 GitHub Releases。scripts/install-*.sh 就是从这里下载的。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BINARIES: agentd autoagents-relay
+
+jobs:
+  build:
+    name: 构建 · ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: 安装 cargo-zigbuild（交叉构建 musl 用）
+        if: matrix.zig
+        run: pip install cargo-zigbuild ziglang
+      - name: 构建
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p autoagents-node
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p autoagents-node
+          fi
+      - name: 打包并生成校验值
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="dist"
+          mkdir -p "$out"
+          archive="autoagents-node-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$out/$archive" $BINARIES
+          if command -v sha256sum >/dev/null; then
+            (cd "$out" && sha256sum "$archive")
+          else
+            (cd "$out" && shasum -a 256 "$archive")
+          done > "$out/SHA256SUMS"
+          ls -la "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binaries-*
+      - name: 汇总校验值，逐个核对
+        run: |
+          set -euo pipefail
+          cat dist/*/SHA256SUMS | sort -u > SHA256SUMS
+          mkdir -p out
+          mv dist/*/*.tar.gz out/
+          (cd out && while read -r sum file; do echo "$sum  $file" | sha256sum -c -; done < ../SHA256SUMS)
+          ls -la out
+          cat SHA256SUMS
+      - name: 创建 Release 并上传
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes="## 节点程序
+
+          | 平台 | 文件 |
+          | --- | --- |
+          | Linux x86_64（静态链接） | autoagents-node-x86_64-unknown-linux-musl.tar.gz |
+          | Linux arm64（静态链接） | autoagents-node-aarch64-unknown-linux-musl.tar.gz |
+          | macOS Intel | autoagents-node-x86_64-apple-darwin.tar.gz |
+          | macOS Apple Silicon | autoagents-node-aarch64-apple-darwin.tar.gz |
+
+          每个压缩包里有 agentd（装在被管理的机器上）和 autoagents-relay（自建中继）。
+          一般不用手动下载：AutoAgents「机器」页生成的安装命令会自动取对应平台的版本并校验 SHA256SUMS。"
+          # 同一个标签重跑时补充上传
+          if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.tar.gz SHA256SUMS --clobber
+          else
+            gh release create "$TAG" out/*.tar.gz SHA256SUMS \
+              --title "AutoAgents $TAG" \
+              --generate-notes \
+              --notes "$notes"
+          fi

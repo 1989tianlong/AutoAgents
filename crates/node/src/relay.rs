@@ -30,6 +30,12 @@ struct Options {
 
 #[tokio::main]
 async fn main() {
+    // 输出被提前关掉时像其它命令行工具一样安静地退出
+    #[cfg(unix)]
+    // SAFETY: 只设置本进程的信号处理方式
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     if let Err(e) = run().await {
         eprintln!("autoagents-relay：{e}");
         std::process::exit(1);

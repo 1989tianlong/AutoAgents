@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Rust 测试 · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 桌面应用（Tauri）在 Linux 上依赖 WebKitGTK；应用层的测试要把它编出来
+      - name: 安装桌面应用的 Linux 依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  ui:
+    name: 界面测试
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: 安装无头 WebKit
+        run: npx playwright-core install --with-deps webkit
+      - name: 类型检查
+        run: npx tsc --noEmit
+      - name: 启动开发服务器
+        run: npm run dev &
+      - name: 等开发服务器就绪
+        run: until curl -sf -o /dev/null http://localhost:1430/; do sleep 1; done
+      - name: 界面测试（Tauri 接口由 tests/ui/mock.mjs 模拟）
+        run: npm run test:ui
