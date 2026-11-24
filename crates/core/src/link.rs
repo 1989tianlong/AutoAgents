@@ -451,8 +451,8 @@ impl NodeAuth for NodeState {
 
 /// 节点这一头：在一条已建好的连接上服务一个控制端，直到连接结束。
 ///
-/// 返回 `Err` 的原因只用于日志。连接断了就会停掉这条连接上启动的对话，
-/// 不让 Agent 在这台机器上无人看管地跑下去。
+/// 返回 `Err` 的原因只用于日志。连接断了（或者这个任务被整个丢弃）就会停掉
+/// 这条连接上启动的对话，不让 Agent 在这台机器上无人看管地跑下去。
 pub async fn serve<S>(
     mut channel: Channel<S>,
     auth: Arc<dyn NodeAuth>,
@@ -461,21 +461,38 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let turns: TurnSet = Arc::default();
-    let result = serve_inner(&mut channel, auth, Arc::clone(&service), Arc::clone(&turns)).await;
+    let guard = TurnGuard::new(Arc::clone(&service));
+    let result = serve_inner(&mut channel, auth, Arc::clone(&service), Arc::clone(&guard.turns)).await;
     let _ = channel.close().await;
-    stop_turns(&turns, &service);
+    // guard 在这里离开作用域：停掉这条连接上还在跑的对话
     result
 }
 
 /// 连接上启动过的对话（供连接结束时统一停掉）
 type TurnSet = Arc<Mutex<std::collections::HashSet<String>>>;
 
-/// 连接结束后调用：停掉这条连接上还在跑的对话。
-/// 对话可能正安静地等着模型响应、没有事件可推，光靠「推送失败」发现不了断线。
-fn stop_turns(turns: &TurnSet, service: &Service) {
-    for key in turns.lock().unwrap().iter() {
-        service.stop_turn(key);
+/// 这条连接上启动过的对话的清单。离开作用域时停掉它们——正常结束、出错、
+/// 任务被整个丢弃都算。对话可能正安静地等着模型响应、没有事件可推，
+/// 光靠「推送失败」发现不了断线。
+struct TurnGuard {
+    turns: TurnSet,
+    service: Arc<Service>,
+}
+
+impl TurnGuard {
+    fn new(service: Arc<Service>) -> Self {
+        Self {
+            turns: Arc::default(),
+            service,
+        }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        for key in self.turns.lock().unwrap().iter() {
+            self.service.stop_turn(key);
+        }
     }
 }
 

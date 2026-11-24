@@ -22,6 +22,18 @@ use tokio::sync::watch;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVICE_LABEL: &str = "com.tianlong.autoagents.agentd";
+/// 像 `println!`，但写不进去也不算错：输出被 `| head` 这类命令提前关掉时，
+/// 安静地停下就好，不该让守护进程的启动输出变成一次崩溃。
+///
+/// 进程本身保持 Rust 的默认设置（忽略 SIGPIPE）：守护进程要往网络上写，
+/// 对端突然断开时的一次写入失败只能是一次 `Err`，不能把整个进程带走。
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 /// 配对码默认有效期
 const DEFAULT_PAIR_TTL: Duration = Duration::from_secs(600);
 /// 重连中继的退避范围
@@ -76,7 +88,6 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    restore_sigpipe();
     let (command, options) = match parse() {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -97,18 +108,6 @@ async fn main() {
     }
 }
 
-/// 输出被提前关掉（比如 `agentd info | head`）时像其它命令行工具一样安静地退出，
-/// 而不是因为写不进去而崩溃。Rust 默认忽略 SIGPIPE，这里改回系统的默认处理。
-#[cfg(unix)]
-fn restore_sigpipe() {
-    // SAFETY: 只设置本进程的信号处理方式
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
-#[cfg(not(unix))]
-fn restore_sigpipe() {}
 
 fn usage() -> String {
     format!(
@@ -147,11 +146,11 @@ fn parse() -> Result<(Command, Options), String> {
         };
         match arg.as_str() {
             "--help" | "-h" => {
-                println!("{}", usage());
+                say!("{}", usage());
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("agentd {VERSION}");
+                say!("agentd {VERSION}");
                 std::process::exit(0);
             }
             "install" => command = Command::Install,
@@ -385,16 +384,16 @@ async fn run(options: Options) -> Result<(), String> {
         ..Default::default()
     });
 
-    println!(
+    say!(
         "AutoAgents agentd {VERSION}\n  节点：{}（id {}）\n  数据目录：{}",
         config.name,
         config.node_id,
         data_dir.display()
     );
     if config.allow_roots.is_empty() {
-        println!("  允许操作的目录：不限制");
+        say!("  允许操作的目录：不限制");
     } else {
-        println!("  允许操作的目录：{}", config.allow_roots.join("，"));
+        say!("  允许操作的目录：{}", config.allow_roots.join("，"));
     }
 
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -624,13 +623,13 @@ fn pair(options: Options) -> Result<(), String> {
         &pair_request_path(&data_dir),
         serde_json::to_string(&request).map_err(|e| e.to_string())?.as_bytes(),
     )?;
-    println!(
+    say!(
         "配对码：{code}\n  {} 分钟内有效，只能用一次（守护进程会在几秒内读到这个请求）。\n",
         (ttl.as_secs() + 59) / 60
     );
-    println!("在另一台电脑的 AutoAgents 里：机器 → 添加机器 → 选「已安装 agentd」。");
+    say!("在另一台电脑的 AutoAgents 里：机器 → 添加机器 → 选「已安装 agentd」。");
     if !config.relay.is_empty() {
-        println!(
+        say!(
             "  在线机器里选「{}」，输入上面的配对码。\n  （选不到时手动填写节点 id：{}）",
             config.name, config.node_id
         );
@@ -650,7 +649,7 @@ fn pair(options: Options) -> Result<(), String> {
                 }
             })
             .unwrap_or_else(|| config.listen.clone());
-        println!(
+        say!(
             "  直连地址：wss://{host}\n  证书指纹：{fingerprint}\n  或把这一行原样粘贴进去：\n  {}",
             node_connect_string(&host, &fingerprint, &config.node_id, &config.name, &code)
         );
@@ -691,14 +690,14 @@ fn info(options: Options) -> Result<(), String> {
     let data_dir = data_dir(&options);
     let config = load_config(&options, &data_dir)?;
     let hubs = load_hubs(&data_dir)?;
-    println!("AutoAgents agentd {VERSION}");
-    println!("  节点：{}（id {}）", config.name, config.node_id);
-    println!("  数据目录：{}", data_dir.display());
+    say!("AutoAgents agentd {VERSION}");
+    say!("  节点：{}（id {}）", config.name, config.node_id);
+    say!("  数据目录：{}", data_dir.display());
     if config.relay.is_empty() && config.listen.is_empty() {
-        println!("  接入方式：尚未配置");
+        say!("  接入方式：尚未配置");
     }
     if !config.relay.is_empty() {
-        println!(
+        say!(
             "  经中继：{}{}",
             config.relay,
             if config.fingerprint.is_empty() {
@@ -709,10 +708,10 @@ fn info(options: Options) -> Result<(), String> {
         );
     }
     if !config.listen.is_empty() {
-        println!("  直连监听：{}", config.listen);
+        say!("  直连监听：{}", config.listen);
     }
-    println!("  已配对的控制端：{} 个", hubs.len());
-    println!(
+    say!("  已配对的控制端：{} 个", hubs.len());
+    say!(
         "  允许操作的目录：{}",
         if config.allow_roots.is_empty() {
             "不限制".to_string()
@@ -720,7 +719,7 @@ fn info(options: Options) -> Result<(), String> {
             config.allow_roots.join("，")
         }
     );
-    println!(
+    say!(
         "  同时运行的对话上限：{}",
         if config.max_turns == 0 { 8 } else { config.max_turns }
     );
@@ -749,9 +748,9 @@ async fn install(options: Options) -> Result<(), String> {
         .ok_or("找不到 agentd 自己的路径")?;
     let exe = exe.to_string_lossy().into_owned();
     let data = data_dir.to_string_lossy().into_owned();
-    println!("节点：{}（id {}）", config.name, config.node_id);
-    println!("程序：{exe}");
-    println!("数据目录：{data}");
+    say!("节点：{}（id {}）", config.name, config.node_id);
+    say!("程序：{exe}");
+    say!("数据目录：{data}");
 
     #[cfg(target_os = "macos")]
     {
@@ -805,7 +804,7 @@ async fn install(options: Options) -> Result<(), String> {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        println!("已安装为开机自启的服务并启动（{}）。", plist.display());
+        say!("已安装为开机自启的服务并启动（{}）。", plist.display());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -846,8 +845,8 @@ async fn install(options: Options) -> Result<(), String> {
             .map_err(|e| format!("写入 {} 失败：{e}", unit.display()))?;
             run(&["daemon-reload"])?;
             run(&["enable", "--now", "autoagents-agentd.service"])?;
-            println!("已安装为 systemd 系统服务并启动（{}）。", unit.display());
-            println!("它以 root 身份运行；只让它在授权过的目录里干活的话，加上 --allow 重新安装。");
+            say!("已安装为 systemd 系统服务并启动（{}）。", unit.display());
+            say!("它以 root 身份运行；只让它在授权过的目录里干活的话，加上 --allow 重新安装。");
         } else if has_systemd {
             let home = autoagents_core::discovery::home_dir();
             let dir = home.join(".config/systemd/user");
@@ -862,7 +861,7 @@ async fn install(options: Options) -> Result<(), String> {
             .map_err(|e| format!("写入 {} 失败：{e}", unit.display()))?;
             run(&["--user", "daemon-reload"])?;
             run(&["--user", "enable", "--now", "autoagents-agentd.service"])?;
-            println!("已安装为 systemd 用户服务并启动（{}）。", unit.display());
+            say!("已安装为 systemd 用户服务并启动（{}）。", unit.display());
             // 没有登录时也要保持运行；没有权限就算了，提示一句
             let user = autoagents_core::discovery::home_dir()
                 .file_name()
@@ -874,19 +873,19 @@ async fn install(options: Options) -> Result<(), String> {
                     .output()
                     .is_ok_and(|out| out.status.success())
             {
-                println!("已允许它在没有登录时也保持运行。");
+                say!("已允许它在没有登录时也保持运行。");
             } else {
-                println!("要让它在你没有登录时也保持运行：sudo loginctl enable-linger $USER");
+                say!("要让它在你没有登录时也保持运行：sudo loginctl enable-linger $USER");
             }
         } else {
-            println!("这台机器上没有 systemd，没法注册成服务。请自行保持下面这条命令运行（写进启动脚本、容器入口或进程管理器）：");
-            println!("  {exec}");
+            say!("这台机器上没有 systemd，没法注册成服务。请自行保持下面这条命令运行（写进启动脚本、容器入口或进程管理器）：");
+            say!("  {exec}");
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (exe, data);
-        println!(
+        say!(
             "Windows 暂不支持自动注册服务。请把下面这行加入「启动」文件夹或任务计划程序：\n  {exe} --data-dir {data}"
         );
     }
@@ -906,7 +905,7 @@ fn uninstall() -> Result<(), String> {
             .args(["bootout", &format!("gui/{uid}/{SERVICE_LABEL}")])
             .output();
         let _ = std::fs::remove_file(&plist);
-        println!("已停止并移除服务。配置保留在 ~/.autoagents，重新安装会继续沿用。");
+        say!("已停止并移除服务。配置保留在 ~/.autoagents，重新安装会继续沿用。");
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -930,11 +929,11 @@ fn uninstall() -> Result<(), String> {
         let _ = std::process::Command::new("systemctl")
             .args(["daemon-reload"])
             .output();
-        println!("已停止并移除服务。配置保留在数据目录里，重新安装会继续沿用。");
+        say!("已停止并移除服务。配置保留在数据目录里，重新安装会继续沿用。");
     }
     #[cfg(not(unix))]
     {
-        println!("Windows 上没有注册服务，无需卸载。");
+        say!("Windows 上没有注册服务，无需卸载。");
     }
     Ok(())
 }

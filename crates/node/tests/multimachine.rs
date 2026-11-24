@@ -49,10 +49,18 @@ struct Processes {
 }
 
 impl Processes {
-    fn dump(&self) -> String {
+    fn dump(&mut self) -> String {
         let mut text = String::new();
-        for (i, proc) in self.procs.iter().enumerate() {
-            text.push_str(&format!("--- 进程 {i} 的标准错误（尾部）：\n{}\n", clip_tail(&proc.log.lock().unwrap(), 3000)));
+        for (i, proc) in self.procs.iter_mut().enumerate() {
+            // 顺手收一下退出状态：还在跑的进程日志没收全，先把现在有的打出来
+            let state = match proc.child.try_wait() {
+                Ok(Some(status)) => format!("已退出 {status}"),
+                _ => "还在运行".to_string(),
+            };
+            text.push_str(&format!(
+                "--- 进程 {i}：{state}；标准错误（尾部）：\n{}\n",
+                clip_tail(&proc.log.lock().unwrap(), 3000)
+            ));
         }
         text
     }
@@ -220,14 +228,9 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     assert!(wrong.is_err(), "配对码不对不该配上");
 
     // 配对：握手后立即换成长期密钥
-    let link = connect(
-        &relay,
-        &node_id,
-        secure::psk_from_code(&code),
-        Some(long_term),
-    )
-    .await
-    .unwrap();
+    let link = connect(&relay, &node_id, secure::psk_from_code(&code), Some(long_term))
+        .await
+        .unwrap_or_else(|e| panic!("凭配对码连不上：{e}\n{}", processes.dump()));
     let info = link.call("sys.info", json!({})).await.unwrap();
     assert_eq!(info["name"], "home-pc");
     assert_eq!(info["flavor"], "agentd");

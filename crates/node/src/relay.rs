@@ -16,6 +16,18 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+/// 像 `println!`，但写不进去也不算错：输出被 `| head` 这类命令提前关掉时，
+/// 安静地停下就好，不该让守护进程的启动输出变成一次崩溃。
+///
+/// 进程本身保持 Rust 的默认设置（忽略 SIGPIPE）：守护进程要往网络上写，
+/// 对端突然断开时的一次写入失败只能是一次 `Err`，不能把整个进程带走。
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LISTEN: &str = "0.0.0.0:7000";
 
@@ -30,12 +42,6 @@ struct Options {
 
 #[tokio::main]
 async fn main() {
-    // 输出被提前关掉时像其它命令行工具一样安静地退出
-    #[cfg(unix)]
-    // SAFETY: 只设置本进程的信号处理方式
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
     if let Err(e) = run().await {
         eprintln!("autoagents-relay：{e}");
         std::process::exit(1);
@@ -73,11 +79,11 @@ fn parse() -> Result<Options, String> {
         };
         match arg.as_str() {
             "--help" | "-h" => {
-                println!("{}", usage());
+                say!("{}", usage());
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("autoagents-relay {VERSION}");
+                say!("autoagents-relay {VERSION}");
                 std::process::exit(0);
             }
             "--listen" => options.listen = value("--listen")?,
@@ -157,7 +163,7 @@ async fn run() -> Result<(), String> {
         format!("wss://{host}:{}", bound.port())
     });
 
-    println!(
+    say!(
         "AutoAgents 中继 {VERSION} 已启动\n  监听：{bound}{}\n  令牌：{token}\n  数据目录：{}",
         if options.tls {
             "（自带 TLS）"
@@ -167,13 +173,13 @@ async fn run() -> Result<(), String> {
         options.data_dir.display()
     );
     if let Some(fingerprint) = &fingerprint {
-        println!("  证书指纹：{fingerprint}");
+        say!("  证书指纹：{fingerprint}");
     }
-    println!(
+    say!(
         "\n把下面这行「中继连接串」粘贴到 AutoAgents 的「机器 → 中继设置」：\n  {}",
         connect_string(&public, fingerprint.as_ref(), &token)
     );
-    println!("\nCtrl+C 停止。");
+    say!("\nCtrl+C 停止。");
 
     let result = serve(
         listener,
