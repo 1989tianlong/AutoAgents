@@ -1,5 +1,6 @@
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
+import { useNodeEvents } from "./lib/nodeEvents";
 import Dashboard from "./pages/Dashboard";
 import Machines from "./pages/Machines";
 import Agents from "./pages/Agents";
@@ -12,6 +13,7 @@ import Activity from "./pages/Activity";
 import Settings from "./pages/Settings";
 
 export default function App() {
+  useNodeEvents();
   return (
     <HashRouter>
       <div className="flex h-full">

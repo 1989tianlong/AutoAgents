@@ -116,45 +116,43 @@ async fn run() -> Result<(), String> {
     let listener = TcpListener::bind(&options.listen)
         .await
         .map_err(|e| format!("无法监听 {}：{e}", options.listen))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("无法得知监听地址：{e}"))?;
     let (online, _) = watch::channel(Vec::new());
 
-    let (kind, fingerprint, public) = if options.tls {
+    let (kind, fingerprint) = if options.tls {
         let identity = Identity::load_or_create(&options.data_dir.join("identity"))?;
         let acceptor = tokio_rustls::TlsAcceptor::from(identity.server_config()?);
-        // 没给对外地址时按监听地址推一个，提醒用户换成公网 IP 或域名
-        let public = options.public.unwrap_or_else(|| {
-            let (host, port) = options
-                .listen
-                .rsplit_once(':')
-                .unwrap_or(("", "7000"));
-            let host = if host == "0.0.0.0" || host.is_empty() || host == "::" {
-                "<公网IP或域名>"
-            } else {
-                host
-            };
-            format!("wss://{host}:{port}")
-        });
         (
             Kind::Tls {
                 relay: Relay::new(&token, online),
                 acceptor,
             },
             Some(identity.fingerprint()),
-            public,
         )
     } else {
-        (
-            Kind::Plain(Relay::new(&token, online)),
-            None,
-            options
-                .public
-                .unwrap_or_else(|| "wss://<反向代理的域名>".to_string()),
-        )
+        (Kind::Plain(Relay::new(&token, online)), None)
     };
+    // 对外地址：没给的话，自带 TLS 时按监听地址推一个（提醒换成公网 IP 或域名）；
+    // 放在反向代理后面时只能由用户给
+    let public = options.public.clone().unwrap_or_else(|| {
+        if !options.tls {
+            return "wss://<反向代理的域名>".to_string();
+        }
+        let ip = bound.ip();
+        let host = if ip.is_unspecified() {
+            "<公网IP或域名>".to_string()
+        } else if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        format!("wss://{host}:{}", bound.port())
+    });
 
     println!(
-        "AutoAgents 中继 {VERSION} 已启动\n  监听：{}{}\n  令牌：{token}\n  数据目录：{}",
-        options.listen,
+        "AutoAgents 中继 {VERSION} 已启动\n  监听：{bound}{}\n  令牌：{token}\n  数据目录：{}",
         if options.tls {
             "（自带 TLS）"
         } else {

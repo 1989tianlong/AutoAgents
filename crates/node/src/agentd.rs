@@ -29,9 +29,6 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// 多久看一次有没有新的配对请求
 const PAIR_POLL: Duration = Duration::from_secs(2);
-/// 配对码用的字母表：去掉了容易看错的 0 / O / 1 / I / L
-const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-
 /// 保存下来的配置（`<数据目录>/agentd.toml`）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -339,15 +336,6 @@ fn local_clock() -> String {
     format!("{:02}:{:02}:{:02}Z", secs / 3600 % 24, secs / 60 % 60, secs % 60)
 }
 
-fn generate_code() -> String {
-    let raw = secure::random::<16>();
-    let code: String = raw
-        .iter()
-        .map(|byte| CODE_ALPHABET[*byte as usize % CODE_ALPHABET.len()] as char)
-        .collect();
-    format!("{}-{}-{}-{}", &code[0..4], &code[4..8], &code[8..12], &code[12..16])
-}
-
 /// 前台运行
 async fn run(options: Options) -> Result<(), String> {
     let data_dir = data_dir(&options);
@@ -610,7 +598,7 @@ async fn pair_poller(path: PathBuf, state: Arc<NodeState>) {
 fn pair(options: Options) -> Result<(), String> {
     let data_dir = data_dir(&options);
     let config = load_config(&options, &data_dir)?;
-    let code = generate_code();
+    let code = secure::pairing_code();
     let ttl = options.ttl.unwrap_or(DEFAULT_PAIR_TTL);
     let request = PairRequest {
         code: code.clone(),

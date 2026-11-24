@@ -58,6 +58,19 @@ pub fn random_psk() -> Psk {
     random()
 }
 
+/// 配对码用的字母表：去掉了容易看错的 0 / O / 1 / I / L
+const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// 生成一个配对码：16 位约 79 比特，`XXXX-XXXX-XXXX-XXXX`
+pub fn pairing_code() -> String {
+    let raw: [u8; 16] = random();
+    let code: String = raw
+        .iter()
+        .map(|byte| CODE_ALPHABET[*byte as usize % CODE_ALPHABET.len()] as char)
+        .collect();
+    format!("{}-{}-{}-{}", &code[0..4], &code[4..8], &code[8..12], &code[12..16])
+}
+
 /// 配对码 → 握手用的 psk。配对码不区分大小写、忽略首尾空白与连字符（手工输入容错）。
 pub fn psk_from_code(code: &str) -> Psk {
     let normalized: String = code
@@ -434,6 +447,15 @@ mod tests {
         assert_eq!(wire["eph"].as_str().unwrap().len(), 43);
         let back: Hello = serde_json::from_value(wire).unwrap();
         assert_eq!(back, hello);
+    }
+
+    #[test]
+    fn pairing_codes_look_right_and_differ() {
+        let a = pairing_code();
+        let b = pairing_code();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 19);
+        assert!(a.chars().all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8))), "{a}");
     }
 
     #[test]

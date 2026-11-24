@@ -1,7 +1,7 @@
 //! 主机信息与资源指标：机器页的卡片、仪表盘的迷你图都从这里取。
 
 use crate::discovery;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
 
@@ -9,7 +9,7 @@ use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
 const CPU_SAMPLE: Duration = Duration::from_millis(300);
 
 /// 一台机器的静态信息
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
     /// 显示名（节点自己配置的名字，没有则用主机名）
@@ -28,7 +28,7 @@ pub struct MachineInfo {
 }
 
 /// 一台机器此刻的资源占用
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metrics {
     /// 全核平均 CPU 占用率（%）

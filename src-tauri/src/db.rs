@@ -46,6 +46,23 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             created_at TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (adapter, model)
         );
+        -- 配对过的远程机器。与机器配对的密钥不在这里：存系统 Keychain
+        CREATE TABLE IF NOT EXISTS nodes (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            -- 非空表示经这个中继接入；否则用 addr 直连
+            relay_url   TEXT NOT NULL DEFAULT '',
+            addr        TEXT NOT NULL DEFAULT '',
+            fingerprint TEXT NOT NULL DEFAULT '',
+            -- 最近一次拿到的机器信息（JSON）
+            info        TEXT,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+        -- 杂项设置（中继地址、安装脚本地址……；令牌类不在这里，存 Keychain）
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         -- 统一事件流：机器、会话、任务、部署的动态与审计都在这里
         CREATE TABLE IF NOT EXISTS events (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,

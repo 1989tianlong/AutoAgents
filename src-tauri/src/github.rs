@@ -1,4 +1,4 @@
-//! GitHub 接入：PAT 认证（Keychain 存储）+ REST API 只读查询。
+//! GitHub 接入：PAT 认证（存系统 Keychain）+ REST API 查询。
 
 use crate::AppState;
 use serde::Serialize;
@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tauri::State;
 
-const KEYRING_SERVICE: &str = "com.tianlong.autoagents";
-const KEYRING_ACCOUNT: &str = "github_pat";
+/// PAT 在凭据存储里的名字
+const PAT_ACCOUNT: &str = "github_pat";
 const API: &str = "https://api.github.com";
 
 #[derive(Clone, Serialize)]
@@ -54,10 +54,6 @@ pub struct GhPr {
     pub base_ref: String,
     pub updated_at: Option<String>,
     pub html_url: String,
-}
-
-pub struct GithubState {
-    token: String,
 }
 
 fn http() -> Result<reqwest::Client, String> {
@@ -108,7 +104,7 @@ async fn fetch_user(token: &str) -> Result<GhUser, String> {
     })
 }
 
-/// 连接 GitHub：验证 Token → 写入 Keychain → 缓存状态。
+/// 连接 GitHub：先验证 Token，通过后写入 Keychain。
 #[tauri::command]
 pub async fn github_connect(
     state: State<'_, Arc<AppState>>,
@@ -119,57 +115,40 @@ pub async fn github_connect(
         return Err("请输入 Token".into());
     }
     let user = fetch_user(&token).await?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .map_err(|e| format!("Keychain 初始化失败: {e}"))?;
-    entry
-        .set_password(&token)
-        .map_err(|e| format!("Keychain 写入失败: {e}"))?;
-    *state.gh.lock().unwrap() = Some(GithubState { token });
+    state.secrets.set(PAT_ACCOUNT, &token)?;
+    record(&state, "github.connected", "info", &user.login, "GitHub 已连接");
     Ok(user)
 }
 
-/// 查询连接状态；若内存无状态则尝试从 Keychain 恢复。
+/// 查询连接状态：有保存的 Token 就拿它验证一次。
 #[tauri::command]
 pub async fn github_status(state: State<'_, Arc<AppState>>) -> Result<Option<GhUser>, String> {
-    let cached = state.gh.lock().unwrap().as_ref().map(|st| st.token.clone());
-    let from_keyring = cached.is_none();
-    let token = match cached {
-        Some(t) => t,
-        None => {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-                .map_err(|e| format!("Keychain 初始化失败: {e}"))?;
-            match entry.get_password() {
-                Ok(t) => t,
-                Err(keyring::Error::NoEntry) => return Ok(None),
-                Err(e) => return Err(format!("读取 Keychain 失败: {e}")),
-            }
-        }
+    let Some(token) = state.secrets.get(PAT_ACCOUNT)? else {
+        return Ok(None);
     };
-    let user = fetch_user(&token).await?;
-    if from_keyring {
-        *state.gh.lock().unwrap() = Some(GithubState { token });
-    }
-    Ok(Some(user))
+    Ok(Some(fetch_user(&token).await?))
 }
 
-/// 断开连接：删除 Keychain 凭据并清空内存状态。
+/// 断开连接：删除 Keychain 凭据。
 #[tauri::command]
 pub async fn github_disconnect(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-        let _ = entry.delete_credential();
-    }
-    *state.gh.lock().unwrap() = None;
+    state.secrets.delete(PAT_ACCOUNT)?;
+    record(&state, "github.disconnected", "info", "GitHub", "GitHub 已断开连接");
     Ok(())
 }
 
-fn token_of(state: &State<'_, Arc<AppState>>) -> Result<String, String> {
+/// 取已保存的 Token；没有就提示先连接
+pub fn token_of(state: &AppState) -> Result<String, String> {
     state
-        .gh
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|st| st.token.clone())
+        .secrets
+        .get(PAT_ACCOUNT)?
         .ok_or_else(|| "尚未连接 GitHub，请先在 GitHub 页连接".to_string())
+}
+
+/// 记一条 GitHub 相关的事件（调用方没有持有数据库锁）
+pub fn record(state: &AppState, kind: &str, level: &str, source: &str, message: &str) {
+    let db = state.db.lock().unwrap();
+    crate::events::record(&db, kind, level, source, message, Some("#/github"));
 }
 
 /// 我参与的仓库（按更新时间倒序）。

@@ -7,10 +7,11 @@
 use autoagents_core::adapters;
 use autoagents_core::runner::{TurnEvent, TurnParams};
 use crate::nodes;
-use crate::AppState;
+use crate::{events, AppState};
 use rusqlite::params;
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
@@ -178,8 +179,37 @@ fn emit(state: &AppState, session_id: i64, event: ChatEvent) {
     state.sink.send(event);
 }
 
+/// 会话事件在活动流里的来源：机器名 · Agent
+fn event_source(state: &AppState, node: &str, adapter: &str) -> String {
+    let machine = if nodes::is_local(node) {
+        nodes::LOCAL_NAME.to_string()
+    } else {
+        state
+            .remote
+            .view(node)
+            .map(|view| view.name)
+            .unwrap_or_else(|_| node.to_string())
+    };
+    format!("{machine} · {adapter}")
+}
+
+/// 记一条会话事件（活动页与仪表盘从这里读）
+fn record_event(state: &AppState, session_id: i64, kind: &str, level: &str, source: &str, message: &str) {
+    let db = state.db.lock().unwrap();
+    events::record(
+        &db,
+        kind,
+        level,
+        source,
+        message,
+        Some(&format!("#/sessions?s={session_id}")),
+    );
+}
+
 /// 本轮以失败收尾：写入系统消息、通知前端、从运行中摘掉
 fn fail(state: &AppState, session_id: i64, message: &str) {
+    let (node, adapter) = session_where(state, session_id);
+    record_event(state, session_id, "session.failed", "warning", &event_source(state, &node, &adapter), message);
     insert_message(state, session_id, "system", message, Usage::default(), None);
     emit(
         state,
@@ -190,6 +220,62 @@ fn fail(state: &AppState, session_id: i64, message: &str) {
         },
     );
     state.live.lock().unwrap().remove(&session_id);
+}
+
+/// 机器掉线（或被要求重连）：它上面正在运行的对话不可能再有结果了，以失败收尾。
+/// 节点看到连接断开时会停掉这条连接上的对话，这里让控制端的记录跟上。
+pub fn fail_node_sessions(state: &Arc<AppState>, node: &str) {
+    let ids: Vec<i64> = state
+        .live
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, turn)| turn.node == node)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        fail(state, id, "与机器的连接断开，这一轮已停止");
+    }
+}
+
+/// 一轮对话在哪个机器上、用哪个 Agent
+fn session_where(state: &AppState, session_id: i64) -> (String, String) {
+    let db = state.db.lock().unwrap();
+    db.query_row(
+        "SELECT node_id, adapter FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| nodes::LOCAL.to_string()),
+                row.get::<_, String>(1)?,
+            ))
+        },
+    )
+    .unwrap_or_else(|_| (nodes::LOCAL.to_string(), String::new()))
+}
+
+/// 发出一轮时记一笔：活动流里能看到「谁在干什么」
+fn note_started(state: &AppState, session_id: i64, turn: &Turn, node: &str) {
+    record_event(
+        state,
+        session_id,
+        "session.started",
+        "info",
+        &event_source(state, node, &turn.adapter),
+        &format!("开始一轮：{}", clip_title(&turn.prompt)),
+    );
+}
+
+fn clip_title(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(40).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// 首次拿到外部会话标识就落库：应用中途退出后，会话仍然可以续聊
@@ -235,13 +321,30 @@ fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) 
                 input_tokens,
                 output_tokens,
             };
+            let elapsed = started.elapsed().as_millis() as i64;
             insert_message(
                 state,
                 session_id,
                 "assistant",
                 &text,
                 usage,
-                Some(started.elapsed().as_millis() as i64),
+                Some(elapsed),
+            );
+            let (node, adapter) = session_where(state, session_id);
+            let spent = match cost_usd {
+                Some(cost) => format!("≈ ${cost:.4}"),
+                None => match (input_tokens, output_tokens) {
+                    (Some(i), Some(o)) => format!("{} → {o} tokens", thousands(i)),
+                    _ => "用量未知".to_string(),
+                },
+            };
+            record_event(
+                state,
+                session_id,
+                "session.finished",
+                "info",
+                &event_source(state, &node, &adapter),
+                &format!("完成一轮：用时 {}，{spent}", fmt_duration(elapsed)),
             );
             emit(
                 state,
@@ -266,6 +369,28 @@ fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) 
     }
 }
 
+fn thousands(n: i64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn fmt_duration(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms} 毫秒")
+    } else if ms < 60_000 {
+        format!("{}.{:.0} 秒", ms / 1000, (ms % 1000) / 100)
+    } else {
+        format!("{} 分 {} 秒", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
 /// 事件总线 → 会话归档。应用启动时启动一个，常驻。
 pub fn dispatch(state: Arc<AppState>, mut rx: mpsc::UnboundedReceiver<NodeEvent>) {
     tauri::async_runtime::spawn(async move {
@@ -281,6 +406,7 @@ pub fn dispatch(state: Arc<AppState>, mut rx: mpsc::UnboundedReceiver<NodeEvent>
 /// 登记为运行中并发出这一轮。先登记再启动：此后任何一次状态查询都能看到这个会话，
 /// 事件总线上的事件也都有地方归档。之后的收尾由事件总线上的终态事件触发。
 fn spawn_turn(state: &Arc<AppState>, session_id: i64, turn: Turn, node: String) {
+    note_started(state, session_id, &turn, &node);
     state.live.lock().unwrap().insert(
         session_id,
         LiveTurn {
@@ -294,8 +420,30 @@ fn spawn_turn(state: &Arc<AppState>, session_id: i64, turn: Turn, node: String) 
         // 没能启动的（机器掉线、目录被删……）：这一轮以失败收尾
         if let Err(e) = nodes::call(&state, &node, "turn.start", &params).await {
             fail(&state, session_id, &e);
+            return;
         }
+        stop_if_requested(&state, session_id, &node).await;
     });
+}
+
+/// 机器登记完这一轮之后补发停止：用户可能在它登记之前就点了停止，
+/// 那一次停止会扑空（机器上还没有这一轮）。
+async fn stop_if_requested(state: &Arc<AppState>, session_id: i64, node: &str) {
+    let requested = state
+        .live
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .is_some_and(|turn| turn.stop_requested.load(Ordering::SeqCst));
+    if requested {
+        let _ = nodes::call(
+            state,
+            node,
+            "turn.stop",
+            &serde_json::json!({ "turnId": session_id.to_string() }),
+        )
+        .await;
+    }
 }
 
 /// 开启新会话并发送第一条消息。model 为空时沿用 Agent 自身配置的默认模型；
@@ -419,13 +567,16 @@ pub async fn send(state: &Arc<AppState>, session_id: i64, prompt: &str) -> Resul
         workdir,
         prompt,
     };
+    note_started(state, session_id, &turn, &node);
     // 已经登记过；这里只负责发出
     let st = Arc::clone(state);
     tauri::async_runtime::spawn(async move {
         let params = serde_json::to_value(turn_params(session_id, &turn)).expect("序列化对话参数");
         if let Err(e) = nodes::call(&st, &node, "turn.start", &params).await {
             fail(&st, session_id, &e);
+            return;
         }
+        stop_if_requested(&st, session_id, &node).await;
     });
     Ok(())
 }
@@ -525,6 +676,8 @@ pub struct LiveTurn {
     activity: Option<String>,
     node: String,
     started: Instant,
+    /// 用户已经点了停止（机器上登记这一轮之前点的，要等登记完再补发）
+    stop_requested: AtomicBool,
 }
 
 impl Default for LiveTurn {
@@ -534,6 +687,7 @@ impl Default for LiveTurn {
             activity: None,
             node: String::new(),
             started: Instant::now(),
+            stop_requested: AtomicBool::new(false),
         }
     }
 }
@@ -545,6 +699,29 @@ pub struct LiveTurnInfo {
     pub text: String,
     pub activity: Option<String>,
     pub node_id: String,
+}
+
+/// 停止正在运行的一轮对话；已产出的文本会保留。
+///
+/// 机器上可能还没登记这一轮（刚发出、或链路慢）：先记下停止请求，
+/// 等它登记完由 [`stop_if_requested`] 补发。
+pub async fn stop(state: &Arc<AppState>, session_id: i64) -> Result<(), String> {
+    let node = {
+        let mut live = state.live.lock().unwrap();
+        let turn = live
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("会话 #{session_id} 没有在运行"))?;
+        turn.stop_requested.store(true, Ordering::SeqCst);
+        turn.node.clone()
+    };
+    nodes::call(
+        state,
+        &node,
+        "turn.stop",
+        &serde_json::json!({ "turnId": session_id.to_string() }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// 正在运行的会话及其实时输出。界面以它为准：窗口不可见时推送事件可能没有送达，
@@ -564,24 +741,6 @@ pub fn live(state: &Arc<AppState>) -> Vec<LiveTurnInfo> {
     list
 }
 
-/// 停止正在运行的一轮对话；已产出的文本会保留。
-pub async fn stop(state: &Arc<AppState>, session_id: i64) -> Result<(), String> {
-    let node = {
-        let live = state.live.lock().unwrap();
-        live.get(&session_id)
-            .map(|turn| turn.node.clone())
-            .ok_or_else(|| format!("会话 #{session_id} 没有在运行"))?
-    };
-    nodes::call(
-        &state,
-        &node,
-        "turn.stop",
-        &serde_json::json!({ "turnId": session_id.to_string() }),
-    )
-    .await?;
-    Ok(())
-}
-
 #[tauri::command]
 pub fn chat_live(state: State<'_, Arc<AppState>>) -> Vec<LiveTurnInfo> {
     live(&state)
@@ -595,42 +754,15 @@ pub async fn chat_stop(state: State<'_, Arc<AppState>>, session_id: i64) -> Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::testutil::{fake_agent, test_state, Collect, TestState};
     use autoagents_core::runner::BinaryResolver;
     use autoagents_core::service::{Service, ServiceOptions};
-    use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::time::Duration;
 
-    /// 收集推给界面的事件
-    #[derive(Clone, Default)]
-    struct Collector(Arc<Mutex<Vec<ChatEvent>>>);
-
-    impl Sink for Collector {
-        fn send(&self, event: ChatEvent) {
-            self.0.lock().unwrap().push(event);
-        }
-    }
-
-    /// 造一个冒充 claude 的脚本，并返回只认它的服务
-    fn fake_agent(script: &str) -> (PathBuf, Arc<Service>) {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("claude");
-        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        std::mem::forget(dir);
-        let fake = bin.clone();
-        let service = Service::new(ServiceOptions {
-            resolve: Some(Arc::new(move |_: &str| Some(fake.clone())) as BinaryResolver),
-            ..Default::default()
-        });
-        (bin, service)
-    }
-
-    fn test_state(service: Arc<Service>) -> (Arc<AppState>, Collector) {
-        let collector = Collector::default();
-        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
-        let state = AppState::new(db, service, Arc::new(collector.clone()));
-        (state, collector)
+    /// 只要状态和收集会话事件的那个收集器
+    fn chat_state(service: Arc<Service>) -> (Arc<AppState>, Collect<ChatEvent>) {
+        let TestState { state, chat, .. } = test_state(service);
+        (state, chat)
     }
 
     type Row = (String, String, Option<f64>, Option<i64>);
@@ -663,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn turn_streams_persists_and_settles() {
         let (_, service) = fake_agent(OK);
-        let (state, collector) = test_state(service);
+        let (state, collector) = chat_state(service);
         let id = start(&state, None, "claude-cli", Some("glm-5.3"), Some("~"), "hi").await.unwrap();
         settle(&state, id).await;
         let rows = rows(&state, id);
@@ -701,7 +833,7 @@ mod tests {
     #[tokio::test]
     async fn live_snapshot_tracks_progress() {
         let (_, service) = fake_agent(OK);
-        let (state, _) = test_state(service);
+        let (state, _) = chat_state(service);
         let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
         settle(&state, id).await;
         let running = live(&state);
@@ -711,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn start_rejects_bad_input_without_creating_a_session() {
         let (bin, service) = fake_agent(OK);
-        let (state, _) = test_state(service);
+        let (state, _) = chat_state(service);
         assert!(start(&state, None, "zcode", None, None, "hi").await.unwrap_err().contains("适配"));
         assert!(start(&state, None, "claude-cli", None, None, "  ").await.unwrap_err().contains("不能为空"));
         let missing = bin.parent().unwrap().join("no-such-dir");
@@ -734,7 +866,7 @@ mod tests {
         // 把收到的参数原样当作回答带回来，便于断言命令行
         let echo = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' "{\"type\":\"result\",\"is_error\":false,\"result\":\"$*\"}""#;
         let (_, service) = fake_agent(echo);
-        let (state, _) = test_state(service);
+        let (state, _) = chat_state(service);
         let id = start(&state, None, "claude-cli", Some("glm-5.3"), None, "one").await.unwrap();
         settle(&state, id).await;
         assert!(send(&state, id, "two").await.is_ok());
@@ -750,7 +882,7 @@ mod tests {
 
         // 运行中再发：拒绝，且不落用户消息
         let (_, slow) = fake_agent("sleep 30");
-        let (state, _) = test_state(slow);
+        let (state, _) = chat_state(slow);
         let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
         assert!(state.live.lock().unwrap().contains_key(&id));
         assert!(send(&state, id, "again").await.unwrap_err().contains("还在运行"));
@@ -766,7 +898,7 @@ mod tests {
         let partial = r#"printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"部分"}}}'
 sleep 30"#;
         let (_, service) = fake_agent(partial);
-        let (state, collector) = test_state(service);
+        let (state, collector) = chat_state(service);
         let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
         // 等第一个增量到达再停
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -795,7 +927,7 @@ sleep 30"#;
             resolve: Some(Arc::new(|_: &str| None) as BinaryResolver),
             ..Default::default()
         });
-        let (state, collector) = test_state(service);
+        let (state, collector) = chat_state(service);
         let id = start(&state, None, "codex-cli", None, None, "hi").await.unwrap();
         settle(&state, id).await;
         let rows = rows(&state, id);
@@ -808,11 +940,76 @@ sleep 30"#;
         ));
     }
 
+    /// 机器还没登记这一轮时点了停止：停止请求先记下，等它登记完再补发
+    #[tokio::test]
+    async fn stop_before_the_turn_is_registered_is_replayed() {
+        let (_, slow) = fake_agent("sleep 30");
+        let (state, _) = chat_state(slow);
+        // 逐次紧挨着发、停：机器侧还没来得及登记的那几次，停止要靠事后补发
+        for _ in 0..5 {
+            let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+            stop(&state, id).await.unwrap();
+            settle(&state, id).await;
+            assert!(!state.live.lock().unwrap().contains_key(&id), "停止后不该留在运行中");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.service.running_turns() > 0 {
+            assert!(Instant::now() < deadline, "停止之后 Agent 进程还在运行");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 登记完之后才发现有人点过停止：照常补发
+        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        wait_running(&state, 1).await;
+        state
+            .live
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .stop_requested
+            .store(true, Ordering::SeqCst);
+        stop_if_requested(&state, id, "local").await;
+        settle(&state, id).await;
+        assert_eq!(state.service.running_turns(), 0);
+
+        // 已经登记的一轮：点停止照常立即结束
+        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        wait_running(&state, 1).await;
+        stop(&state, id).await.unwrap();
+        settle(&state, id).await;
+        assert_eq!(state.service.running_turns(), 0);
+    }
+
+    async fn wait_running(state: &AppState, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.service.running_turns() != count {
+            assert!(Instant::now() < deadline, "机器上应当有 {count} 轮在运行");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 上一轮刚结束就发下一轮：机器上这一轮不能还占着会话号
+    #[tokio::test]
+    async fn back_to_back_turns_do_not_collide() {
+        let (_, service) = fake_agent(OK);
+        let (state, _) = chat_state(service);
+        let id = start(&state, None, "claude-cli", None, None, "one").await.unwrap();
+        for prompt in ["two", "three", "four"] {
+            settle(&state, id).await;
+            send(&state, id, prompt).await.unwrap();
+            settle(&state, id).await;
+        }
+        let history = rows(&state, id);
+        assert_eq!(history.len(), 8, "四轮各一条用户消息、一条回答：{history:?}");
+        assert!(history.iter().all(|row| row.0 != "system"), "{history:?}");
+    }
+
     /// 不是这台机器上那一轮的事件、已结束会话的迟到事件：一律忽略
     #[tokio::test]
     async fn stale_events_are_ignored() {
         let (_, service) = fake_agent("sleep 30");
-        let (state, _) = test_state(service);
+        let (state, _) = chat_state(service);
         let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
         let stale = TurnEvent::Finished {
             turn_id: "424242".into(),

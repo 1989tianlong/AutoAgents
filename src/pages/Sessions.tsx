@@ -1,23 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import {
   agentModels,
+  agentsAll,
   chatLive,
   chatMessages,
   chatSend,
   chatSessions,
   chatStart,
   chatStop,
-  discoverAgents,
-  getAppInfo,
+  machinesList,
   modelRemember,
 } from "../lib/api";
 import { CHAT_ADAPTERS } from "../lib/types";
 import type { ChatEvent, ChatMessage } from "../lib/types";
 import ModelPicker from "../components/ModelPicker";
-import { Badge } from "../components/ui";
+import DirPicker from "../components/DirPicker";
+import { Badge, StatusDot } from "../components/ui";
 
 /** 有会话在运行时，与 Rust 端对账的间隔 */
 const RECONCILE_MS = 2000;
@@ -32,14 +33,23 @@ const isChatAdapter = (adapter: string) =>
   (CHAT_ADAPTERS as readonly string[]).includes(adapter);
 
 export default function Sessions() {
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const sessions = useQuery({ queryKey: ["chatSessions"], queryFn: chatSessions });
-  const agents = useQuery({ queryKey: ["agents"], queryFn: discoverAgents });
-  const { data: info } = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo });
+  // 所有机器上的 Agent：新会话可以指定在哪台机器上跑
+  const agents = useQuery({ queryKey: ["agentsAll"], queryFn: agentsAll });
+  const machines = useQuery({
+    queryKey: ["machines"],
+    queryFn: machinesList,
+    refetchInterval: 15000,
+  });
 
   const [selected, setSelected] = useState<number | null>(null);
   const [adapter, setAdapter] = useState(() => params.get("adapter") ?? "claude-cli");
+  /** 新会话所在的机器 */
+  const [node, setNode] = useState(() => params.get("node") ?? "local");
+  const [picking, setPicking] = useState(false);
   /** 选中的模型 ID；空串表示沿用 Agent 默认 */
   const [model, setModel] = useState("");
   const [workdir, setWorkdir] = useState("");
@@ -66,8 +76,8 @@ export default function Sessions() {
     enabled: selected != null,
   });
   const models = useQuery({
-    queryKey: ["agentModels", adapter],
-    queryFn: () => agentModels(adapter),
+    queryKey: ["agentModels", adapter, node],
+    queryFn: () => agentModels(adapter, node),
     staleTime: 60_000,
   });
 
@@ -182,13 +192,26 @@ export default function Sessions() {
     return () => window.clearInterval(timer);
   }, [hasRunning, reconcile]);
 
-  // 工作目录默认为主目录
-  const home = info?.home;
+  const machine = machines.data?.find((m) => m.id === node);
+  const machineNames = Object.fromEntries((machines.data ?? []).map((m) => [m.id, m.name]));
+  const machineName = (id: string | undefined) => (id && id !== "local" ? (machineNames[id] ?? id) : "本机");
+
+  // 工作目录默认为那台机器的主目录
+  const home = machine?.info?.home;
   useEffect(() => {
     if (home && !workdir) setWorkdir(home);
   }, [home, workdir]);
 
-  const cliAgents = agents.data?.filter((a) => a.kind === "cli" && isChatAdapter(a.adapter));
+  // 换一台机器：模型清单与默认目录都跟着换
+  const pickMachine = (id: string) => {
+    setNode(id);
+    setModel("");
+    setWorkdir(machines.data?.find((m) => m.id === id)?.info?.home ?? "");
+  };
+
+  const cliAgents = agents.data?.filter(
+    (a) => a.nodeId === node && a.kind === "cli" && isChatAdapter(a.adapter),
+  );
   // 当前选中的 Agent 在本机不可用时，换成第一个可用的
   useEffect(() => {
     if (cliAgents && cliAgents.length > 0 && !cliAgents.some((a) => a.adapter === adapter)) {
@@ -210,6 +233,22 @@ export default function Sessions() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messageCount, liveText, liveActivity, showPending]);
 
+  // 从活动记录等处跳进来：#/sessions?s=<会话号>。用完就把参数去掉，
+  // 免得之后用户切到别的会话时又被拉回来
+  useEffect(() => {
+    const wanted = Number(params.get("s"));
+    if (!wanted || !sessions.data?.some((s) => s.id === wanted)) return;
+    openSession(wanted);
+    setParams(
+      (prev) => {
+        prev.delete("s");
+        return prev;
+      },
+      { replace: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params, sessions.data]);
+
   const openSession = (id: number | null) => {
     selectedRef.current = id;
     setSelected(id);
@@ -228,10 +267,12 @@ export default function Sessions() {
       if (selected == null) {
         const use = isChatAdapter(adapter) ? adapter : "claude-cli";
         setStarting(true);
-        const id = await chatStart(use, chosenModel || null, workdir.trim() || null, text);
+        const id = await chatStart(use, chosenModel || null, workdir.trim() || null, text, node);
         setStarting(false);
         selectedRef.current = id;
         setSelected(id);
+        // 清单里立刻有这个会话：头部才能显示它的机器、Agent 等信息
+        qc.invalidateQueries({ queryKey: ["chatSessions"] });
         pushSeenRef.current.delete(id);
         if (!finishedRef.current.has(id)) updateRunning((ids) => [...ids, id]);
         // 清单之外的模型记下来，下次直接出现在下拉里
@@ -243,9 +284,28 @@ export default function Sessions() {
       } else {
         pushSeenRef.current.delete(selected);
         updateRunning((ids) => (ids.includes(selected) ? ids : [...ids, selected]));
+        // 自己的这条消息先显示出来：落库的那份要到这一轮结束才取回
+        const optimistic = {
+          id: -Date.now(),
+          sessionId: selected,
+          role: "user" as const,
+          content: text,
+          costUsd: null,
+          inputTokens: null,
+          outputTokens: null,
+          durationMs: null,
+          createdAt: "",
+        };
+        qc.setQueryData<ChatMessage[]>(["chatMessages", selected], (old) => [...(old ?? []), optimistic]);
         pendingStartRef.current.add(selected);
         try {
           await chatSend(selected, text);
+        } catch (e) {
+          // 没发出去：把先显示的那条撤掉
+          qc.setQueryData<ChatMessage[]>(["chatMessages", selected], (old) =>
+            (old ?? []).filter((m) => m.id !== optimistic.id),
+          );
+          throw e;
         } finally {
           pendingStartRef.current.delete(selected);
         }
@@ -280,12 +340,12 @@ export default function Sessions() {
   );
 
   const modelHint = models.isPending
-    ? "正在读取本机模型清单…"
+    ? "正在读取那台机器上的模型清单…"
     : models.isError
       ? String(models.error)
       : !models.data || models.data.options.length === 0
-        ? "没有从本机配置里读到模型清单，可以直接填写模型 ID"
-        : `模型清单来自 ${models.data.source}`;
+        ? "没有从那台机器的配置里读到模型清单，可以直接填写模型 ID"
+        : `模型清单来自 ${machine?.name ?? "那台机器"} 上的 ${models.data.source}`;
 
   return (
     <div className="flex h-full">
@@ -311,6 +371,14 @@ export default function Sessions() {
               <div className="truncate text-xs text-slate-300">{s.title}</div>
               <div className="mt-0.5 flex items-center justify-between text-[10px] text-slate-500">
                 <span className="truncate">{s.model ?? s.adapter}</span>
+                {s.nodeId !== "local" && (
+                  <span
+                    className="ml-1.5 max-w-16 shrink-0 truncate rounded bg-slate-800 px-1 text-slate-400"
+                    title={machineName(s.nodeId)}
+                  >
+                    {machineName(s.nodeId)}
+                  </span>
+                )}
                 <span className={`shrink-0 pl-2 ${running.includes(s.id) ? "text-sky-400" : ""}`}>
                   {running.includes(s.id) ? "运行中" : s.createdAt.slice(5, 16)}
                 </span>
@@ -326,7 +394,7 @@ export default function Sessions() {
           <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center p-8">
             <h1 className="text-xl font-semibold text-white">与 Agent 对话</h1>
             <p className="mt-1 text-sm text-slate-400">
-              在应用内直接驱动本机的 CLI Agent，上下文自动续接，历史保存在本机。
+              在应用内驱动任意一台已接入机器上的 CLI Agent，上下文自动续接，历史保存在本机。
             </p>
 
             {starting && pendingUser && (
@@ -337,6 +405,36 @@ export default function Sessions() {
             )}
 
             <div className="mt-6">
+              <div className="mb-2 text-xs text-slate-500">机器</div>
+              <div className="flex flex-wrap gap-2">
+                {machines.data?.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => pickMachine(m.id)}
+                    disabled={!m.online}
+                    title={m.online ? undefined : (m.status?.error ?? "不在线")}
+                    className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                      node === m.id
+                        ? "border-sky-600 bg-sky-950/50 text-white"
+                        : "border-slate-700 text-slate-300 hover:border-sky-600"
+                    }`}
+                  >
+                    <StatusDot online={m.online} />
+                    {m.name}
+                  </button>
+                ))}
+                {machines.isSuccess && machines.data.length === 1 && (
+                  <button
+                    onClick={() => navigate("/machines?add=1")}
+                    className="rounded-lg px-2 py-1.5 text-sm text-sky-400 transition hover:text-sky-300"
+                  >
+                    ＋ 接入其它机器
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4">
               <div className="mb-2 text-xs text-slate-500">Agent</div>
               <div className="flex flex-wrap gap-2">
                 {cliAgents?.map((a) => (
@@ -357,7 +455,9 @@ export default function Sessions() {
                 ))}
                 {agents.data && cliAgents?.length === 0 && (
                   <span className="text-xs text-slate-500">
-                    未发现可对话的 CLI Agent，请到 Agents 页重新扫描
+                    {machine?.online || node === "local"
+                      ? `「${machine?.name ?? "本机"}」上没有发现可对话的 CLI Agent，请到 Agents 页重新扫描`
+                      : "这台机器不在线"}
                   </span>
                 )}
               </div>
@@ -377,15 +477,25 @@ export default function Sessions() {
 
             <div className="mt-4">
               <div className="mb-2 text-xs text-slate-500">工作目录</div>
-              <input
-                value={workdir}
-                onChange={(e) => setWorkdir(e.currentTarget.value)}
-                spellCheck={false}
-                placeholder={home ?? "~"}
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200 placeholder:text-slate-600 focus:border-sky-600 focus:outline-none"
-              />
+              <div className="flex gap-2">
+                <input
+                  value={workdir}
+                  onChange={(e) => setWorkdir(e.currentTarget.value)}
+                  spellCheck={false}
+                  placeholder={home ?? "~"}
+                  className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200 placeholder:text-slate-600 focus:border-sky-600 focus:outline-none"
+                />
+                <button
+                  onClick={() => setPicking(true)}
+                  disabled={!home}
+                  title={home ? "在那台机器上浏览目录" : "连上那台机器之后才能浏览"}
+                  className="shrink-0 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 transition hover:border-sky-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  浏览…
+                </button>
+              </div>
               <p className="mt-1.5 text-[11px] text-slate-600">
-                Agent 在这个目录下读写文件、执行命令；留空为主目录。
+                Agent 在这个目录下读写文件、执行命令；留空为那台机器的主目录。
               </p>
             </div>
 
@@ -398,6 +508,9 @@ export default function Sessions() {
             <div className="flex items-center gap-2 border-b border-slate-800/80 px-6 py-2 text-xs text-slate-500">
               <span className="shrink-0">{curSession?.adapter ?? adapter}</span>
               {curSession?.model && <Badge tone="violet">{curSession.model}</Badge>}
+              <Badge tone={curSession?.nodeId === "local" ? "sky" : "emerald"}>
+                {machineName(curSession?.nodeId)}
+              </Badge>
               {isRunning && <Badge tone="sky">运行中</Badge>}
               {curSession?.workdir && (
                 <span
@@ -442,6 +555,19 @@ export default function Sessions() {
           </>
         )}
       </div>
+
+      {picking && home && (
+        <DirPicker
+          node={node}
+          machineName={machine?.name ?? "本机"}
+          start={workdir.trim() || home}
+          onPick={(path) => {
+            setWorkdir(path);
+            setPicking(false);
+          }}
+          onClose={() => setPicking(false)}
+        />
+      )}
     </div>
   );
 }

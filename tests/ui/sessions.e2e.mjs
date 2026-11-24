@@ -6,6 +6,7 @@
 // playwright-core 依次从命令行参数、环境变量 PLAYWRIGHT_CORE、项目依赖里查找；
 // 首次需要下载 WebKit：npx playwright-core install webkit
 import { createRequire } from "node:module";
+import { MOCK } from "./mock.mjs";
 
 const [, , urlArg, pwDirArg] = process.argv;
 const url = urlArg ?? "http://localhost:1430/#/sessions";
@@ -26,152 +27,6 @@ const waitFor = async (fn, ms = 7000) => {
     await sleep(80);
   }
   return false;
-};
-
-// 注入页面的模拟实现：只实现会话页用到的命令
-const MOCK = () => {
-  let nextId = 1;
-  const callbacks = new Map();
-  const listeners = new Map();
-  const state = {
-    nextSession: 1,
-    nextMessage: 1000,
-    sessions: [],
-    messages: new Map(),
-    live: [],
-    calls: [],
-    remembered: [],
-  };
-  const agents = ["claude-cli", "codex-cli", "grok-cli", "pi"].map((adapter, i) => ({
-    id: `local/${adapter}`,
-    name: ["Claude CLI", "Codex CLI", "Grok CLI", "Pi Agent"][i],
-    kind: "cli",
-    level: "L3",
-    adapter,
-    path: `/bin/${adapter}`,
-    version: "1.0",
-  }));
-  const models = {
-    "claude-cli": {
-      adapter: "claude-cli",
-      source: "~/.claude/settings.json",
-      default: "sonnet[1m]",
-      options: [
-        { value: "auto/glm-5.3-flash[1m]", label: "GLM-5.3-Flash · routing group", detail: "via magpie" },
-        { value: "zai/glm-5.3[1m]", label: "GLM-5.3 · Z.AI Coding Plan", detail: "via magpie" },
-      ],
-      custom: [],
-    },
-    "grok-cli": {
-      adapter: "grok-cli",
-      source: "~/.grok/config.toml",
-      default: "magpie/grok/grok-4.7",
-      options: [
-        { value: "magpie/grok/grok-4.7", label: "Grok 4.7 · Grok", detail: null },
-        { value: "magpie/auto/glm-5.3-flash", label: "GLM-5.3-Flash · routing group", detail: null },
-        { value: "magpie/zai/glm-5.3", label: "GLM-5.3 · Z.AI", detail: null },
-      ],
-      custom: [],
-    },
-    pi: { adapter: "pi", source: "pi --list-models", default: "magpie/grok/grok-4.7", options: [], custom: [] },
-  };
-  const handlers = {
-    "plugin:event|listen": ({ event, handler }) => {
-      listeners.set(handler, { event, id: handler });
-      return handler;
-    },
-    "plugin:event|unlisten": ({ eventId }) => {
-      listeners.delete(eventId);
-      return null;
-    },
-    app_info: () => ({ name: "autoagents", version: "0.1.0", os: "macos", arch: "aarch64", hostname: "test", home: "/Users/tester" }),
-    discover_agents: () => agents,
-    github_status: () => null,
-    tasks_list: () => [],
-    chat_sessions: () => state.sessions,
-    chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],
-    chat_live: () => state.live.map((l) => ({ ...l })),
-    agent_models: ({ adapter }) => {
-      const m = models[adapter];
-      if (!m) throw new Error(`mock: 没有为 ${adapter} 准备模型清单`);
-      return { ...m, custom: [...m.custom] };
-    },
-    model_remember: ({ adapter, model }) => {
-      state.remembered.push(`${adapter}|${model}`);
-      models[adapter].custom.push(model);
-    },
-    chat_start: ({ adapter, model, workdir, prompt }) => {
-      const id = state.nextSession++;
-      state.sessions.unshift({ id, adapter, title: prompt.slice(0, 24), model, workdir, createdAt: "2026-11-23 10:00:00" });
-      state.messages.set(id, []);
-      window.__mock.addUserMessage(id, prompt);
-      window.__mock.beginTurn(id);
-      return id;
-    },
-    chat_send: ({ sessionId, prompt }) => {
-      window.__mock.addUserMessage(sessionId, prompt);
-      window.__mock.beginTurn(sessionId);
-      return null;
-    },
-    chat_stop: () => null,
-  };
-  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
-  window.__TAURI_INTERNALS__ = {
-    transformCallback: (cb) => {
-      const id = nextId++;
-      callbacks.set(id, cb);
-      return id;
-    },
-    unregisterCallback: (id) => callbacks.delete(id),
-    metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-    invoke: async (cmd, args) => {
-      state.calls.push({ cmd, args: args ?? {} });
-      const h = handlers[cmd];
-      if (!h) throw new Error(`mock: 未实现的命令 ${cmd}`);
-      return h(args ?? {});
-    },
-  };
-  window.__mock = {
-    state,
-    /** Rust 端推送一个事件（真实环境里是 Tauri 的 emit）。返回送达的监听器个数 */
-    emit: (payload) => {
-      let n = 0;
-      for (const [id, l] of listeners) {
-        if (l.event === "chat-event") {
-          callbacks.get(id)?.({ event: "chat-event", id: n++, payload });
-        }
-      }
-      return n;
-    },
-    beginTurn: (sessionId) => {
-      state.live.push({ sessionId, text: "", activity: null });
-    },
-    addUserMessage: (sessionId, content) => {
-      state.messages.get(sessionId).push({
-        id: state.nextMessage++, sessionId, role: "user", content,
-        costUsd: null, inputTokens: null, outputTokens: null, createdAt: "",
-      });
-    },
-    /** Rust 端记录实时输出（窗口不可见、事件丢失时界面靠它显示进度） */
-    liveSet: (sessionId, text, activity) => {
-      const l = state.live.find((x) => x.sessionId === sessionId);
-      if (l) { l.text = text; l.activity = activity; }
-    },
-    /** Rust 端结束一轮：落库并从运行中摘掉 */
-    finishTurn: (sessionId, role, content) => {
-      state.live = state.live.filter((x) => x.sessionId !== sessionId);
-      state.messages.get(sessionId).push({
-        id: state.nextMessage++, sessionId, role, content,
-        costUsd: role === "assistant" ? 0.03 : null,
-        inputTokens: role === "assistant" ? 100 : null,
-        outputTokens: role === "assistant" ? 5 : null,
-        createdAt: "",
-      });
-    },
-    lastCall: (cmd) => [...state.calls].reverse().find((c) => c.cmd === cmd) ?? null,
-    listenerCount: () => [...listeners.values()].filter((l) => l.event === "chat-event").length,
-    callCount: () => state.calls.length,
-  };
 };
 
 const browser = await webkit.launch();
@@ -223,7 +78,7 @@ console.log("\n[1] 模型选择：按 Agent 读取清单、搜索、选中");
 await page.getByRole("button", { name: "Grok CLI" }).click();
 await waitFor(async () => (await modelInput().getAttribute("placeholder")) === "默认（magpie/grok/grok-4.7）");
 check("Grok 默认模型显示在占位符里", (await modelInput().getAttribute("placeholder")) === "默认（magpie/grok/grok-4.7）");
-check("标注模型清单来源", await page.getByText("模型清单来自 ~/.grok/config.toml").isVisible());
+check("标注模型清单来自哪台机器的哪个配置", await page.getByText("模型清单来自 本机 上的 ~/.grok/config.toml").isVisible());
 await modelInput().click();
 await page.getByRole("button", { name: /Grok 4\.7 · Grok/ }).waitFor();
 const optionCount = await page.locator("div.absolute button").count();
@@ -341,7 +196,7 @@ await page.evaluate((s) => {
 }, piId);
 await page.getByRole("link", { name: "仪表盘" }).click();
 await page.getByRole("heading", { name: "仪表盘" }).waitFor();
-await page.getByRole("link", { name: "会话" }).click();
+await page.getByRole("link", { name: "会话", exact: true }).click();
 check("会话列表显示运行中", await waitFor(async () => (await runningLabels().count()) === 1));
 await runningLabels().first().click();
 check("打开后显示后台产生的输出", await waitFor(async () => (await answerText()) === "后台仍在输出"));
@@ -351,10 +206,56 @@ console.log("\n[8] 没有任何会话在运行时，重新进入不会误标运�
 await page.evaluate(() => { window.__mock.state.live = []; });
 await page.getByRole("link", { name: "仪表盘" }).click();
 await page.getByRole("heading", { name: "仪表盘" }).waitFor();
-await page.getByRole("link", { name: "会话" }).click();
+await page.getByRole("link", { name: "会话", exact: true }).click();
 await page.getByRole("button", { name: "Grok CLI" }).waitFor();
 await sleep(2600);
 check("没有残留的运行中标记", (await runningLabels().count()) === 0);
+
+console.log("\n[9] 选择机器：Agent、模型清单、工作目录都跟着换到那台机器上");
+await page.evaluate(() => window.__mock.addMachine("home-mac", "家里的 Mac", { home: "/Users/home" }));
+// 等机器清单刷新后，新会话面板里出现那台机器
+await page.getByRole("button", { name: "＋ 新会话" }).click();
+const remoteChip = () => page.getByRole("button", { name: "家里的 Mac", exact: true });
+const localChip = () => page.getByRole("button", { name: "本机", exact: true });
+await remoteChip().waitFor();
+await remoteChip().click();
+check("选中的机器高亮", await page.locator("button.bg-sky-950\\/50", { hasText: "家里的 Mac" }).first().isVisible());
+check("Agent 清单换成那台机器上的", (await page.locator("button", { hasText: /^(Claude CLI|Codex CLI|Grok CLI|Pi Agent)$/ }).count()) === 1);
+check("工作目录默认是那台机器的主目录", (await page.getByPlaceholder("/Users/home").inputValue()) === "/Users/home");
+await modelInput().click();
+await waitFor(async () => (await lastCall("agent_models"))?.args.nodeId === "home-mac");
+check("模型清单按机器读取", (await lastCall("agent_models")).args.nodeId === "home-mac", JSON.stringify((await lastCall("agent_models")).args));
+
+console.log("\n[10] 浏览目录：列出那台机器上的目录，选中后填进工作目录");
+await page.getByRole("button", { name: "浏览…" }).click();
+await page.getByRole("heading", { name: /选择工作目录 · 家里的 Mac/ }).waitFor();
+await page.getByRole("button", { name: /code/ }).first().click();
+await waitFor(async () => (await lastCall("node_ls"))?.args.path === "/Users/home/code");
+check("进入子目录时按那台机器查询", (await lastCall("node_ls")).args.path === "/Users/home/code" && (await lastCall("node_ls")).args.nodeId === "home-mac", JSON.stringify((await lastCall("node_ls")).args));
+await page.getByRole("button", { name: "使用这个目录" }).click();
+check("选中的目录填进工作目录", (await page.getByPlaceholder("/Users/home").inputValue()) === "/Users/home/code");
+
+await send("remote hello");
+const remoteStart = await lastCall("chat_start");
+check("chat_start 带上机器 id", remoteStart.args.nodeId === "home-mac" && remoteStart.args.workdir === "/Users/home/code", JSON.stringify(remoteStart.args));
+await waitFor(async () => (await stopButton().isVisible()));
+check("会话头部标出所在机器", await page.locator("span", { hasText: "家里的 Mac" }).first().isVisible());
+const remoteId = await page.evaluate(() => window.__mock.state.sessions[0].id);
+await finishTurn(remoteId, "assistant", "来自另一台机器的回答");
+await emit({ type: "done", sessionId: remoteId });
+await waitFor(async () => !(await stopButton().isVisible()));
+
+console.log("\n[11] 机器不在线：不能选它发消息");
+await page.evaluate(() => {
+  const m = window.__mock.state.machines.find((x) => x.id === "home-mac");
+  m.online = false;
+  m.status.error = "节点 20 秒内没有回应，判定为断线";
+  window.__mock.emitNode({ id: m.id, name: m.name, online: false, message: m.status.error });
+});
+await page.getByRole("button", { name: "＋ 新会话" }).click();
+await sleep(2600);
+check("离线的机器不能选", await remoteChip().isDisabled());
+check("本机仍然可选", !(await localChip().isDisabled()));
 
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} 项通过${pageErrors.length ? `；页面错误 ${pageErrors.length} 条：` : ""}`);

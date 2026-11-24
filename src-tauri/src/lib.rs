@@ -1,21 +1,26 @@
 mod chat;
 mod db;
 mod discovery;
+mod events;
 mod github;
 mod models;
 mod nodes;
-mod nodes_remote;
+mod remote;
+mod secrets;
 mod tasks;
+mod usage;
+
+#[cfg(all(test, unix))]
+mod testutil;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tokio::sync::mpsc;
 
-/// 全局应用状态：SQLite 连接、GitHub 连接状态、本机的机器侧服务、运行中的会话。
+/// 全局应用状态：SQLite 连接、本机的机器侧服务、运行中的对话、远程机器、凭据存储。
 pub struct AppState {
-    pub db: Mutex<rusqlite::Connection>,
-    pub gh: Mutex<Option<github::GithubState>>,
+    pub db: Arc<Mutex<rusqlite::Connection>>,
     /// 本机的机器侧服务：与远程节点上 agentd 提供的是同一个服务
     pub service: Arc<autoagents_core::service::Service>,
     /// 对话事件总线：本机与各节点的过程事件都汇到这里，按会话归档
@@ -24,6 +29,12 @@ pub struct AppState {
     pub live: Mutex<HashMap<i64, chat::LiveTurn>>,
     /// 把会话事件推给界面
     pub sink: Arc<dyn chat::Sink>,
+    /// 凭据（系统 Keychain）：GitHub PAT、中继令牌、与各机器配对的密钥、部署平台令牌
+    pub secrets: Arc<dyn secrets::SecretStore>,
+    /// 远程机器：配对、连接、状态与请求转发
+    pub remote: Arc<remote::RemoteManager>,
+    /// 本机的机器信息：第一次取到后沿用
+    pub local_info: Mutex<Option<autoagents_core::machine::MachineInfo>>,
 }
 
 impl AppState {
@@ -32,17 +43,35 @@ impl AppState {
         db: rusqlite::Connection,
         service: Arc<autoagents_core::service::Service>,
         sink: Arc<dyn chat::Sink>,
+        node_sink: Arc<dyn remote::NodeSink>,
+        secrets: Arc<dyn secrets::SecretStore>,
     ) -> Arc<Self> {
         let (events, events_rx) = mpsc::unbounded_channel();
+        let db = Arc::new(Mutex::new(db));
+        let remote = remote::RemoteManager::new(
+            Arc::clone(&db),
+            Arc::clone(&secrets),
+            events.clone(),
+            node_sink,
+        );
         let state = Arc::new(Self {
-            db: Mutex::new(db),
-            gh: Mutex::new(None),
+            db,
             service,
             events,
             live: Mutex::new(HashMap::new()),
             sink,
+            secrets,
+            remote: Arc::new(remote),
+            local_info: Mutex::new(None),
         });
         chat::dispatch(state.clone(), events_rx);
+        // 机器掉线时结束它上面正在运行的对话。拿弱引用，免得状态与自己互相引用
+        let weak = Arc::downgrade(&state);
+        state.remote.set_on_offline(Arc::new(move |node| {
+            if let Some(state) = weak.upgrade() {
+                chat::fail_node_sessions(&state, node);
+            }
+        }));
         state
     }
 }
@@ -65,8 +94,12 @@ pub fn run() {
                 conn,
                 service,
                 Arc::new(chat::TauriSink(app.handle().clone())),
+                Arc::new(remote::TauriNodeSink(app.handle().clone())),
+                Arc::new(secrets::KeychainStore),
             );
-            app.manage(state);
+            app.manage(state.clone());
+            // 连上配对过的机器、开始跟踪中继（都在后台，不拖慢启动）
+            state.remote.start_all();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -90,6 +123,31 @@ pub fn run() {
             chat::chat_send,
             chat::chat_stop,
             chat::chat_live,
+            // 机器
+            agents_all,
+            machines_list,
+            node_metrics,
+            node_ls,
+            node_git,
+            remote::relay_get,
+            remote::relay_set,
+            remote::relay_clear,
+            remote::relay_status,
+            remote::install_script_set,
+            remote::node_install_command,
+            remote::node_pair,
+            remote::node_pair_direct,
+            remote::node_authorize,
+            remote::nodes_list,
+            remote::node_remove,
+            remote::node_rename,
+            remote::node_connect_now,
+            // 活动与审计
+            events::events_list,
+            events::events_counts,
+            events::events_clear,
+            // 用量与成本
+            usage::usage_summary,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -126,3 +184,5 @@ pub fn run() {
             }
         });
 }
+
+use nodes::{agents_all, machines_list, node_git, node_ls, node_metrics};

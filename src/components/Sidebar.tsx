@@ -1,5 +1,7 @@
 import { NavLink } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import type { SVGProps } from "react";
+import { getAppInfo } from "../lib/api";
 
 type IconProps = SVGProps<SVGSVGElement>;
 
@@ -100,6 +102,7 @@ const NAV = [
 ];
 
 export default function Sidebar() {
+  const { data: info } = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo, staleTime: Infinity });
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-800/80 bg-slate-900/40">
       <div className="flex items-center gap-3 px-5 py-5">
@@ -133,8 +136,8 @@ export default function Sidebar() {
       </nav>
 
       <div className="px-5 py-4 text-xs leading-5 text-slate-500">
-        <div>v0.1.0 · M1 单机骨架</div>
-        <div>GPL-3.0</div>
+        <div>AutoAgents v{info?.version ?? "…"}</div>
+        <div>GPL-3.0 · 端到端加密</div>
       </div>
     </aside>
   );

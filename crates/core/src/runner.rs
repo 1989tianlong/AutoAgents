@@ -172,10 +172,13 @@ impl Proc {
 
 impl TurnHandle {
     /// 请求停止：连同 Agent 拉起的子进程一起结束，已经产出的文本会保留。
+    ///
+    /// 先记下停止、先结束进程，最后才叫醒读取输出的一方：读取方醒来后会自己把进程
+    /// 拿走，那样这里就来不及结束了。
     pub fn stop(&self) {
         self.proc.cancelled.store(true, Ordering::SeqCst);
-        let _ = self.proc.stop_signal.send(true);
         self.kill();
+        let _ = self.proc.stop_signal.send(true);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -382,9 +385,16 @@ async fn run(
         }
     }
 
-    // 收回子进程：被停止时已经终止并回收
-    let child = proc.child.lock().unwrap().take();
+    // 收回子进程：被停止时通常已经终止并回收
+    let mut child = proc.child.lock().unwrap().take();
     let cancelled = proc.is_cancelled();
+    // 读取输出的一方先一步拿到了进程（输出先断、停止请求随后才到）：这里负责结束它。
+    // 不给它自行退出的宽限：用户要的是现在就停，Agent 多跑一秒都可能多改一个文件
+    if cancelled {
+        if let Some(running) = child.take() {
+            terminate(running).await;
+        }
+    }
 
     if let Some(message) = failure {
         emit(&tx, &proc, failed(&id, message)).await;

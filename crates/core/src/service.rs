@@ -19,7 +19,7 @@ use crate::discovery;
 use crate::machine;
 use crate::models;
 use crate::runner::{self, TurnEvent, TurnParams};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -190,10 +190,15 @@ impl Service {
                 let mut events_rx = output.events;
                 let mut stopped = false;
                 while let Some(event) = events_rx.recv().await {
+                    let ended = matches!(event, TurnEvent::Finished { .. } | TurnEvent::Failed { .. });
                     if !stopped && events.send(event).await.is_err() {
                         // 调用方已经离开（连接断开）：不让 Agent 在这台机器上无人看管地跑下去
                         stopped = true;
                         output.handle.stop();
+                    }
+                    // 终态一出手就不算运行中了：控制端紧接着发下一轮时，这一轮不能还占着会话号
+                    if ended {
+                        service.turns.lock().unwrap().remove(&turn_id);
                     }
                 }
                 service.turns.lock().unwrap().remove(&turn_id);
@@ -258,7 +263,7 @@ fn ls(path: &Path) -> Result<Value, String> {
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitOutput {
     /// 退出码；被信号结束时为空

@@ -1,16 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentEntry,
+  AppEvent,
   AppInfo,
   ChatMessage,
   ChatSession,
   DiscoveredAgent,
+  EventCounts,
   GhIssue,
   GhPr,
   GhRepo,
   GhUser,
+  InstallCommand,
   LiveTurn,
+  LsResult,
+  MachineView,
+  Metrics,
   ModelList,
+  RelayStatusView,
+  RelayView,
   Task,
+  UsageSummary,
 } from "./types";
 
 export const getAppInfo = () => invoke<AppInfo>("app_info");
@@ -18,11 +28,14 @@ export const getAppInfo = () => invoke<AppInfo>("app_info");
 /** 扫描本机 PATH 与 /Applications，发现已安装的 Agent */
 export const discoverAgents = () => invoke<DiscoveredAgent[]>("discover_agents");
 
+/** 所有机器上的 Agent：本机实时扫描，远程机器用最近一次同步到的清单 */
+export const agentsAll = () => invoke<AgentEntry[]>("agents_all");
+
 // ---------- 模型 ----------
 
-/** 某个 Agent 在本机可选的模型（从其配置文件 / CLI 读取） */
-export const agentModels = (adapter: string) =>
-  invoke<ModelList>("agent_models", { adapter });
+/** 某个 Agent 在指定机器上可选的模型（读那台机器上的配置文件 / CLI） */
+export const agentModels = (adapter: string, nodeId?: string | null) =>
+  invoke<ModelList>("agent_models", { adapter, nodeId });
 
 /** 记住手动填写的模型 */
 export const modelRemember = (adapter: string, model: string) =>
@@ -58,13 +71,15 @@ export const chatSessions = () => invoke<ChatSession[]>("chat_sessions");
 export const chatMessages = (sessionId: number) =>
   invoke<ChatMessage[]>("chat_messages", { sessionId });
 
-/** 开启新会话并发送第一条消息；model / workdir 留空时沿用 Agent 默认值 / 主目录 */
+/** 开启新会话并发送第一条消息；model / workdir 留空时沿用 Agent 默认值 / 那台机器的主目录。
+ *  nodeId 留空表示在本机执行。 */
 export const chatStart = (
   adapter: string,
   model: string | null,
   workdir: string | null,
   prompt: string,
-) => invoke<number>("chat_start", { adapter, model, workdir, prompt });
+  nodeId?: string | null,
+) => invoke<number>("chat_start", { adapter, model, workdir, prompt, nodeId });
 
 export const chatSend = (sessionId: number, prompt: string) =>
   invoke<void>("chat_send", { sessionId, prompt });
@@ -74,3 +89,71 @@ export const chatStop = (sessionId: number) => invoke<void>("chat_stop", { sessi
 
 /** 正在运行的会话及其实时输出：界面以它为准，补上没送达的事件 */
 export const chatLive = () => invoke<LiveTurn[]>("chat_live");
+
+// ---------- 机器 ----------
+
+export const machinesList = () => invoke<MachineView[]>("machines_list");
+export const nodesList = () => invoke<MachineView[]>("nodes_list");
+
+/** 某台机器此刻的资源占用 */
+export const nodeMetrics = (nodeId: string) => invoke<Metrics>("node_metrics", { nodeId });
+
+/** 列出某台机器上的子目录（远程选择工作目录用） */
+export const nodeLs = (nodeId: string, path: string) =>
+  invoke<LsResult>("node_ls", { nodeId, path });
+
+/** 在某台机器上的指定目录执行 git */
+export const nodeGit = (nodeId: string, workdir: string, args: string[]) =>
+  invoke<{ code: number | null; stdout: string; stderr: string }>("node_git", {
+    nodeId,
+    workdir,
+    args,
+  });
+
+export const relayGet = () => invoke<RelayView>("relay_get");
+export const relayClear = () => invoke<void>("relay_clear");
+export const relayStatus = () => invoke<RelayStatusView>("relay_status");
+
+/** 设置中继：粘贴中继启动时打印的连接串即可；也可以分开填地址、令牌、指纹 */
+export const relaySet = (p: {
+  text?: string | null;
+  addr?: string | null;
+  token?: string | null;
+  fingerprint?: string | null;
+}) => invoke<RelayView>("relay_set", p);
+
+export const installScriptSet = (url: string) => invoke<void>("install_script_set", { url });
+
+/** 给新机器生成安装命令（带一次性配对码，10 分钟内有效） */
+export const nodeInstallCommand = (name: string, allow: string[]) =>
+  invoke<InstallCommand>("node_install_command", { name, allow });
+
+/** 与中继上一台在线、尚未配对的机器配对 */
+export const nodePair = (nodeId: string, code: string, name?: string | null) =>
+  invoke<MachineView>("node_pair", { nodeId, code, name });
+
+/** 直连配对：粘贴那台机器上 `agentd pair` 打印的连接串 */
+export const nodePairDirect = (text: string) => invoke<MachineView>("node_pair_direct", { text });
+
+/** 让一台已配对的机器为另一台设备（另一台电脑上的 AutoAgents）开放配对 */
+export const nodeAuthorize = (nodeId: string) => invoke<string>("node_authorize", { nodeId });
+
+export const nodeRemove = (nodeId: string) => invoke<void>("node_remove", { nodeId });
+export const nodeRename = (nodeId: string, name: string) =>
+  invoke<MachineView>("node_rename", { nodeId, name });
+
+/** 立刻重连某台机器 */
+export const nodeConnectNow = (nodeId: string) => invoke<void>("node_connect_now", { nodeId });
+
+// ---------- 活动与审计 ----------
+
+export const eventsList = (limit = 100, kind?: string | null) =>
+  invoke<AppEvent[]>("events_list", { limit, kind });
+export const eventsCounts = () => invoke<EventCounts>("events_counts");
+/** 清空事件；keep > 0 时保留最近 keep 条 */
+export const eventsClear = (keep = 0) => invoke<number>("events_clear", { keep });
+
+// ---------- 用量与成本 ----------
+
+/** 用量汇总：总计、最近几天、按 Agent / 机器 / 会话（不同 Agent 口径不同，费用与 token 分开看） */
+export const usageSummary = (days = 14) => invoke<UsageSummary>("usage_summary", { days });
