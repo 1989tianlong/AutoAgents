@@ -9,13 +9,22 @@ use autoagents_core::relay::{self, RelayWatcher};
 use autoagents_core::secure::{self, Psk};
 use serde_json::json;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const HUB: &str = "hub-e2e";
+
+/// 要联调的程序：默认用 cargo 刚编出来的那个。设了 AUTOAGENTS_TEST_RELAY / AUTOAGENTS_TEST_AGENTD
+/// 就改用指定的文件——比如从 GitHub Releases 下载下来的，用来确认发出去的那一份也能走通
+fn bin(name: &str, built: &str) -> PathBuf {
+    let key = format!("AUTOAGENTS_TEST_{}", name.to_uppercase().replace('-', "_"));
+    std::env::var_os(&key)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(built))
+}
 
 /// 起了一个子进程，并把它的标准错误收进内存（出错时好打出来看）
 struct Process {
@@ -94,7 +103,7 @@ struct Relay {
 fn start_relay(data_dir: &Path, processes: &mut Processes) -> Relay {
     let mut child = Process::spawn(
         {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_autoagents-relay"));
+            let mut command = Command::new(bin("autoagents-relay", env!("CARGO_BIN_EXE_autoagents-relay")));
             command
                 .args(["--listen", "127.0.0.1:0", "--data-dir"])
                 .arg(data_dir)
@@ -137,7 +146,7 @@ fn parse_relay_string(query: &str) -> Relay {
 
 /// 起一台「被管理的机器」
 fn start_agentd(data_dir: &Path, relay: &Relay, code: Option<&str>, processes: &mut Processes) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agentd"));
+    let mut command = Command::new(bin("agentd", env!("CARGO_BIN_EXE_agentd")));
     command
         .args(["--data-dir"])
         .arg(data_dir)
