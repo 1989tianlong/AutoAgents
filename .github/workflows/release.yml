@@ -57,12 +57,13 @@ jobs:
           out="dist"
           mkdir -p "$out"
           archive="autoagents-node-${{ matrix.target }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "$out/$archive" $BINARIES
+          # COPYFILE_DISABLE：macOS 上别把 ._* 元数据文件打进包里（Linux 上没有影响）
+          COPYFILE_DISABLE=1 tar -C "target/${{ matrix.target }}/release" -czf "$out/$archive" $BINARIES
           if command -v sha256sum >/dev/null; then
             (cd "$out" && sha256sum "$archive")
           else
             (cd "$out" && shasum -a 256 "$archive")
-          done > "$out/SHA256SUMS"
+          fi > "$out/SHA256SUMS"
           ls -la "$out"
       - uses: actions/upload-artifact@v4
         with:
@@ -84,7 +85,8 @@ jobs:
       - name: 汇总校验值，逐个核对
         run: |
           set -euo pipefail
-          cat dist/*/SHA256SUMS | sort -u > SHA256SUMS
+          # 按文件名排，读起来顺眼；安装脚本按文件名去找对应的那一行
+          cat dist/*/SHA256SUMS | sort -u -k2 > SHA256SUMS
           mkdir -p out
           mv dist/*/*.tar.gz out/
           (cd out && while read -r sum file; do echo "$sum  $file" | sha256sum -c -; done < ../SHA256SUMS)
@@ -96,17 +98,23 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="## 节点程序
-
-          | 平台 | 文件 |
-          | --- | --- |
-          | Linux x86_64（静态链接） | autoagents-node-x86_64-unknown-linux-musl.tar.gz |
-          | Linux arm64（静态链接） | autoagents-node-aarch64-unknown-linux-musl.tar.gz |
-          | macOS Intel | autoagents-node-x86_64-apple-darwin.tar.gz |
-          | macOS Apple Silicon | autoagents-node-aarch64-apple-darwin.tar.gz |
-
-          每个压缩包里有 agentd（装在被管理的机器上）和 autoagents-relay（自建中继）。
-          一般不用手动下载：AutoAgents「机器」页生成的安装命令会自动取对应平台的版本并校验 SHA256SUMS。"
+          # 一行一行拼：直接写成多行字符串的话，后面几行会带着 YAML 的缩进，表格就被当成代码块了
+          notes="$(
+            printf '%s\n' \
+              '## 节点程序' \
+              '' \
+              '| 平台 | 文件 |' \
+              '| --- | --- |' \
+              '| Linux x86_64（静态链接） | autoagents-node-x86_64-unknown-linux-musl.tar.gz |' \
+              '| Linux arm64（静态链接） | autoagents-node-aarch64-unknown-linux-musl.tar.gz |' \
+              '| macOS Intel | autoagents-node-x86_64-apple-darwin.tar.gz |' \
+              '| macOS Apple Silicon | autoagents-node-aarch64-apple-darwin.tar.gz |' \
+              '' \
+              '每个压缩包里有 agentd（装在被管理的机器上）和 autoagents-relay（自建中继）。' \
+              '一般不用手动下载：AutoAgents「机器」页生成的安装命令会自动取对应平台的版本并校验 SHA256SUMS。' \
+              '' \
+              '桌面应用目前要从源码构建（`npm run tauri build`），见 README。'
+          )"
           # 同一个标签重跑时补充上传
           if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
             gh release upload "$TAG" out/*.tar.gz SHA256SUMS --clobber
