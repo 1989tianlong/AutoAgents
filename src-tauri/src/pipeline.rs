@@ -8,14 +8,14 @@
 //! - 推送用带校验的强推：分支在远端的样子必须和刚看到的一致，别人的提交不会被盖掉
 //! - Agent 的全部往来都在这个任务的会话里（会话页可以旁听、插话）；每一步都记进活动流
 
+use crate::AppState;
 use crate::github;
 use crate::nodes;
 use crate::tasks::{self, Task};
-use crate::AppState;
 use autoagents_core::service::GitOutput;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -78,7 +78,12 @@ pub fn split_repo(repo: &str) -> Result<(String, String), String> {
 // 在那台机器上执行 git
 // ---------------------------------------------------------------------------
 
-async fn git(state: &Arc<AppState>, node: &str, workdir: &str, args: &[&str]) -> Result<GitOutput, String> {
+async fn git(
+    state: &Arc<AppState>,
+    node: &str,
+    workdir: &str,
+    args: &[&str],
+) -> Result<GitOutput, String> {
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
     let value = nodes::call(
         state,
@@ -168,10 +173,16 @@ pub async fn prepare_worktree(
     base: &str,
     branch: &str,
 ) -> Result<Prepared, String> {
-    let repo_dir = git_ok(state, node, workdir, &["rev-parse", "--show-toplevel"], "确认仓库位置")
-        .await?
-        .trim()
-        .to_string();
+    let repo_dir = git_ok(
+        state,
+        node,
+        workdir,
+        &["rev-parse", "--show-toplevel"],
+        "确认仓库位置",
+    )
+    .await?
+    .trim()
+    .to_string();
     let remote = git(state, node, &repo_dir, &["remote", "get-url", "origin"])
         .await
         .ok()
@@ -183,11 +194,17 @@ pub async fn prepare_worktree(
         None if remote.is_empty() => return Err(format!("{repo_dir} 没有名为 origin 的远程仓库")),
         None => return Err(format!("{repo_dir} 的 origin（{remote}）不是 GitHub 仓库")),
     }
-    git_ok(state, node, &repo_dir, &["fetch", "origin", base], &format!("拉取 origin/{base}"))
-        .await
-        .map_err(|e| {
-            format!("{e}\n（这台机器上有权限访问 {owner}/{name} 吗？分支 {base} 存在吗？）")
-        })?;
+    git_ok(
+        state,
+        node,
+        &repo_dir,
+        &["fetch", "origin", base],
+        &format!("拉取 origin/{base}"),
+    )
+    .await
+    .map_err(|e| {
+        format!("{e}\n（这台机器上有权限访问 {owner}/{name} 吗？分支 {base} 存在吗？）")
+    })?;
     let worktree = worktree_path(&repo_dir, branch);
     let _ = git(
         state,
@@ -213,10 +230,16 @@ pub async fn prepare_worktree(
         "创建工作树",
     )
     .await?;
-    let base_sha = git_ok(state, node, &worktree, &["rev-parse", "HEAD"], "读取起点提交")
-        .await?
-        .trim()
-        .to_string();
+    let base_sha = git_ok(
+        state,
+        node,
+        &worktree,
+        &["rev-parse", "HEAD"],
+        "读取起点提交",
+    )
+    .await?
+    .trim()
+    .to_string();
     Ok(Prepared {
         repo_dir,
         worktree,
@@ -225,7 +248,12 @@ pub async fn prepare_worktree(
 }
 
 /// 把仓库克隆到那台机器上（机器上还没有这个仓库时用）
-pub async fn clone_repo(state: &Arc<AppState>, node: &str, url: &str, dir: &str) -> Result<String, String> {
+pub async fn clone_repo(
+    state: &Arc<AppState>,
+    node: &str,
+    url: &str,
+    dir: &str,
+) -> Result<String, String> {
     let url = url.trim();
     let dir = dir.trim().trim_end_matches('/');
     if url.is_empty() || dir.is_empty() {
@@ -254,7 +282,13 @@ pub async fn clean_worktree(state: &Arc<AppState>, task: &Task) -> Result<(), St
     ) else {
         return Ok(());
     };
-    let _ = git(state, node, repo_dir, &["worktree", "remove", "--force", worktree]).await;
+    let _ = git(
+        state,
+        node,
+        repo_dir,
+        &["worktree", "remove", "--force", worktree],
+    )
+    .await;
     let _ = git(state, node, repo_dir, &["branch", "-D", branch]).await;
     Ok(())
 }
@@ -311,7 +345,11 @@ fn build_prompt(brief: &str, owner: &str, name: &str, branch: &str, base: &str) 
 }
 
 /// 启动（或重新启动）一个任务：准备工作树，然后在这个任务专属的会话里把需求交给 Agent。
-pub async fn start(state: &Arc<AppState>, task_id: i64, opts: &StartOptions) -> Result<Task, String> {
+pub async fn start(
+    state: &Arc<AppState>,
+    task_id: i64,
+    opts: &StartOptions,
+) -> Result<Task, String> {
     let task = tasks::load(&state.db.lock().unwrap(), task_id)?;
     if task.status == "running" {
         return Err("任务正在进行中；要从头来先停止它".into());
@@ -428,7 +466,13 @@ fn last_is_answer(state: &AppState, session_id: i64) -> bool {
 fn fail(state: &Arc<AppState>, task_id: i64, reason: &str) {
     let db = state.db.lock().unwrap();
     if let Ok(task) = tasks::load(&db, task_id) {
-        let _ = tasks::set_status(&db, task_id, "failed", Some("出错了，可以重试"), Some(reason));
+        let _ = tasks::set_status(
+            &db,
+            task_id,
+            "failed",
+            Some("出错了，可以重试"),
+            Some(reason),
+        );
         tasks::record(&db, &task, "task.failed", "warning", &clip(reason, 160));
     }
 }
@@ -439,7 +483,10 @@ pub fn turn_started(state: &Arc<AppState>, session_id: i64) {
         return;
     };
     // 已完成的任务不往回走：合并之后再聊只是普通对话
-    if !matches!(task.status.as_str(), "running" | "changes" | "failed" | "reviewing") {
+    if !matches!(
+        task.status.as_str(),
+        "running" | "changes" | "failed" | "reviewing"
+    ) {
         return;
     }
     let db = state.db.lock().unwrap();
@@ -481,12 +528,17 @@ async fn evaluate(state: &Arc<AppState>, task_id: i64, ok: bool) -> Result<(), S
         let reason = last_message(state, task.session_id.unwrap_or_default(), Some("system"))
             .map(|(_, content)| content)
             .unwrap_or_else(|| "这一轮没有完成".to_string());
-        fail(state, task_id, &format!("这一轮没有完成：{}", clip(&reason, 600)));
+        fail(
+            state,
+            task_id,
+            &format!("这一轮没有完成：{}", clip(&reason, 600)),
+        );
         return Ok(());
     }
     let diff = diff(state, &task).await?;
     if diff.entries.is_empty() {
-        let reason = "Agent 完成了这一轮，但没有改动任何文件。可以到会话里让它接着做，或换个说法重试。";
+        let reason =
+            "Agent 完成了这一轮，但没有改动任何文件。可以到会话里让它接着做，或换个说法重试。";
         let db = state.db.lock().unwrap();
         let _ = tasks::set_status(&db, task_id, "failed", None, Some(reason));
         let task = tasks::load(&db, task_id)?;
@@ -547,7 +599,13 @@ pub async fn diff(state: &Arc<AppState>, task: &Task) -> Result<DiffView, String
         state,
         node,
         worktree,
-        &["-c", "core.quotepath=false", "status", "--porcelain", "--untracked-files=all"],
+        &[
+            "-c",
+            "core.quotepath=false",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
         "读取改动",
     )
     .await?;
@@ -800,7 +858,13 @@ async fn submit_inner(state: &Arc<AppState>, task_id: i64) -> Result<(), String>
         )
         .map_err(|e| e.to_string())?;
         let task = tasks::load(&db, task_id)?;
-        tasks::record(&db, &task, "task.pr", "info", &format!("已创建 PR #{}", pr.number));
+        tasks::record(
+            &db,
+            &task,
+            "task.pr",
+            "info",
+            &format!("已创建 PR #{}", pr.number),
+        );
         format!("已创建 PR #{}，等审查", pr.number)
     } else {
         // 已有的 PR：把这次的说明追加进去。追加不上不影响任务
@@ -940,7 +1004,13 @@ pub async fn fix(state: &Arc<AppState>, task_id: i64) -> Result<(), String> {
             None,
         )?;
         let task = tasks::load(&db, task_id)?;
-        tasks::record(&db, &task, "task.started", "info", "让 Agent 修没通过的检查");
+        tasks::record(
+            &db,
+            &task,
+            "task.started",
+            "info",
+            "让 Agent 修没通过的检查",
+        );
     }
     // 发不出去（比如上一轮还没停）：任务退回原状，不算失败
     if let Err(e) = crate::chat::send(state, session, &text).await {
@@ -977,7 +1047,9 @@ async fn recover(state: &Arc<AppState>) {
         return;
     };
     for task in running {
-        let Some(session) = task.session_id else { continue };
+        let Some(session) = task.session_id else {
+            continue;
+        };
         if state.live.lock().unwrap().contains_key(&session) {
             continue;
         }
@@ -1087,7 +1159,10 @@ mod tests {
     use super::*;
     use crate::chat;
     use crate::secrets::SecretStore;
-    use crate::testutil::{fake_script, git_in, read_request, respond, service_for, setup_repo, test_state, Req, TestState};
+    use crate::testutil::{
+        Req, TestState, fake_script, git_in, read_request, respond, service_for, setup_repo,
+        test_state,
+    };
 
     /// 假的 GitHub API：只实现流水线会调的那几个接口，并把收到的请求记下来
     struct FakeGithub {
@@ -1109,14 +1184,26 @@ mod tests {
             checks: Arc::default(),
             merged: Arc::default(),
         };
-        let (calls, checks, merged) = (Arc::clone(&fake.calls), Arc::clone(&fake.checks), Arc::clone(&fake.merged));
+        let (calls, checks, merged) = (
+            Arc::clone(&fake.calls),
+            Arc::clone(&fake.checks),
+            Arc::clone(&fake.merged),
+        );
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
-                let (calls, checks, merged) = (Arc::clone(&calls), Arc::clone(&checks), Arc::clone(&merged));
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (calls, checks, merged) =
+                    (Arc::clone(&calls), Arc::clone(&checks), Arc::clone(&merged));
                 tokio::spawn(async move {
-                    let Req { method, path, body, .. } = read_request(&mut stream).await;
-                    calls.lock().unwrap().push((method.clone(), path.clone(), body.clone()));
+                    let Req {
+                        method, path, body, ..
+                    } = read_request(&mut stream).await;
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone(), body.clone()));
                     // 回一段 JSON
                     macro_rules! json {
                         ($text:expr) => {
@@ -1192,7 +1279,12 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
             if want.contains(&task.status.as_str()) {
                 return task;
             }
-            assert!(std::time::Instant::now() < deadline, "任务一直停在 {}：{}", task.status, task.detail.as_deref().unwrap_or(""));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "任务一直停在 {}：{}",
+                task.status,
+                task.detail.as_deref().unwrap_or("")
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
@@ -1213,11 +1305,20 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         let github = start_github().await;
         let tmp = tempfile::tempdir().unwrap();
         let workdir = setup_repo(tmp.path());
-        let TestState { state, secrets, .. } = test_state(service_for(fake_script("claude", AGENT), None));
+        let TestState { state, secrets, .. } =
+            test_state(service_for(fake_script("claude", AGENT), None));
         *state.gh_api.lock().unwrap() = github.addr.clone();
         secrets.set("github_pat", "test-token").unwrap();
         let db = state.db.lock().unwrap();
-        let issue_task = tasks::create_issue(&db, "加一句问候", "o/r", 7, "https://github.test/o/r/issues/7").unwrap().id;
+        let issue_task = tasks::create_issue(
+            &db,
+            "加一句问候",
+            "o/r",
+            7,
+            "https://github.test/o/r/issues/7",
+        )
+        .unwrap()
+        .id;
         drop(db);
         let opts = StartOptions {
             adapter: "claude-cli".into(),
@@ -1229,14 +1330,32 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         let task = start(&state, issue_task, &opts).await.unwrap();
         assert_eq!(task.status, "running", "{task:?}");
         assert_eq!(task.base_branch.as_deref(), Some("main"));
-        assert!(task.worktree.as_deref().unwrap().ends_with("app-wt/agent-issue-7"), "{}", task.worktree.as_deref().unwrap_or(""));
+        assert!(
+            task.worktree
+                .as_deref()
+                .unwrap()
+                .ends_with("app-wt/agent-issue-7"),
+            "{}",
+            task.worktree.as_deref().unwrap_or("")
+        );
         let worktree = std::path::PathBuf::from(task.worktree.clone().unwrap());
         assert!(worktree.is_dir(), "工作树要真的建出来");
         let task = wait_status(&state, issue_task, &["changes", "failed"]).await;
-        assert_eq!(task.status, "changes", "{}", task.failure.as_deref().unwrap_or(""));
+        assert_eq!(
+            task.status,
+            "changes",
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
         let changes = diff(&state, &task).await.unwrap();
         assert_eq!(changes.entries.len(), 1, "{changes:?}");
-        assert_eq!((changes.entries[0].path.as_str(), changes.entries[0].status.as_str()), ("greet.txt", "?"));
+        assert_eq!(
+            (
+                changes.entries[0].path.as_str(),
+                changes.entries[0].status.as_str()
+            ),
+            ("greet.txt", "?")
+        );
         let patch = diff_file(&state, &task, "greet.txt", true)
             .await
             .unwrap_or_else(|e| panic!("读取未跟踪文件的改动失败：{e}"));
@@ -1258,8 +1377,15 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         assert!(prompt.contains("不要提交"), "{prompt}");
 
         // ---------- 2. 在会话里继续追问：任务回到进行中，改完再等确认 ----------
-        chat::send(&state, task.session_id.unwrap(), "再改一下").await.unwrap();
-        assert_eq!(tasks::load(&state.db.lock().unwrap(), issue_task).unwrap().status, "running");
+        chat::send(&state, task.session_id.unwrap(), "再改一下")
+            .await
+            .unwrap();
+        assert_eq!(
+            tasks::load(&state.db.lock().unwrap(), issue_task)
+                .unwrap()
+                .status,
+            "running"
+        );
         let task = wait_status(&state, issue_task, &["changes", "failed"]).await;
         assert_eq!(task.status, "changes");
 
@@ -1268,10 +1394,19 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         github.checks.lock().unwrap().push(("build".into(), false));
         github.checks.lock().unwrap().push(("test".into(), true));
         let task = submit(&state, issue_task).await.unwrap();
-        assert_eq!(task.status, "reviewing", "{}", task.failure.as_deref().unwrap_or(""));
+        assert_eq!(
+            task.status,
+            "reviewing",
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
         assert_eq!(task.pr_number, Some(1));
         assert_eq!(task.head_sha.as_deref(), Some("abc123"));
-        let log = git_in(&worktree, &["log", "--format=%an <%ae> %B", "origin/main..HEAD"]).stdout;
+        let log = git_in(
+            &worktree,
+            &["log", "--format=%an <%ae> %B", "origin/main..HEAD"],
+        )
+        .stdout;
         let log = String::from_utf8_lossy(&log);
         // 提交身份：那台机器上配了就用它的（这里读到什么，提交里就该是什么）；
         // 没配的话用 GitHub 账号的 noreply 地址
@@ -1282,32 +1417,70 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
             .output()
             .unwrap();
         let expected_email = if configured.status.success() {
-            String::from_utf8_lossy(&configured.stdout).trim().to_string()
+            String::from_utf8_lossy(&configured.stdout)
+                .trim()
+                .to_string()
         } else {
             "42+octo@users.noreply.github.com".to_string()
         };
-        assert!(log.contains(&expected_email), "提交身份应当是 {expected_email}：{log}");
+        assert!(
+            log.contains(&expected_email),
+            "提交身份应当是 {expected_email}：{log}"
+        );
         assert!(log.contains("Refs #7"), "{log}");
-        assert_eq!(git_in(&worktree, &["status", "--porcelain"]).stdout.len(), 0, "提交之后工作树是干净的");
+        assert_eq!(
+            git_in(&worktree, &["status", "--porcelain"]).stdout.len(),
+            0,
+            "提交之后工作树是干净的"
+        );
         let (_, body) = calls(&github, "POST", "/repos/o/r/pulls").remove(0);
         let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!((body["head"].as_str(), body["base"].as_str()), (Some("agent/issue-7"), Some("main")));
+        assert_eq!(
+            (body["head"].as_str(), body["base"].as_str()),
+            (Some("agent/issue-7"), Some("main"))
+        );
         assert!(body["body"].as_str().unwrap().contains("Closes #7"));
         assert!(body["body"].as_str().unwrap().contains("新增了问候语"));
         // 检查已经取回来了：一项通过、一项失败
-        assert_eq!(task.checks.as_ref().and_then(Value::as_array).map(Vec::len), Some(2));
+        assert_eq!(
+            task.checks.as_ref().and_then(Value::as_array).map(Vec::len),
+            Some(2)
+        );
         let detail = task.detail.as_deref().unwrap_or("");
-        assert!(detail.contains("1 项通过") && detail.contains("1 项失败"), "{detail}");
+        assert!(
+            detail.contains("1 项通过") && detail.contains("1 项失败"),
+            "{detail}"
+        );
         let kinds: Vec<String> = {
             let db = state.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT kind FROM events WHERE kind LIKE 'task.%' ORDER BY id").unwrap();
-            stmt.query_map([], |row| row.get(0)).unwrap().flatten().collect()
+            let mut stmt = db
+                .prepare("SELECT kind FROM events WHERE kind LIKE 'task.%' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .flatten()
+                .collect()
         };
-        assert_eq!(kinds, ["task.created", "task.started", "task.changes", "task.started", "task.changes", "task.pr"]);
+        assert_eq!(
+            kinds,
+            [
+                "task.created",
+                "task.started",
+                "task.changes",
+                "task.started",
+                "task.changes",
+                "task.pr"
+            ]
+        );
 
         // ---------- 4. CI 没通过：把日志交给 Agent 修，改完再推到同一个 PR 上 ----------
         fix(&state, issue_task).await.unwrap();
-        assert_eq!(tasks::load(&state.db.lock().unwrap(), issue_task).unwrap().status, "running");
+        assert_eq!(
+            tasks::load(&state.db.lock().unwrap(), issue_task)
+                .unwrap()
+                .status,
+            "running"
+        );
         let task = wait_status(&state, issue_task, &["changes", "failed"]).await;
         assert_eq!(task.status, "changes");
         assert!(worktree.join("fix.txt").exists(), "Agent 应当改了 fix.txt");
@@ -1322,24 +1495,44 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(fix_prompt.contains("FAILED src/greet.test.ts"), "{fix_prompt}");
+        assert!(
+            fix_prompt.contains("FAILED src/greet.test.ts"),
+            "{fix_prompt}"
+        );
         let task = submit(&state, issue_task).await.unwrap();
         assert_eq!(task.status, "reviewing");
-        let pushed = git_in(&worktree, &["rev-list", "--count", "origin/main..origin/agent/issue-7"]);
-        assert_eq!(String::from_utf8_lossy(&pushed.stdout).trim(), "2", "远端的分支上要有两个提交");
+        let pushed = git_in(
+            &worktree,
+            &["rev-list", "--count", "origin/main..origin/agent/issue-7"],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&pushed.stdout).trim(),
+            "2",
+            "远端的分支上要有两个提交"
+        );
         let (_, body) = calls(&github, "PATCH", "/repos/o/r/pulls/1").remove(0);
         assert!(body.contains("后续修改"), "{body}");
 
         // ---------- 5. 合并 ----------
         *github.merged.lock().unwrap() = true;
         let task = refresh(&state, issue_task).await.unwrap();
-        assert_eq!(task.status, "done", "{}", task.detail.as_deref().unwrap_or(""));
+        assert_eq!(
+            task.status,
+            "done",
+            "{}",
+            task.detail.as_deref().unwrap_or("")
+        );
 
         // ---------- 6. 做完直接发（不等确认）的手动任务 ----------
         *github.merged.lock().unwrap() = false;
-        let manual_task = tasks::create_manual(&state.db.lock().unwrap(), "补一份 CHANGELOG", "o/r", "写一份 CHANGELOG。")
-            .unwrap()
-            .id;
+        let manual_task = tasks::create_manual(
+            &state.db.lock().unwrap(),
+            "补一份 CHANGELOG",
+            "o/r",
+            "写一份 CHANGELOG。",
+        )
+        .unwrap()
+        .id;
         let task = start(
             &state,
             manual_task,
@@ -1353,10 +1546,23 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         assert_eq!(task.status, "running");
         assert!(task.instructions.as_deref().unwrap().contains("CHANGELOG"));
         let task = wait_status(&state, manual_task, &["reviewing", "failed"]).await;
-        assert_eq!(task.status, "reviewing", "{}", task.failure.as_deref().unwrap_or(""));
+        assert_eq!(
+            task.status,
+            "reviewing",
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
         let created = calls(&github, "POST", "/repos/o/r/pulls");
-        assert!(created[1].1.contains(r#""head":"agent/task-2""#), "{}", created[1].1);
-        assert!(!created[1].1.contains("Closes"), "手动任务的 PR 不该关联 Issue：{}", created[1].1);
+        assert!(
+            created[1].1.contains(r#""head":"agent/task-2""#),
+            "{}",
+            created[1].1
+        );
+        assert!(
+            !created[1].1.contains("Closes"),
+            "手动任务的 PR 不该关联 Issue：{}",
+            created[1].1
+        );
     }
 
     /// 认仓库地址、排工作树的位置
@@ -1376,8 +1582,14 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         );
         assert_eq!(parse_remote("git@gitlab.com:a/b.git"), None);
         assert_eq!(parse_remote("/srv/repos/app"), None);
-        assert_eq!(worktree_path("/Users/me/code/AutoAgents", "agent/issue-12"), "/Users/me/code/AutoAgents-wt/agent-issue-12");
-        assert_eq!(worktree_path("/repo", "agent/task-3"), "/repo-wt/agent-task-3");
+        assert_eq!(
+            worktree_path("/Users/me/code/AutoAgents", "agent/issue-12"),
+            "/Users/me/code/AutoAgents-wt/agent-issue-12"
+        );
+        assert_eq!(
+            worktree_path("/repo", "agent/task-3"),
+            "/repo-wt/agent-task-3"
+        );
         assert!(github::clip_tail("abc", 10).starts_with("abc"));
         let long = "l1\nl2\nl3";
         assert_eq!(github::clip_tail(long, 4), "…（前面省略）\nl3");
@@ -1388,12 +1600,15 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
     async fn failures_are_recorded_on_the_task() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = setup_repo(tmp.path());
-        let TestState { state, secrets, .. } = test_state(service_for(fake_script("claude", AGENT), None));
+        let TestState { state, secrets, .. } =
+            test_state(service_for(fake_script("claude", AGENT), None));
         // 没有可用的 GitHub 接口：连不上一个不存在的地址
         *state.gh_api.lock().unwrap() = "http://127.0.0.1:9".to_string();
         secrets.set("github_pat", "test-token").unwrap();
         let db = state.db.lock().unwrap();
-        let id = tasks::create_manual(&db, "不会成功", "o/r", "随便改改。").unwrap().id;
+        let id = tasks::create_manual(&db, "不会成功", "o/r", "随便改改。")
+            .unwrap()
+            .id;
         drop(db);
         let opts = StartOptions {
             adapter: "claude-cli".into(),
@@ -1402,29 +1617,70 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
             ..Default::default()
         };
         // 取不到默认分支（GitHub 接口连不上）：任务记为失败，原因留在任务上
-        let task = start(&state, id, &StartOptions { base_branch: None, ..opts.clone() }).await.unwrap();
+        let task = start(
+            &state,
+            id,
+            &StartOptions {
+                base_branch: None,
+                ..opts.clone()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(task.status, "failed", "{task:?}");
-        assert!(task.failure.as_deref().unwrap().contains("网络错误"), "{}", task.failure.as_deref().unwrap_or(""));
+        assert!(
+            task.failure.as_deref().unwrap().contains("网络错误"),
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
         assert!(task.worktree.is_none(), "还没建工作树就失败了");
 
         // 目录不是这个仓库
         let other = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&other).unwrap();
-        let task = start(&state, id, &StartOptions { workdir: other.to_string_lossy().into_owned(), ..opts.clone() }).await.unwrap();
+        let task = start(
+            &state,
+            id,
+            &StartOptions {
+                workdir: other.to_string_lossy().into_owned(),
+                ..opts.clone()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(task.status, "failed");
-        assert!(task.failure.as_deref().unwrap().contains("不是 o/r") || task.failure.as_deref().unwrap().contains("git"), "{}", task.failure.as_deref().unwrap_or(""));
+        assert!(
+            task.failure.as_deref().unwrap().contains("不是 o/r")
+                || task.failure.as_deref().unwrap().contains("git"),
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
 
         // Agent 没改任何文件
-        let talker = r#"printf '%s\n' '{"type":"result","is_error":false,"result":"我觉得不需要改。"}'"#;
+        let talker =
+            r#"printf '%s\n' '{"type":"result","is_error":false,"result":"我觉得不需要改。"}'"#;
         let idle = service_for(fake_script("claude", talker), None);
-        let TestState { state: state2, secrets: secrets2, .. } = test_state(idle);
+        let TestState {
+            state: state2,
+            secrets: secrets2,
+            ..
+        } = test_state(idle);
         secrets2.set("github_pat", "test-token").unwrap();
-        let id2 = tasks::create_manual(&state2.db.lock().unwrap(), "不用改", "o/r", "看看就好。").unwrap().id;
+        let id2 = tasks::create_manual(&state2.db.lock().unwrap(), "不用改", "o/r", "看看就好。")
+            .unwrap()
+            .id;
         // 假 Agent 输出一行就退出：start 返回的时候这一轮可能已经收尾、任务已经不是「进行中」了，
         // 所以这里不断言它此刻的状态，只等它走到头
         start(&state2, id2, &opts).await.unwrap();
         let task = wait_status(&state2, id2, &["failed", "changes"]).await;
         assert_eq!(task.status, "failed");
-        assert!(task.failure.as_deref().unwrap().contains("没有改动任何文件"), "{}", task.failure.as_deref().unwrap_or(""));
+        assert!(
+            task.failure
+                .as_deref()
+                .unwrap()
+                .contains("没有改动任何文件"),
+            "{}",
+            task.failure.as_deref().unwrap_or("")
+        );
     }
 }

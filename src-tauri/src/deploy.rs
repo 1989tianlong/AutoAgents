@@ -28,14 +28,14 @@
 //! Workers Builds 没有「指定分支发起构建」的接口：要走控制台里建的 Deploy Hook（地址存 Keychain）。
 //! 这套接口只认用户级令牌，账户级令牌会被拒绝。
 
+use crate::AppState;
 use crate::events;
 use crate::pipeline;
 use crate::remote::{set_setting, setting};
 use crate::tasks;
-use crate::AppState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -171,7 +171,9 @@ const TARGET_COLS: &str = "id, provider, name, platform_id, scope, url, repo, re
      prod_requires_approval, auto_fix, health_path, health_contains, has_hook, created_at, updated_at";
 
 fn row_to_target(row: &rusqlite::Row) -> rusqlite::Result<Target> {
-    let flag = |i: usize, default: i64| Ok::<bool, rusqlite::Error>(row.get::<_, Option<i64>>(i)?.unwrap_or(default) != 0);
+    let flag = |i: usize, default: i64| {
+        Ok::<bool, rusqlite::Error>(row.get::<_, Option<i64>>(i)?.unwrap_or(default) != 0)
+    };
     Ok(Target {
         id: row.get(0)?,
         provider: row.get(1)?,
@@ -290,7 +292,8 @@ const DEP_COLS: &str = "id, target_id, provider, project, env, state, raw_state,
      health, task_id";
 
 fn row_to_deployment(row: &rusqlite::Row) -> rusqlite::Result<Deployment> {
-    let flag = |i: usize| Ok::<bool, rusqlite::Error>(row.get::<_, Option<i64>>(i)?.unwrap_or(0) != 0);
+    let flag =
+        |i: usize| Ok::<bool, rusqlite::Error>(row.get::<_, Option<i64>>(i)?.unwrap_or(0) != 0);
     Ok(Deployment {
         id: row.get(0)?,
         target_id: row.get(1)?,
@@ -543,7 +546,14 @@ fn now_ms() -> i64 {
 
 /// 记一条部署相关的事件（调用方没有持有数据库锁）
 fn record(state: &AppState, kind: &str, level: &str, source: &str, message: &str, link: &str) {
-    events::record(&state.db.lock().unwrap(), kind, level, source, message, Some(link));
+    events::record(
+        &state.db.lock().unwrap(),
+        kind,
+        level,
+        source,
+        message,
+        Some(link),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -569,21 +579,32 @@ async fn vercel(
     let base = state.vercel_api.lock().unwrap().clone();
     let mut request = client(20)?
         .request(
-            method.parse().map_err(|_| format!("HTTP 方法不对：{method}"))?,
+            method
+                .parse()
+                .map_err(|_| format!("HTTP 方法不对：{method}"))?,
             format!("{base}{path}"),
         )
         .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let resp = request.send().await.map_err(|e| format!("连不上 Vercel：{e}"))?;
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("连不上 Vercel：{e}"))?;
     let code = resp.status().as_u16();
     let value: Option<Value> = resp.json().await.ok();
     if !(200..300).contains(&code) {
         let error = value.as_ref().and_then(|v| v.get("error"));
-        let detail = error.and_then(|e| e["message"].as_str()).unwrap_or_default();
+        let detail = error
+            .and_then(|e| e["message"].as_str())
+            .unwrap_or_default();
         let hint = match code {
-            401 | 403 if error.and_then(|e| e["invalidToken"].as_bool()).unwrap_or(false) => {
+            401 | 403
+                if error
+                    .and_then(|e| e["invalidToken"].as_bool())
+                    .unwrap_or(false) =>
+            {
                 "，令牌无效或已过期"
             }
             401 | 403 => "，访问被拒绝：检查令牌的范围（团队 / 项目）",
@@ -611,14 +632,19 @@ async fn cf(
     let base = state.cf_api.lock().unwrap().clone();
     let mut request = client(20)?
         .request(
-            method.parse().map_err(|_| format!("HTTP 方法不对：{method}"))?,
+            method
+                .parse()
+                .map_err(|_| format!("HTTP 方法不对：{method}"))?,
             format!("{base}{path}"),
         )
         .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let resp = request.send().await.map_err(|e| format!("连不上 Cloudflare：{e}"))?;
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("连不上 Cloudflare：{e}"))?;
     let status = resp.status().as_u16();
     let value: Option<Value> = resp.json().await.ok();
     let success = value
@@ -630,7 +656,9 @@ async fn cf(
             .as_ref()
             .and_then(|v| v["errors"].as_array())
             .and_then(|list| list.first());
-        let detail = error.and_then(|e| e["message"].as_str()).unwrap_or_default();
+        let detail = error
+            .and_then(|e| e["message"].as_str())
+            .unwrap_or_default();
         let code = error
             .and_then(|e| e["code"].as_i64())
             .map_or_else(|| status.to_string(), |code| code.to_string());
@@ -645,7 +673,9 @@ async fn cf(
             Err(format!("Cloudflare API 错误（{code}）：{detail}{hint}"))
         };
     }
-    Ok(value.map(|mut v| v.take()["result"].take()).unwrap_or(Value::Null))
+    Ok(value
+        .map(|mut v| v.take()["result"].take())
+        .unwrap_or(Value::Null))
 }
 
 fn token_of(state: &AppState, provider: Provider) -> Result<String, String> {
@@ -751,11 +781,7 @@ fn from_vercel(v: &Value) -> Option<Fresh> {
     let meta = &v["meta"];
     let pick = |github: &str, gitlab: &str| text(meta, github).or_else(|| text(meta, gitlab));
     Some(Fresh {
-        env: if production {
-            "production"
-        } else {
-            "preview"
-        },
+        env: if production { "production" } else { "preview" },
         current: production && text(v, "readySubstate").is_some_and(|s| s == "PROMOTED"),
         rollback_ok: v["isRollbackCandidate"].as_bool().unwrap_or(false),
         inspector_url: text(v, "inspectorUrl"),
@@ -788,7 +814,12 @@ fn from_pages(v: &Value) -> Option<Fresh> {
     // 部署阶段结束的时间才是就绪的时间；没有就退回修改时间
     let ready = v["stages"]
         .as_array()
-        .and_then(|stages| stages.iter().rev().find(|stage| stage["name"].as_str() == Some("deploy")))
+        .and_then(|stages| {
+            stages
+                .iter()
+                .rev()
+                .find(|stage| stage["name"].as_str() == Some("deploy"))
+        })
         .and_then(|stage| date(stage, "ended_on"))
         .or_else(|| date(v, "modified_on"));
     Some(Fresh {
@@ -839,11 +870,7 @@ fn from_workers(v: &Value, target: &Target) -> Option<Fresh> {
         })
     };
     Some(Fresh {
-        env: if production {
-            "production"
-        } else {
-            "preview"
-        },
+        env: if production { "production" } else { "preview" },
         current: false,
         rollback_ok: false,
         inspector_url: None,
@@ -860,7 +887,9 @@ fn from_workers(v: &Value, target: &Target) -> Option<Fresh> {
         created_ms: date(&["created_on"]),
         building_ms: date(&["build_start_on", "started_on"]),
         ready_ms: date(&["build_end_on", "finished_on", "modified_on"]),
-        error_code: (state == "error").then(|| outcome.clone()).filter(|s| !s.is_empty()),
+        error_code: (state == "error")
+            .then(|| outcome.clone())
+            .filter(|s| !s.is_empty()),
         error_message: text(v, "build_error").or_else(|| text(meta, "error")),
         id,
         state,
@@ -932,8 +961,7 @@ async fn fetch(
                 None,
             )
             .await?;
-            Ok(v
-                .as_array()
+            Ok(v.as_array()
                 .or_else(|| v["builds"].as_array())
                 .map(|items| {
                     items
@@ -997,9 +1025,7 @@ async fn refresh_inner(state: &Arc<AppState>, target: &Target) -> Result<usize, 
     let fresh = fetch(state, &target, provider, &token).await?;
 
     // Vercel 的项目信息里没有生产地址：从最近一次成功的生产部署上认一个域名
-    if provider == Provider::Vercel
-        && target.url.as_deref().is_none_or(|url| url.is_empty())
-    {
+    if provider == Provider::Vercel && target.url.as_deref().is_none_or(|url| url.is_empty()) {
         if let Some(dep) = fresh
             .iter()
             .find(|dep| dep.env == "production" && dep.state == "ready")
@@ -1336,7 +1362,7 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
 }
 
 /// 这个仓库最近一次任务用的机器、Agent 与仓库位置
-fn previous_settings(db: &Connection, repo: &str) -> Option<pipeline::StartOptions> {
+pub(crate) fn previous_settings(db: &Connection, repo: &str) -> Option<pipeline::StartOptions> {
     let id = db
         .query_row(
             "SELECT id FROM tasks WHERE repo = ?1 AND node_id IS NOT NULL AND adapter IS NOT NULL AND workdir IS NOT NULL \
@@ -1438,9 +1464,7 @@ async fn check(url: &str, contains: Option<&str>) -> Health {
     };
     let status = resp.status().as_u16();
     if status == 401 || status == 403 {
-        return Health::Unknown(format!(
-            "HTTP {status}：这个地址有访问保护，检查不了"
-        ));
+        return Health::Unknown(format!("HTTP {status}：这个地址有访问保护，检查不了"));
     }
     let body = resp.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
@@ -1510,8 +1534,8 @@ async fn status(state: &AppState, platform: &str) -> ProviderStatus {
             }
         }
     }
-    if let Some(saved) = setting(&state.db.lock().unwrap(), &scope_key(platform))
-        .filter(|saved| !saved.is_empty())
+    if let Some(saved) =
+        setting(&state.db.lock().unwrap(), &scope_key(platform)).filter(|saved| !saved.is_empty())
     {
         status.scope = Some(saved);
     }
@@ -1619,7 +1643,12 @@ pub async fn discover(state: &Arc<AppState>, platform: &str) -> Result<Vec<Candi
             _ => "/v10/projects?limit=100".to_string(),
         };
         let v = vercel(state, &token, "GET", &path, None).await?;
-        for project in v.as_array().or_else(|| v["projects"].as_array()).cloned().unwrap_or_default() {
+        for project in v
+            .as_array()
+            .or_else(|| v["projects"].as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
             let Some(name) = text(&project, "name") else {
                 continue;
             };
@@ -1658,7 +1687,9 @@ pub async fn discover(state: &Arc<AppState>, platform: &str) -> Result<Vec<Candi
                     .and_then(|domains| domains.first())
                     .and_then(Value::as_str)
                     .map(|domain| with_scheme(domain.to_string()))
-                    .or_else(|| text(&project, "subdomain").map(|sub| format!("https://{name}.{sub}"))),
+                    .or_else(|| {
+                        text(&project, "subdomain").map(|sub| format!("https://{name}.{sub}"))
+                    }),
                 repo: repo_of(text(source, "owner"), text(source, "repo_name")),
                 repo_id: text(source, "repo_id"),
                 branch: text(source, "production_branch")
@@ -1670,21 +1701,31 @@ pub async fn discover(state: &Arc<AppState>, platform: &str) -> Result<Vec<Candi
             });
         }
         // 令牌没有 Workers 的读取权限时列不出 Worker：不算错，Pages 照样能用
-        match cf(state, &token, "GET", &format!("/accounts/{account}/workers/scripts"), None).await {
-            Ok(v) => list.extend(v.as_array().cloned().unwrap_or_default().iter().filter_map(|script| {
-                let name = text(script, "id")?;
-                Some(Candidate {
-                    platform_id: text(script, "tag").unwrap_or_else(|| name.clone()),
-                    name,
-                    url: None,
-                    repo: None,
-                    repo_id: None,
-                    branch: None,
-                    framework: None,
-                    provider: "cloudflare-workers".to_string(),
-                    registered: None,
-                })
-            })),
+        match cf(
+            state,
+            &token,
+            "GET",
+            &format!("/accounts/{account}/workers/scripts"),
+            None,
+        )
+        .await
+        {
+            Ok(v) => list.extend(v.as_array().cloned().unwrap_or_default().iter().filter_map(
+                |script| {
+                    let name = text(script, "id")?;
+                    Some(Candidate {
+                        platform_id: text(script, "tag").unwrap_or_else(|| name.clone()),
+                        name,
+                        url: None,
+                        repo: None,
+                        repo_id: None,
+                        branch: None,
+                        framework: None,
+                        provider: "cloudflare-workers".to_string(),
+                        registered: None,
+                    })
+                },
+            )),
             Err(e) => events::record(
                 &state.db.lock().unwrap(),
                 "deploy.discover",
@@ -1727,19 +1768,25 @@ async fn enrich(state: &AppState, target: &mut Target, token: &str) {
                         .and_then(|domains| domains.first())
                         .and_then(Value::as_str)
                         .map(|domain| with_scheme(domain.to_string()))
-                        .or_else(|| text(&v, "subdomain").map(|sub| format!("https://{}.{}", target.name, sub)));
+                        .or_else(|| {
+                            text(&v, "subdomain")
+                                .map(|sub| format!("https://{}.{}", target.name, sub))
+                        });
                 }
                 target.repo = repo_of(text(source, "owner"), text(source, "repo_name"));
                 target.repo_id = text(source, "repo_id");
                 target.git_type = text(&v["source"], "type");
-                target.branch = text(source, "production_branch")
-                    .or_else(|| text(&v, "production_branch"));
+                target.branch =
+                    text(source, "production_branch").or_else(|| text(&v, "production_branch"));
                 target.framework = text(&v, "framework");
             }
         }
         Ok(Provider::Workers) => {
             // 构建设置里有连的仓库与生产分支
-            let settings = format!("/accounts/{}/builds/workers/{}", target.scope, target.platform_id);
+            let settings = format!(
+                "/accounts/{}/builds/workers/{}",
+                target.scope, target.platform_id
+            );
             if let Ok(v) = cf(state, token, "GET", &settings, None).await {
                 let repo = &v["git_repository"];
                 target.repo = text(repo, "repo_name")
@@ -1753,10 +1800,19 @@ async fn enrich(state: &AppState, target: &mut Target, token: &str) {
                     })
                     .filter(|repo| repo.contains('/'));
                 target.branch = text(repo, "branch");
-                target.git_type = text(repo, "provider").or_else(|| Some("github".to_string()).filter(|_| target.repo.is_some()));
+                target.git_type = text(repo, "provider")
+                    .or_else(|| Some("github".to_string()).filter(|_| target.repo.is_some()));
             }
             if target.url.is_none() {
-                if let Ok(v) = cf(state, token, "GET", &format!("/accounts/{}/workers/subdomain", target.scope), None).await {
+                if let Ok(v) = cf(
+                    state,
+                    token,
+                    "GET",
+                    &format!("/accounts/{}/workers/subdomain", target.scope),
+                    None,
+                )
+                .await
+                {
                     if let Some(sub) = text(&v, "subdomain") {
                         target.url = Some(format!("https://{}.{}.workers.dev", target.name, sub));
                     }
@@ -1824,7 +1880,10 @@ pub async fn add_target(
         &format!("已登记部署目标（{}）", provider.label()),
         &event_link(target.id),
     );
-    if let Some(hook) = hook_url.map(str::trim).filter(|hook| hook.starts_with("https://")) {
+    if let Some(hook) = hook_url
+        .map(str::trim)
+        .filter(|hook| hook.starts_with("https://"))
+    {
         state.secrets.set(&hook_account(target.id), hook)?;
         target.has_hook = true;
     }
@@ -1864,7 +1923,8 @@ pub fn update_target(
         };
     }
     if let Some(needle) = health_contains {
-        target.health_contains = Some(needle.trim().to_string()).filter(|needle| !needle.is_empty());
+        target.health_contains =
+            Some(needle.trim().to_string()).filter(|needle| !needle.is_empty());
     }
     match hook_url.map(str::trim) {
         Some("") => {
@@ -1938,10 +1998,13 @@ pub fn for_task(state: &AppState, task_id: i64) -> Result<Vec<Deployment>, Strin
             DEP_COLS.split(", ").map(|column| format!("d.{column}")).collect::<Vec<_>>().join(", ")
         ))
         .map_err(|e| e.to_string())?;
-    stmt.query_map(params![task.repo, task.branch, task.head_sha, task_id], row_to_deployment)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+    stmt.query_map(
+        params![task.repo, task.branch, task.head_sha, task_id],
+        row_to_deployment,
+    )
+    .map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())
 }
 
 /// 触发 Worker 的 Deploy Hook。地址本身就是凭据，不需要鉴权
@@ -1960,7 +2023,10 @@ async fn fire_hook(state: &AppState, target: &Target) -> Result<(), String> {
         .await
         .map_err(|e| format!("触发 Deploy Hook 失败：{}", e.without_url()))?;
     if !resp.status().is_success() {
-        return Err(format!("Deploy Hook 返回了 HTTP {}", resp.status().as_u16()));
+        return Err(format!(
+            "Deploy Hook 返回了 HTTP {}",
+            resp.status().as_u16()
+        ));
     }
     Ok(())
 }
@@ -2006,7 +2072,10 @@ pub async fn trigger(
                 if let Some(commit) = &commit {
                     source["sha"] = json!(commit);
                 }
-                match (&target.repo_id, target.repo.as_deref().and_then(|repo| repo.split_once('/'))) {
+                match (
+                    &target.repo_id,
+                    target.repo.as_deref().and_then(|repo| repo.split_once('/')),
+                ) {
                     (Some(repo_id), _) => source["repoId"] = json!(repo_id),
                     (None, Some((org, name))) => {
                         source["org"] = json!(org);
@@ -2023,7 +2092,9 @@ pub async fn trigger(
                 let latest = list(state, Some(target.id), Some(1))?
                     .into_iter()
                     .next()
-                    .ok_or("这个项目还没有部署过，也没有关联 GitHub 仓库：请先在 Vercel 上部署一次")?;
+                    .ok_or(
+                        "这个项目还没有部署过，也没有关联 GitHub 仓库：请先在 Vercel 上部署一次",
+                    )?;
                 if latest.branch.as_deref() != Some(branch.as_str()) {
                     return Err(format!(
                         "这个项目没有关联 GitHub 仓库，只能把最近一次部署（分支 {}）原样再来一遍",
@@ -2040,19 +2111,25 @@ pub async fn trigger(
                 "deploy.trigger",
                 "info",
                 &target.name,
-                &format!("发起了{}部署：{branch}", env_label(if production { "production" } else { "preview" })),
+                &format!(
+                    "发起了{}部署：{branch}",
+                    env_label(if production { "production" } else { "preview" })
+                ),
                 &event_link(target.id),
             );
-            text(&v, "id").or_else(|| text(&v, "uid")).ok_or_else(|| "Vercel 没有返回部署的编号".to_string())?
+            text(&v, "id")
+                .or_else(|| text(&v, "uid"))
+                .ok_or_else(|| "Vercel 没有返回部署的编号".to_string())?
         }
         Provider::Pages => {
-            let branch = branch
-                .ok_or("这个项目没有记录生产分支，请指定要部署的分支")?;
+            let branch = branch.ok_or("这个项目没有记录生产分支，请指定要部署的分支")?;
             refresh_target(state, &target).await.ok();
             let last = list(state, Some(target.id), Some(200))?
                 .into_iter()
                 .find(|dep| dep.branch.as_deref() == Some(branch.as_str()))
-                .ok_or_else(|| format!("分支「{branch}」还没有部署过：推送后 Cloudflare 会自动部署"))?;
+                .ok_or_else(|| {
+                    format!("分支「{branch}」还没有部署过：推送后 Cloudflare 会自动部署")
+                })?;
             gate(last.env == "production")?;
             let v = cf(
                 state,
@@ -2319,7 +2396,11 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
         };
         // 平台给了「能回滚」的标记就只列那些；没给的话，成功的生产部署都列出来
         let rows = query("rollback_ok = 1")?;
-        let rows = if rows.is_empty() { query("1 = 1")? } else { rows };
+        let rows = if rows.is_empty() {
+            query("1 = 1")?
+        } else {
+            rows
+        };
         return Ok(rows
             .into_iter()
             .map(|dep| HistoryItem {
@@ -2335,10 +2416,7 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
 
     // Workers：回滚的单位是「版本」。部署记录指明用的是哪个版本，版本记录带着时间与说明
     let token = token_of(state, Provider::Workers)?;
-    let base = format!(
-        "/accounts/{}/workers/scripts/{}",
-        target.scope, target.name
-    );
+    let base = format!("/accounts/{}/workers/scripts/{}", target.scope, target.name);
     let versions = cf(state, &token, "GET", &format!("{base}/versions"), None).await?;
     let mut info: HashMap<String, (Option<i64>, Option<String>)> = HashMap::new();
     for version in versions
@@ -2374,7 +2452,15 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
                 branch: None,
                 commit_message: message
                     .or_else(|| text(&deployment["annotations"], "workers/message"))
-                    .or_else(|| Some(format!("版本 …{}", version_id.chars().skip(version_id.chars().count().saturating_sub(8)).collect::<String>()))),
+                    .or_else(|| {
+                        Some(format!(
+                            "版本 …{}",
+                            version_id
+                                .chars()
+                                .skip(version_id.chars().count().saturating_sub(8))
+                                .collect::<String>()
+                        ))
+                    }),
                 current: false,
                 version_id: Some(version_id),
             })
@@ -2394,7 +2480,10 @@ pub async fn logs(state: &AppState, dep: &Deployment) -> Result<String, String> 
     let token = token_of(state, provider)?;
     let text = match provider {
         Provider::Vercel => {
-            let path = with_team(&target, &format!("/v3/deployments/{}/events?limit=-1", dep.id));
+            let path = with_team(
+                &target,
+                &format!("/v3/deployments/{}/events?limit=-1", dep.id),
+            );
             let v = vercel(state, &token, "GET", &path, None).await?;
             v.as_array()
                 .map(|events| {
@@ -2683,9 +2772,9 @@ mod tests {
     use super::*;
     use crate::secrets::SecretStore;
     use crate::testutil::{
-        fake_agent, fake_script, read_request, respond, service_for, setup_repo_at, test_state, Req,
+        Req, fake_agent, fake_script, read_request, respond, service_for, setup_repo_at, test_state,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::atomic::{AtomicI64, Ordering};
 
     type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
@@ -2704,7 +2793,9 @@ mod tests {
     impl Fake {
         /// 冒充生产地址的站点：`/healthz` 正常，`/down` 挂了，`/private` 有访问保护
         fn site(&self, path: &str) -> String {
-            format!("{addr}/healthz{path}", addr = self.addr).replace("/healthz/down", "/down").replace("/healthz/private", "/private")
+            format!("{addr}/healthz{path}", addr = self.addr)
+                .replace("/healthz/down", "/down")
+                .replace("/healthz/private", "/private")
         }
 
         /// 最近一次这样的请求：(路径带查询串, 请求体)
@@ -2786,14 +2877,30 @@ mod tests {
             )
         };
         let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
-        let parts: Vec<&str> = path.trim_matches('/').split('/').filter(|part| !part.is_empty()).collect();
+        let parts: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
         let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);
-        let bearer = req.headers.get("authorization").map(String::as_str).unwrap_or("");
+        let bearer = req
+            .headers
+            .get("authorization")
+            .map(String::as_str)
+            .unwrap_or("");
 
         // 冒充生产地址的站点
         match parts.first().copied() {
-            Some("healthz") => return ("200 OK".into(), "text/html", "<html>all good</html>".into()),
-            Some("down") => return ("500 Internal Server Error".into(), "text/plain", "boom".into()),
+            Some("healthz") => {
+                return ("200 OK".into(), "text/html", "<html>all good</html>".into());
+            }
+            Some("down") => {
+                return (
+                    "500 Internal Server Error".into(),
+                    "text/plain",
+                    "boom".into(),
+                );
+            }
             Some("private") => return ("401 Unauthorized".into(), "text/plain", String::new()),
             _ => {}
         }
@@ -2805,17 +2912,28 @@ mod tests {
             let build = json!({"build_uuid": "wk_new", "projectId": "wk", "status": "queued",
                                "created_on": "2026-11-24T12:00:00Z", "build_trigger_metadata": {"branch": "main", "commit_hash": "eeeeee5555"}});
             workers.lock().unwrap().insert(0, build.clone());
-            return envelope(json!({"build_uuid": "wk_new", "branch": "main", "worker": "api-worker"}));
+            return envelope(
+                json!({"build_uuid": "wk_new", "branch": "main", "worker": "api-worker"}),
+            );
         }
         if parts.first() == Some(&"repos") {
-            return reply("200 OK", &json!({"default_branch": "main", "full_name": "octo/demo"}));
+            return reply(
+                "200 OK",
+                &json!({"default_branch": "main", "full_name": "octo/demo"}),
+            );
         }
         let is_vercel = parts.first().is_some_and(|part| part.starts_with('v'));
         if is_vercel && bearer != "Bearer vcp_good" {
-            return reply("403 Forbidden", &json!({"error": {"code": "forbidden", "message": "Not authorized", "invalidToken": true}}));
+            return reply(
+                "403 Forbidden",
+                &json!({"error": {"code": "forbidden", "message": "Not authorized", "invalidToken": true}}),
+            );
         }
         if parts.first() == Some(&"accounts") && bearer != "Bearer cf_good" {
-            return reply("400 Bad Request", &json!({"success": false, "errors": [{"code": 10000, "message": "Invalid API Token"}]}));
+            return reply(
+                "400 Bad Request",
+                &json!({"success": false, "errors": [{"code": 10000, "message": "Invalid API Token"}]}),
+            );
         }
 
         let vercel_list = vercel.lock().unwrap().clone();
@@ -2950,12 +3068,23 @@ mod tests {
         );
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
-                let (calls, vercel, pages, workers, seq) =
-                    (Arc::clone(&calls), Arc::clone(&vercel), Arc::clone(&pages), Arc::clone(&workers), Arc::clone(&seq));
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (calls, vercel, pages, workers, seq) = (
+                    Arc::clone(&calls),
+                    Arc::clone(&vercel),
+                    Arc::clone(&pages),
+                    Arc::clone(&workers),
+                    Arc::clone(&seq),
+                );
                 tokio::spawn(async move {
                     let req = read_request(&mut stream).await;
-                    calls.lock().unwrap().push((req.method.clone(), req.path.clone(), req.body.clone()));
+                    calls.lock().unwrap().push((
+                        req.method.clone(),
+                        req.path.clone(),
+                        req.body.clone(),
+                    ));
                     let (status, kind, body) = route(&req, &vercel, &pages, &workers, &seq);
                     respond(&mut stream, &status, kind, &body).await;
                 });
@@ -3039,7 +3168,9 @@ mod tests {
     /// (类别, 级别, 文案)，按时间先后
     fn events_of(state: &AppState) -> Vec<(String, String, String)> {
         let db = state.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT kind, level, message FROM events ORDER BY id").unwrap();
+        let mut stmt = db
+            .prepare("SELECT kind, level, message FROM events ORDER BY id")
+            .unwrap();
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -3057,7 +3188,9 @@ mod tests {
         }
         panic!(
             "任务没有进入 {want:?}：{}",
-            tasks::load(&state.db.lock().unwrap(), task_id).unwrap().status
+            tasks::load(&state.db.lock().unwrap(), task_id)
+                .unwrap()
+                .status
         );
     }
 
@@ -3079,68 +3212,189 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         assert!(ts.secrets.get("deploy_vercel_token").unwrap().is_none());
         let err = connect(&state, "cloudflare", "nope").await.unwrap_err();
         assert!(err.contains("令牌无效"), "{err}");
-        assert!(connect(&state, "gitlab", "x").await.unwrap_err().contains("不认识"));
-        assert!(connect(&state, "vercel", "   ").await.unwrap_err().contains("请输入"));
+        assert!(
+            connect(&state, "gitlab", "x")
+                .await
+                .unwrap_err()
+                .contains("不认识")
+        );
+        assert!(
+            connect(&state, "vercel", "   ")
+                .await
+                .unwrap_err()
+                .contains("请输入")
+        );
 
         // 通过了才存进凭据库，并带出用户与团队 / 账户
         let vercel = connect(&state, "vercel", "vcp_good").await.unwrap();
         assert_eq!(vercel.who.as_deref(), Some("octo"));
         assert_eq!(vercel.scopes[0].name, "Acme");
         assert_eq!(vercel.scope.as_deref(), Some("team_a"));
-        assert_eq!(ts.secrets.get("deploy_vercel_token").unwrap().as_deref(), Some("vcp_good"));
+        assert_eq!(
+            ts.secrets.get("deploy_vercel_token").unwrap().as_deref(),
+            Some("vcp_good")
+        );
         let cloudflare = connect(&state, "cloudflare", "cf_good").await.unwrap();
         assert_eq!(cloudflare.who, None);
-        assert_eq!((cloudflare.scopes[0].id.as_str(), cloudflare.scope.as_deref()), ("acct1", Some("acct1")));
+        assert_eq!(
+            (
+                cloudflare.scopes[0].id.as_str(),
+                cloudflare.scope.as_deref()
+            ),
+            ("acct1", Some("acct1"))
+        );
         assert!(status(&state, "cloudflare").await.error.is_none());
 
         // 还没登记的项目
         let found = discover(&state, "vercel").await.unwrap();
-        assert_eq!(found.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["alt", "off", "plain", "u", "web"]);
+        assert_eq!(
+            found.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["alt", "off", "plain", "u", "web"]
+        );
         let web = &found[4];
         assert_eq!(
-            (web.repo.as_deref(), web.repo_id.as_deref(), web.branch.as_deref(), web.framework.as_deref()),
-            (Some("octo/demo"), Some("1234"), Some("main"), Some("nextjs"))
+            (
+                web.repo.as_deref(),
+                web.repo_id.as_deref(),
+                web.branch.as_deref(),
+                web.framework.as_deref()
+            ),
+            (
+                Some("octo/demo"),
+                Some("1234"),
+                Some("main"),
+                Some("nextjs")
+            )
         );
         assert!(found.iter().all(|candidate| candidate.registered.is_none()));
-        assert_eq!(fake.call("GET", "/v10/projects").unwrap().0, "/v10/projects?limit=100&teamId=team_a");
+        assert_eq!(
+            fake.call("GET", "/v10/projects").unwrap().0,
+            "/v10/projects?limit=100&teamId=team_a"
+        );
 
         let found = discover(&state, "cloudflare").await.unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
-        assert_eq!((found[0].provider.as_str(), found[0].name.as_str()), ("cloudflare-pages", "site"));
+        assert_eq!(
+            (found[0].provider.as_str(), found[0].name.as_str()),
+            ("cloudflare-pages", "site")
+        );
         assert_eq!(found[0].url.as_deref(), Some("https://site.example.com"));
-        assert_eq!((found[0].repo.as_deref(), found[0].branch.as_deref()), (Some("octo/demo"), Some("main")));
-        assert_eq!((found[1].provider.as_str(), found[1].platform_id.as_str()), ("cloudflare-workers", "tag_api_worker"));
+        assert_eq!(
+            (found[0].repo.as_deref(), found[0].branch.as_deref()),
+            (Some("octo/demo"), Some("main"))
+        );
+        assert_eq!(
+            (found[1].provider.as_str(), found[1].platform_id.as_str()),
+            ("cloudflare-workers", "tag_api_worker")
+        );
 
         // 登记 Vercel 项目：仓库、分支从平台补全；范围是选中的团队
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("")), None).await.unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            (web.repo.as_deref(), web.repo_id.as_deref(), web.branch.as_deref(), web.git_type.as_deref(), web.framework.as_deref()),
-            (Some("octo/demo"), Some("1234"), Some("main"), Some("github"), Some("nextjs"))
+            (
+                web.repo.as_deref(),
+                web.repo_id.as_deref(),
+                web.branch.as_deref(),
+                web.git_type.as_deref(),
+                web.framework.as_deref()
+            ),
+            (
+                Some("octo/demo"),
+                Some("1234"),
+                Some("main"),
+                Some("github"),
+                Some("nextjs")
+            )
         );
         assert_eq!(web.scope, "team_a");
         assert!(web.prod_requires_approval && web.auto_fix && !web.has_hook);
-        assert_eq!((web.health_path.as_str(), web.url.as_deref()), ("/", Some(fake.site("").as_str())));
+        assert_eq!(
+            (web.health_path.as_str(), web.url.as_deref()),
+            ("/", Some(fake.site("").as_str()))
+        );
         // 同一个项目再登记一次：还是原来那个
-        assert_eq!(add_target(&state, "vercel", "web", "prj_web", None, None).await.unwrap().id, web.id);
+        assert_eq!(
+            add_target(&state, "vercel", "web", "prj_web", None, None)
+                .await
+                .unwrap()
+                .id,
+            web.id
+        );
         assert_eq!(targets(&state.db.lock().unwrap()).unwrap().len(), 1);
-        assert!(add_target(&state, "docker", "x", "y", None, None).await.is_err());
-        assert!(add_target(&state, "vercel", "  ", "prj_web", None, None).await.is_err());
+        assert!(
+            add_target(&state, "docker", "x", "y", None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            add_target(&state, "vercel", "  ", "prj_web", None, None)
+                .await
+                .is_err()
+        );
 
         // 登记 Worker：标签是平台给的；Deploy Hook 的地址进凭据库，不进数据库
-        let hook = "https://hooks.cloudflare.example/workers/builds/deploy_hooks/hook123".to_string();
-        let worker = add_target(&state, "cloudflare-workers", "api-worker", "tag_api_worker", None, Some(&hook)).await.unwrap();
+        let hook =
+            "https://hooks.cloudflare.example/workers/builds/deploy_hooks/hook123".to_string();
+        let worker = add_target(
+            &state,
+            "cloudflare-workers",
+            "api-worker",
+            "tag_api_worker",
+            None,
+            Some(&hook),
+        )
+        .await
+        .unwrap();
         assert!(worker.has_hook);
-        assert_eq!(ts.secrets.get(&hook_account(worker.id)).unwrap().as_deref(), Some(hook.as_str()));
-        assert_eq!(worker.url.as_deref(), Some("https://api-worker.acme.workers.dev"));
         assert_eq!(
-            (worker.repo.as_deref(), worker.branch.as_deref(), worker.git_type.as_deref(), worker.scope.as_str()),
+            ts.secrets.get(&hook_account(worker.id)).unwrap().as_deref(),
+            Some(hook.as_str())
+        );
+        assert_eq!(
+            worker.url.as_deref(),
+            Some("https://api-worker.acme.workers.dev")
+        );
+        assert_eq!(
+            (
+                worker.repo.as_deref(),
+                worker.branch.as_deref(),
+                worker.git_type.as_deref(),
+                worker.scope.as_str()
+            ),
             (Some("octo/demo"), Some("main"), Some("github"), "acct1")
         );
-        assert!(serde_json::to_string(&worker).unwrap().find("deploy_hooks").is_none(), "Hook 的地址不能跟着目标发给界面");
+        assert!(
+            serde_json::to_string(&worker)
+                .unwrap()
+                .find("deploy_hooks")
+                .is_none(),
+            "Hook 的地址不能跟着目标发给界面"
+        );
 
-        let site = add_target(&state, "cloudflare-pages", "site", "site", Some(&fake.site("/v2")), None).await.unwrap();
+        let site = add_target(
+            &state,
+            "cloudflare-pages",
+            "site",
+            "site",
+            Some(&fake.site("/v2")),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(site.url.as_deref(), Some(fake.site("/v2").as_str()));
-        assert_eq!((site.repo.as_deref(), site.branch.as_deref()), (Some("octo/demo"), Some("main")));
+        assert_eq!(
+            (site.repo.as_deref(), site.branch.as_deref()),
+            (Some("octo/demo"), Some("main"))
+        );
 
         // 列表里标出已经登记的
         let found = discover(&state, "cloudflare").await.unwrap();
@@ -3149,39 +3403,129 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         // 断开之后登记不了；重新连上就好了
         disconnect(&state, "cloudflare").unwrap();
         assert!(ts.secrets.get("deploy_cloudflare_token").unwrap().is_none());
-        assert!(add_target(&state, "cloudflare-pages", "site2", "site2", None, None).await.unwrap_err().contains("尚未连接"));
-        assert!(discover(&state, "cloudflare").await.unwrap_err().contains("尚未连接"));
+        assert!(
+            add_target(&state, "cloudflare-pages", "site2", "site2", None, None)
+                .await
+                .unwrap_err()
+                .contains("尚未连接")
+        );
+        assert!(
+            discover(&state, "cloudflare")
+                .await
+                .unwrap_err()
+                .contains("尚未连接")
+        );
         connect(&state, "cloudflare", "cf_good").await.unwrap();
 
         // 改设置：传了哪项改哪项
-        let updated = update_target(&state, web.id, Some("demo.example.com/api"), Some(false), Some(false), Some("health"), Some("  pong "), None).unwrap();
+        let updated = update_target(
+            &state,
+            web.id,
+            Some("demo.example.com/api"),
+            Some(false),
+            Some(false),
+            Some("health"),
+            Some("  pong "),
+            None,
+        )
+        .unwrap();
         assert_eq!(updated.url.as_deref(), Some("https://demo.example.com/api"));
         assert!(!updated.prod_requires_approval && !updated.auto_fix);
-        assert_eq!((updated.health_path.as_str(), updated.health_contains.as_deref()), ("/health", Some("pong")));
-        assert_eq!(health_url(&updated).as_deref(), Some("https://demo.example.com/api/health"));
-        assert!(update_target(&state, web.id, None, None, None, None, None, Some("http://insecure/hook")).is_err());
-        assert!(!update_target(&state, worker.id, None, None, None, None, None, Some("")).unwrap().has_hook, "清空 Hook");
+        assert_eq!(
+            (
+                updated.health_path.as_str(),
+                updated.health_contains.as_deref()
+            ),
+            ("/health", Some("pong"))
+        );
+        assert_eq!(
+            health_url(&updated).as_deref(),
+            Some("https://demo.example.com/api/health")
+        );
+        assert!(
+            update_target(
+                &state,
+                web.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("http://insecure/hook")
+            )
+            .is_err()
+        );
+        assert!(
+            !update_target(&state, worker.id, None, None, None, None, None, Some(""))
+                .unwrap()
+                .has_hook,
+            "清空 Hook"
+        );
         assert!(ts.secrets.get(&hook_account(worker.id)).unwrap().is_none());
-        assert_eq!(update_target(&state, web.id, None, None, None, None, Some(""), None).unwrap().health_contains, None);
-        update_target(&state, web.id, Some(&fake.site("")), Some(true), Some(true), Some("/"), None, None).unwrap();
+        assert_eq!(
+            update_target(&state, web.id, None, None, None, None, Some(""), None)
+                .unwrap()
+                .health_contains,
+            None
+        );
+        update_target(
+            &state,
+            web.id,
+            Some(&fake.site("")),
+            Some(true),
+            Some(true),
+            Some("/"),
+            None,
+            None,
+        )
+        .unwrap();
 
         // 取消登记：部署记录一并删掉，平台上的项目不动
-        let plain = add_target(&state, "vercel", "plain", "prj_plain", Some(&fake.site("")), None).await.unwrap();
+        let plain = add_target(
+            &state,
+            "vercel",
+            "plain",
+            "prj_plain",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(plain.repo.is_none());
         remove_target(&state, plain.id).unwrap();
         assert!(load_target(&state.db.lock().unwrap(), plain.id).is_err());
         assert_eq!(targets(&state.db.lock().unwrap()).unwrap().len(), 3);
-        assert!(fake.calls.lock().unwrap().iter().all(|(method, _, _)| method != "DELETE"));
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _, _)| method != "DELETE")
+        );
 
         // 换团队：之后列项目按新的团队来
         set_scope(&state, "vercel", Some("team_b")).unwrap();
         discover(&state, "vercel").await.unwrap();
-        assert!(fake.call("GET", "/v10/projects").unwrap().0.ends_with("teamId=team_b"));
+        assert!(
+            fake.call("GET", "/v10/projects")
+                .unwrap()
+                .0
+                .ends_with("teamId=team_b")
+        );
         assert!(set_scope(&state, "github", Some("x")).is_err());
 
         let events = events_of(&state);
-        for (kind, needle) in [("deploy.connected", "Vercel 已连接（octo）"), ("deploy.target", "已登记部署目标（Cloudflare Workers）"), ("deploy.disconnected", "Cloudflare 已断开连接")] {
-            assert!(events.iter().any(|(k, level, message)| k == kind && level == "info" && message.contains(needle)), "缺事件 {kind}：{needle}");
+        for (kind, needle) in [
+            ("deploy.connected", "Vercel 已连接（octo）"),
+            ("deploy.target", "已登记部署目标（Cloudflare Workers）"),
+            ("deploy.disconnected", "Cloudflare 已断开连接"),
+        ] {
+            assert!(
+                events.iter().any(|(k, level, message)| k == kind
+                    && level == "info"
+                    && message.contains(needle)),
+                "缺事件 {kind}：{needle}"
+            );
         }
     }
 
@@ -3189,73 +3533,260 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
     async fn deployments_from_all_three_platforms_are_normalized() {
         let (fake, state) = rigged(idle()).await;
         seed(&fake);
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("")), None).await.unwrap();
-        let site = add_target(&state, "cloudflare-pages", "site", "site", Some(&fake.site("")), None).await.unwrap();
-        let worker = add_target(&state, "cloudflare-workers", "api-worker", "tag_api_worker", Some(&fake.site("")), None).await.unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        let site = add_target(
+            &state,
+            "cloudflare-pages",
+            "site",
+            "site",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        let worker = add_target(
+            &state,
+            "cloudflare-workers",
+            "api-worker",
+            "tag_api_worker",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
         // 登记时各拉过一次，这次什么都不该变
         assert_eq!(refresh(&state, None).await.unwrap(), 0);
 
         let deps = list(&state, Some(web.id), None).unwrap();
-        let by = |id: &str| deps.iter().find(|dep| dep.id == id).cloned().unwrap_or_else(|| panic!("缺 {id}"));
-        let (err, ok, prev, old, preview, build) = (by("dpl_err"), by("dpl_ok"), by("dpl_prev"), by("dpl_old"), by("dpl_preview"), by("dpl_build"));
+        let by = |id: &str| {
+            deps.iter()
+                .find(|dep| dep.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("缺 {id}"))
+        };
+        let (err, ok, prev, old, preview, build) = (
+            by("dpl_err"),
+            by("dpl_ok"),
+            by("dpl_prev"),
+            by("dpl_old"),
+            by("dpl_preview"),
+            by("dpl_build"),
+        );
         assert_eq!(deps.len(), 6);
         // 新的在前
         let order: Vec<&str> = deps.iter().map(|dep| dep.id.as_str()).collect();
-        assert_eq!(order, ["dpl_build", "dpl_preview", "dpl_err", "dpl_ok", "dpl_prev", "dpl_old"]);
+        assert_eq!(
+            order,
+            [
+                "dpl_build",
+                "dpl_preview",
+                "dpl_err",
+                "dpl_ok",
+                "dpl_prev",
+                "dpl_old"
+            ]
+        );
 
-        assert_eq!((err.state.as_str(), err.env.as_str(), err.raw_state.as_deref()), ("error", "production", Some("ERROR")));
-        assert_eq!((err.branch.as_deref(), err.commit_sha.as_deref(), err.commit_message.as_deref(), err.author.as_deref()), (Some("main"), Some("1111111222"), Some("break the build"), Some("Octo")));
-        assert_eq!((err.error_code.as_deref(), err.error_message.as_deref()), (Some("BUILD_FAILED"), Some("Command \"npm run build\" exited with 1")));
-        assert_eq!((err.inspector_url.as_deref(), err.url.as_deref()), (Some("https://vercel.com/acme/web/err"), Some("https://web-err.vercel.app")));
+        assert_eq!(
+            (
+                err.state.as_str(),
+                err.env.as_str(),
+                err.raw_state.as_deref()
+            ),
+            ("error", "production", Some("ERROR"))
+        );
+        assert_eq!(
+            (
+                err.branch.as_deref(),
+                err.commit_sha.as_deref(),
+                err.commit_message.as_deref(),
+                err.author.as_deref()
+            ),
+            (
+                Some("main"),
+                Some("1111111222"),
+                Some("break the build"),
+                Some("Octo")
+            )
+        );
+        assert_eq!(
+            (err.error_code.as_deref(), err.error_message.as_deref()),
+            (
+                Some("BUILD_FAILED"),
+                Some("Command \"npm run build\" exited with 1")
+            )
+        );
+        assert_eq!(
+            (err.inspector_url.as_deref(), err.url.as_deref()),
+            (
+                Some("https://vercel.com/acme/web/err"),
+                Some("https://web-err.vercel.app")
+            )
+        );
         let created = err.created_ms.unwrap();
-        assert_eq!((err.building_ms, err.ready_ms), (Some(created + 10_000), Some(created + 100_000)));
+        assert_eq!(
+            (err.building_ms, err.ready_ms),
+            (Some(created + 10_000), Some(created + 100_000))
+        );
 
-        assert!(ok.current && ok.rollback_ok && !prev.current && prev.rollback_ok && !old.rollback_ok);
+        assert!(
+            ok.current && ok.rollback_ok && !prev.current && prev.rollback_ok && !old.rollback_ok
+        );
         assert_eq!(preview.env.as_str(), "preview");
-        assert_eq!((build.state.as_str(), build.url.as_ref(), build.building_ms.is_some()), ("building", None, true));
+        assert_eq!(
+            (
+                build.state.as_str(),
+                build.url.as_ref(),
+                build.building_ms.is_some()
+            ),
+            ("building", None, true)
+        );
 
         let pages = list(&state, Some(site.id), None).unwrap();
-        assert_eq!(pages.iter().map(|dep| (dep.id.as_str(), dep.state.as_str(), dep.env.as_str())).collect::<Vec<_>>(),
-                   [("pg_ok", "ready", "production"), ("pg_fail", "error", "preview"), ("pg_skipped", "canceled", "preview")]);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|dep| (dep.id.as_str(), dep.state.as_str(), dep.env.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("pg_ok", "ready", "production"),
+                ("pg_fail", "error", "preview"),
+                ("pg_skipped", "canceled", "preview")
+            ]
+        );
         let pg_ok = pages.iter().find(|dep| dep.id == "pg_ok").unwrap();
         assert!(pg_ok.current, "最新那次成功的生产部署就是当前版本");
-        assert_eq!((pg_ok.created_ms, pg_ok.ready_ms), (Some(1_795_428_000_123), Some(1_795_428_120_000)));
-        assert_eq!((pg_ok.url.as_deref(), pg_ok.branch.as_deref()), (Some("https://site-ok.pages.dev"), Some("main")));
+        assert_eq!(
+            (pg_ok.created_ms, pg_ok.ready_ms),
+            (Some(1_795_428_000_123), Some(1_795_428_120_000))
+        );
+        assert_eq!(
+            (pg_ok.url.as_deref(), pg_ok.branch.as_deref()),
+            (Some("https://site-ok.pages.dev"), Some("main"))
+        );
         assert!(!pages[1].current);
 
         let builds = list(&state, Some(worker.id), None).unwrap();
-        assert_eq!(builds.iter().map(|dep| (dep.id.as_str(), dep.state.as_str(), dep.env.as_str())).collect::<Vec<_>>(),
-                   [("wk_run", "building", "production"), ("wk_ok", "ready", "production"), ("wk_fail", "error", "preview")]);
+        assert_eq!(
+            builds
+                .iter()
+                .map(|dep| (dep.id.as_str(), dep.state.as_str(), dep.env.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("wk_run", "building", "production"),
+                ("wk_ok", "ready", "production"),
+                ("wk_fail", "error", "preview")
+            ]
+        );
         let wk_fail = builds.iter().find(|dep| dep.id == "wk_fail").unwrap();
-        assert_eq!((wk_fail.error_code.as_deref(), wk_fail.error_message.as_deref(), wk_fail.branch.as_deref()), (Some("failure"), Some("Build command failed"), Some("feature/z")));
+        assert_eq!(
+            (
+                wk_fail.error_code.as_deref(),
+                wk_fail.error_message.as_deref(),
+                wk_fail.branch.as_deref()
+            ),
+            (
+                Some("failure"),
+                Some("Build command failed"),
+                Some("feature/z")
+            )
+        );
         let wk_ok = builds.iter().find(|dep| dep.id == "wk_ok").unwrap();
-        assert_eq!(wk_ok.url.as_deref(), Some(fake.site("").as_str()), "生产构建的地址就是 Worker 自己的地址");
+        assert_eq!(
+            wk_ok.url.as_deref(),
+            Some(fake.site("").as_str()),
+            "生产构建的地址就是 Worker 自己的地址"
+        );
 
         // 活动流：到了终态的各记一条
         let events = events_of(&state);
         let has = |kind: &str, level: &str, needle: &str| {
-            events.iter().any(|(k, l, message)| k == kind && l == level && message.contains(needle))
+            events
+                .iter()
+                .any(|(k, l, message)| k == kind && l == level && message.contains(needle))
         };
-        assert!(has("deploy.failed", "error", "生产部署失败：1111111 break the build（BUILD_FAILED：Command \"npm run build\" exited with 1）"), "{events:?}");
+        assert!(
+            has(
+                "deploy.failed",
+                "error",
+                "生产部署失败：1111111 break the build（BUILD_FAILED：Command \"npm run build\" exited with 1）"
+            ),
+            "{events:?}"
+        );
         assert!(has("deploy.ready", "info", "生产部署就绪：abcdef1 ship it"));
-        assert!(has("deploy.ready", "info", "生产部署就绪：aaaaaa1 ship pages"));
-        assert!(has("deploy.failed", "error", "预览部署失败：dddddd4 wip（failure：Build command failed）"), "{events:?}");
-        assert!(!events.iter().any(|(kind, _, message)| kind == "deploy.failed" && message.contains("docs only")), "被跳过的部署不算失败");
+        assert!(has(
+            "deploy.ready",
+            "info",
+            "生产部署就绪：aaaaaa1 ship pages"
+        ));
+        assert!(
+            has(
+                "deploy.failed",
+                "error",
+                "预览部署失败：dddddd4 wip（failure：Build command failed）"
+            ),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(kind, _, message)| kind == "deploy.failed" && message.contains("docs only")),
+            "被跳过的部署不算失败"
+        );
 
         // 刷新失败（比如令牌失效）：记一次警告，同一个原因不重复记
-        state.secrets.set("deploy_cloudflare_token", "expired").unwrap();
-        assert!(refresh(&state, Some(site.id)).await.unwrap_err().contains("令牌无效"));
-        assert!(refresh(&state, Some(site.id)).await.unwrap_err().contains("令牌无效"));
-        let warnings = events_of(&state).into_iter().filter(|(kind, level, _)| kind == "deploy.refresh" && level == "warning").count();
+        state
+            .secrets
+            .set("deploy_cloudflare_token", "expired")
+            .unwrap();
+        assert!(
+            refresh(&state, Some(site.id))
+                .await
+                .unwrap_err()
+                .contains("令牌无效")
+        );
+        assert!(
+            refresh(&state, Some(site.id))
+                .await
+                .unwrap_err()
+                .contains("令牌无效")
+        );
+        let warnings = events_of(&state)
+            .into_iter()
+            .filter(|(kind, level, _)| kind == "deploy.refresh" && level == "warning")
+            .count();
         assert_eq!(warnings, 1);
-        state.secrets.set("deploy_cloudflare_token", "cf_good").unwrap();
+        state
+            .secrets
+            .set("deploy_cloudflare_token", "cf_good")
+            .unwrap();
         assert_eq!(refresh(&state, Some(site.id)).await.unwrap(), 0);
-        assert_eq!(events_of(&state).into_iter().filter(|(kind, _, _)| kind == "deploy.refresh").count(), 1, "原因变了才会再记");
+        assert_eq!(
+            events_of(&state)
+                .into_iter()
+                .filter(|(kind, _, _)| kind == "deploy.refresh")
+                .count(),
+            1,
+            "原因变了才会再记"
+        );
 
         // 平台上的状态变了再拉：只算有变化的
         set(&fake.vercel, "dpl_build", "readyState", "CANCELED");
         assert_eq!(refresh(&state, Some(web.id)).await.unwrap(), 1);
-        let build = list(&state, Some(web.id), None).unwrap().into_iter().find(|dep| dep.id == "dpl_build").unwrap();
+        let build = list(&state, Some(web.id), None)
+            .unwrap()
+            .into_iter()
+            .find(|dep| dep.id == "dpl_build")
+            .unwrap();
         assert_eq!(build.state, "canceled");
         assert_eq!(list(&state, None, Some(4)).unwrap().len(), 4);
     }
@@ -3271,7 +3802,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         // 这个仓库之前处理过：记得在哪台机器、用哪个 Agent、仓库在哪
         let earlier = {
             let db = state.db.lock().unwrap();
-            let earlier = tasks::create_manual(&db, "早先的任务", "octo/demo", "随便做点事").unwrap();
+            let earlier =
+                tasks::create_manual(&db, "早先的任务", "octo/demo", "随便做点事").unwrap();
             db.execute(
                 "UPDATE tasks SET node_id = 'local', adapter = 'claude-cli', workdir = ?2 WHERE id = ?1",
                 params![earlier.id, repo.to_str().unwrap()],
@@ -3280,7 +3812,16 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             earlier.id
         };
 
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("")), None).await.unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
         let deps = list(&state, Some(web.id), None).unwrap();
         let failed = deps.iter().find(|dep| dep.id == "dpl_err").unwrap();
         let ok = deps.iter().find(|dep| dep.id == "dpl_ok").unwrap();
@@ -3288,44 +3829,109 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         assert!(failed.guarded && ok.guarded && preview.guarded);
         assert_eq!(ok.health.as_deref(), Some("ok"));
         assert_eq!(preview.health, None, "预览部署不做健康检查");
-        assert!(preview.task_id.is_none() && ok.task_id.is_none(), "只有出问题的那次才带修复任务");
+        assert!(
+            preview.task_id.is_none() && ok.task_id.is_none(),
+            "只有出问题的那次才带修复任务"
+        );
 
         // 修复任务：标题点明是哪个项目哪次提交，说明里有原因和构建日志
         let task_id = failed.task_id.expect("失败的生产部署要带上修复任务");
         let task = tasks::load(&state.db.lock().unwrap(), task_id).unwrap();
-        assert_eq!((task.repo.as_deref(), task.source.as_str()), (Some("octo/demo"), "manual"));
+        assert_eq!(
+            (task.repo.as_deref(), task.source.as_str()),
+            (Some("octo/demo"), "manual")
+        );
         assert_eq!(task.title, "修复 web 部署失败（1111111）");
         let instructions = task.instructions.clone().unwrap();
-        for needle in ["Vercel 上的项目「web」的生产部署出了问题", "分支：main", "提交：1111111 break the build", "BUILD_FAILED：Command \"npm run build\" exited with 1", "Type error: Cannot find name 'useEffect'"] {
-            assert!(instructions.contains(needle), "说明里缺「{needle}」：\n{instructions}");
+        for needle in [
+            "Vercel 上的项目「web」的生产部署出了问题",
+            "分支：main",
+            "提交：1111111 break the build",
+            "BUILD_FAILED：Command \"npm run build\" exited with 1",
+            "Type error: Cannot find name 'useEffect'",
+        ] {
+            assert!(
+                instructions.contains(needle),
+                "说明里缺「{needle}」：\n{instructions}"
+            );
         }
-        assert!(instructions.contains("构建日志的最后部分"), "{instructions}");
+        assert!(
+            instructions.contains("构建日志的最后部分"),
+            "{instructions}"
+        );
 
         // 沿用上次的机器与 Agent 自动开工：基于出问题的分支，改完停下等人确认
         let task = wait_status(&state, task_id, &["changes", "failed"]).await;
-        assert_eq!(task.status, "changes", "{}", task.failure.unwrap_or_default());
+        assert_eq!(
+            task.status,
+            "changes",
+            "{}",
+            task.failure.unwrap_or_default()
+        );
         let canonical = std::fs::canonicalize(&repo).unwrap();
-        assert_eq!((task.node_id.as_deref(), task.adapter.as_deref(), task.workdir.as_deref()), (Some("local"), Some("claude-cli"), Some(canonical.to_str().unwrap())));
+        assert_eq!(
+            (
+                task.node_id.as_deref(),
+                task.adapter.as_deref(),
+                task.workdir.as_deref()
+            ),
+            (
+                Some("local"),
+                Some("claude-cli"),
+                Some(canonical.to_str().unwrap())
+            )
+        );
         assert_eq!(task.base_branch.as_deref(), Some("main"));
         assert!(!task.auto_pr, "修复也要先让人看过改动");
         let worktree = task.worktree.clone().unwrap();
         // 工作树在仓库旁边，以仓库目录的名字命名
-        assert!(worktree.ends_with(&format!("app-wt/agent-task-{task_id}")), "{worktree}");
-        assert!(std::path::Path::new(&worktree).join("fix.txt").exists(), "Agent 没有在工作树里改东西：{worktree}");
+        assert!(
+            worktree.ends_with(&format!("app-wt/agent-task-{task_id}")),
+            "{worktree}"
+        );
+        assert!(
+            std::path::Path::new(&worktree).join("fix.txt").exists(),
+            "Agent 没有在工作树里改东西：{worktree}"
+        );
         assert!(task.session_id.is_some(), "Agent 的往来要留在会话里");
 
         let events = events_of(&state);
-        assert!(events.iter().any(|(kind, level, message)| kind == "deploy.repair" && level == "warning" && message.contains(&format!("已建修复任务 #{task_id}"))), "{events:?}");
-        assert!(events.iter().any(|(kind, _, message)| kind == "task.started" && message.contains("Agent 开始处理")), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.repair"
+                    && level == "warning"
+                    && message.contains(&format!("已建修复任务 #{task_id}"))),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(kind, _, message)| kind == "task.started"
+                    && message.contains("Agent 开始处理")),
+            "{events:?}"
+        );
 
         // 再怎么刷新也不会为同一次部署重复建任务
         assert_eq!(refresh(&state, Some(web.id)).await.unwrap(), 0);
-        let pending: Vec<i64> = tasks::in_status(&state.db.lock().unwrap(), "pending").unwrap().into_iter().map(|task| task.id).collect();
+        let pending: Vec<i64> = tasks::in_status(&state.db.lock().unwrap(), "pending")
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
         assert_eq!(pending, [earlier]);
-        assert_eq!(list(&state, None, None).unwrap().iter().filter(|dep| dep.task_id.is_some()).count(), 1);
+        assert_eq!(
+            list(&state, None, None)
+                .unwrap()
+                .iter()
+                .filter(|dep| dep.task_id.is_some())
+                .count(),
+            1
+        );
 
         // 没处理过这个仓库：任务建好，等人挑机器和 Agent
-        let plain_repo = tasks::create_manual(&state.db.lock().unwrap(), "first", "someone/other", "x").unwrap();
+        let plain_repo =
+            tasks::create_manual(&state.db.lock().unwrap(), "first", "someone/other", "x").unwrap();
         assert_eq!(plain_repo.status, "pending");
         let _ = bin;
     }
@@ -3335,36 +3941,105 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         let (fake, state) = rigged(idle()).await;
         seed(&fake);
         // web 的生产地址挂了：部署成功，健康检查不过
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("/down")), None).await.unwrap();
-        let ok = list(&state, Some(web.id), None).unwrap().into_iter().find(|dep| dep.id == "dpl_ok").unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("/down")),
+            None,
+        )
+        .await
+        .unwrap();
+        let ok = list(&state, Some(web.id), None)
+            .unwrap()
+            .into_iter()
+            .find(|dep| dep.id == "dpl_ok")
+            .unwrap();
         assert_eq!(ok.health.as_deref(), Some("HTTP 500"));
         let task_id = ok.task_id.expect("健康检查不过也要建修复任务");
         let task = tasks::load(&state.db.lock().unwrap(), task_id).unwrap();
         let instructions = task.instructions.unwrap();
-        assert!(instructions.contains("部署成功了，但健康检查没通过：HTTP 500"), "{instructions}");
-        assert!(!instructions.contains("构建日志"), "构建是成功的，没有日志可带：{instructions}");
-        assert!(instructions.contains("查的是 "), "要说清楚查的是哪个地址：{instructions}");
-        assert!(events_of(&state).iter().any(|(kind, level, message)| kind == "deploy.repair" && level == "warning" && message.contains("健康检查没通过：HTTP 500")));
+        assert!(
+            instructions.contains("部署成功了，但健康检查没通过：HTTP 500"),
+            "{instructions}"
+        );
+        assert!(
+            !instructions.contains("构建日志"),
+            "构建是成功的，没有日志可带：{instructions}"
+        );
+        assert!(
+            instructions.contains("查的是 "),
+            "要说清楚查的是哪个地址：{instructions}"
+        );
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.repair"
+                    && level == "warning"
+                    && message.contains("健康检查没通过：HTTP 500"))
+        );
         // 任务留着等人工启动（这个仓库还没处理过）
         assert_eq!(task.status, "pending");
 
         // 有访问保护的地址：检查不了，不算出事
-        let alt = add_target(&state, "vercel", "alt", "prj_alt", Some(&fake.site("/private")), None).await.unwrap();
+        let alt = add_target(
+            &state,
+            "vercel",
+            "alt",
+            "prj_alt",
+            Some(&fake.site("/private")),
+            None,
+        )
+        .await
+        .unwrap();
         let alt_ok = list(&state, Some(alt.id), None).unwrap().remove(0);
-        assert!(alt_ok.health.as_deref().unwrap().contains("访问保护"), "{:?}", alt_ok.health);
+        assert!(
+            alt_ok.health.as_deref().unwrap().contains("访问保护"),
+            "{:?}",
+            alt_ok.health
+        );
         assert!(alt_ok.guarded && alt_ok.task_id.is_none());
-        assert!(events_of(&state).iter().any(|(kind, level, message)| kind == "deploy.health" && level == "warning" && message.contains("健康检查没法做")));
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.health"
+                    && level == "warning"
+                    && message.contains("健康检查没法做"))
+        );
 
         // 连不上（多半是这台机器的网络问题）：同样不算
-        let unreachable = add_target(&state, "vercel", "u", "prj_u", Some("http://127.0.0.1:9/healthz"), None).await.unwrap();
+        let unreachable = add_target(
+            &state,
+            "vercel",
+            "u",
+            "prj_u",
+            Some("http://127.0.0.1:9/healthz"),
+            None,
+        )
+        .await
+        .unwrap();
         let unreachable_ok = list(&state, Some(unreachable.id), None).unwrap().remove(0);
-        assert!(unreachable_ok.health.as_deref().unwrap().contains("连不上"), "{:?}", unreachable_ok.health);
+        assert!(
+            unreachable_ok.health.as_deref().unwrap().contains("连不上"),
+            "{:?}",
+            unreachable_ok.health
+        );
         assert!(unreachable_ok.task_id.is_none(), "连不上不该建修复任务");
 
-        let off = add_target(&state, "vercel", "off", "prj_off", Some(&fake.site("/down")), None).await.unwrap();
+        let off = add_target(
+            &state,
+            "vercel",
+            "off",
+            "prj_off",
+            Some(&fake.site("/down")),
+            None,
+        )
+        .await
+        .unwrap();
         let first = list(&state, Some(off.id), None).unwrap().remove(0);
         assert!(first.task_id.is_some(), "开着自动修复时会建任务");
-        let mut push = |suffix: &str| {
+        let push = |suffix: &str| {
             let mut dep = json!({"uid": format!("dpl_off_{suffix}"), "projectId": "prj_off", "name": "off", "readyState": "ERROR", "target": "production",
                                  "created": now_ms(), "errorCode": "BUILD_FAILED", "errorMessage": "exit 1",
                                  "meta": {"githubCommitRef": "main", "githubCommitSha": "5555555fff"}});
@@ -3378,7 +4053,13 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         refresh(&state, Some(off.id)).await.unwrap();
         let second = load_deployment(&state.db.lock().unwrap(), "dpl_off_second").unwrap();
         assert!(second.guarded && second.task_id.is_none());
-        assert!(events_of(&state).iter().any(|(kind, level, message)| kind == "deploy.guard" && level == "warning" && message.contains("没有开自动修复")));
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.guard"
+                    && level == "warning"
+                    && message.contains("没有开自动修复"))
+        );
 
         // 24 小时内已经建过三个：不再建
         {
@@ -3397,11 +4078,29 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         refresh(&state, Some(off.id)).await.unwrap();
         let third = load_deployment(&state.db.lock().unwrap(), "dpl_off_third").unwrap();
         assert!(third.guarded && third.task_id.is_none());
-        assert!(events_of(&state).iter().any(|(kind, level, message)| kind == "deploy.guard" && level == "warning" && message.contains("不再自动建")));
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.guard"
+                    && level == "warning"
+                    && message.contains("不再自动建"))
+        );
 
         // 没关联 GitHub 仓库：建不了任务
-        let plain = add_target(&state, "vercel", "plain", "prj_plain", Some(&fake.site("/down")), None).await.unwrap();
-        assert!(list(&state, Some(plain.id), None).unwrap().is_empty(), "plain 在假平台上还没有部署");
+        let plain = add_target(
+            &state,
+            "vercel",
+            "plain",
+            "prj_plain",
+            Some(&fake.site("/down")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            list(&state, Some(plain.id), None).unwrap().is_empty(),
+            "plain 在假平台上还没有部署"
+        );
         let mut plain_dep = json!({"uid": "dpl_plain1", "projectId": "prj_plain", "readyState": "READY", "target": "production", "created": now_ms(), "meta": {}});
         plain_dep["created"] = json!(now_ms());
         fake.vercel.lock().unwrap().push(plain_dep);
@@ -3409,10 +4108,25 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         let plain_ok = list(&state, Some(plain.id), None).unwrap().remove(0);
         assert_eq!(plain_ok.health.as_deref(), Some("HTTP 500"));
         assert!(plain_ok.task_id.is_none());
-        assert!(events_of(&state).iter().any(|(kind, _, message)| kind == "deploy.guard" && message.contains("没有关联 GitHub 仓库")));
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, _, message)| kind == "deploy.guard"
+                    && message.contains("没有关联 GitHub 仓库"))
+        );
 
         // 手动复查一次健康
-        update_target(&state, web.id, Some(&fake.site("")), None, None, None, None, None).unwrap();
+        update_target(
+            &state,
+            web.id,
+            Some(&fake.site("")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(check_health(&state, "dpl_ok").await.unwrap(), "ok");
         assert!(check_health(&state, "dpl_nope").await.is_err());
     }
@@ -3421,80 +4135,197 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
     async fn production_deploys_need_a_confirm_and_requests_match_the_documented_shapes() {
         let (fake, state) = rigged(idle()).await;
         seed(&fake);
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("")), None).await.unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
 
         // 生产分支：要先确认
-        let err = trigger(&state, web.id, Some("main"), None, false).await.unwrap_err();
+        let err = trigger(&state, web.id, Some("main"), None, false)
+            .await
+            .unwrap_err();
         assert!(err.contains("需要先确认"), "{err}");
-        assert!(fake.call("POST", "/v13/deployments").is_none(), "没确认就不该发请求");
-        let gate_off = update_target(&state, web.id, None, Some(false), None, None, None, None).unwrap();
+        assert!(
+            fake.call("POST", "/v13/deployments").is_none(),
+            "没确认就不该发请求"
+        );
+        let gate_off =
+            update_target(&state, web.id, None, Some(false), None, None, None, None).unwrap();
         assert!(!gate_off.prod_requires_approval);
-        let dep = trigger(&state, web.id, Some(" main "), None, false).await.unwrap();
+        let dep = trigger(&state, web.id, Some(" main "), None, false)
+            .await
+            .unwrap();
         assert!(dep.id.starts_with("dpl_new"), "{}", dep.id);
         let (path, body) = fake.call("POST", "/v13/deployments").unwrap();
         assert_eq!(path, "/v13/deployments?teamId=team_a");
         let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body, json!({"name": "web", "project": "prj_web", "target": "production", "gitSource": {"type": "github", "ref": "main", "repoId": "1234"}}));
-        assert!((dep.env.as_str(), dep.state.as_str(), dep.branch.as_deref()) == ("production", "queued", Some("main")));
+        assert_eq!(
+            body,
+            json!({"name": "web", "project": "prj_web", "target": "production", "gitSource": {"type": "github", "ref": "main", "repoId": "1234"}})
+        );
+        assert!(
+            (dep.env.as_str(), dep.state.as_str(), dep.branch.as_deref())
+                == ("production", "queued", Some("main"))
+        );
         update_target(&state, web.id, None, Some(true), None, None, None, None).unwrap();
 
         // 预览分支 + 指定提交：不用确认，不带 target
-        let dep = trigger(&state, web.id, Some("feature/x"), Some("fffff0000full"), false).await.unwrap();
+        let dep = trigger(
+            &state,
+            web.id,
+            Some("feature/x"),
+            Some("fffff0000full"),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(dep.env, "preview");
         let body = fake.body("POST", "/v13/deployments");
-        assert_eq!(body["gitSource"], json!({"type": "github", "ref": "feature/x", "sha": "fffff0000full", "repoId": "1234"}));
+        assert_eq!(
+            body["gitSource"],
+            json!({"type": "github", "ref": "feature/x", "sha": "fffff0000full", "repoId": "1234"})
+        );
         assert!(body.get("target").is_none());
 
         // 没有仓库 id 的项目用 org + repo
-        let mut alt = add_target(&state, "vercel", "alt", "prj_alt", Some(&fake.site("")), None).await.unwrap();
+        let mut alt = add_target(
+            &state,
+            "vercel",
+            "alt",
+            "prj_alt",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
         alt.repo_id = None;
         save_target(&state.db.lock().unwrap(), &alt).unwrap();
-        trigger(&state, alt.id, None, None, false).await.unwrap_err();
-        trigger(&state, alt.id, Some("dev"), None, false).await.unwrap();
-        assert_eq!(fake.body("POST", "/v13/deployments")["gitSource"], json!({"type": "github", "ref": "dev", "org": "octo", "repo": "demo"}));
+        trigger(&state, alt.id, None, None, false)
+            .await
+            .unwrap_err();
+        trigger(&state, alt.id, Some("dev"), None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.body("POST", "/v13/deployments")["gitSource"],
+            json!({"type": "github", "ref": "dev", "org": "octo", "repo": "demo"})
+        );
 
         // 没关联 GitHub 的项目：只能把最近一次原样再来一遍
-        let plain = add_target(&state, "vercel", "plain", "prj_plain", Some(&fake.site("")), None).await.unwrap();
-        let err = trigger(&state, plain.id, Some("main"), None, true).await.unwrap_err();
+        let plain = add_target(
+            &state,
+            "vercel",
+            "plain",
+            "prj_plain",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = trigger(&state, plain.id, Some("main"), None, true)
+            .await
+            .unwrap_err();
         assert!(err.contains("还没有部署过"), "{err}");
         let mut plain_dep = json!({"uid": "dpl_plain1", "projectId": "prj_plain", "readyState": "READY", "target": "production", "created": now_ms(), "meta": {"githubCommitRef": "main"}});
         plain_dep["created"] = json!(now_ms());
         fake.vercel.lock().unwrap().push(plain_dep);
         refresh(&state, Some(plain.id)).await.unwrap();
-        assert!(trigger(&state, plain.id, Some("dev"), None, true).await.unwrap_err().contains("没有关联 GitHub 仓库"));
-        trigger(&state, plain.id, Some("main"), None, true).await.unwrap();
-        assert_eq!(fake.body("POST", "/v13/deployments"), json!({"name": "plain", "project": "prj_plain", "deploymentId": "dpl_plain1", "withLatestCommit": true}));
+        assert!(
+            trigger(&state, plain.id, Some("dev"), None, true)
+                .await
+                .unwrap_err()
+                .contains("没有关联 GitHub 仓库")
+        );
+        trigger(&state, plain.id, Some("main"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.body("POST", "/v13/deployments"),
+            json!({"name": "plain", "project": "prj_plain", "deploymentId": "dpl_plain1", "withLatestCommit": true})
+        );
 
         // 重新部署一次生产部署也要确认
-        assert!(retry(&state, "dpl_ok", false).await.unwrap_err().contains("需要先确认"));
+        assert!(
+            retry(&state, "dpl_ok", false)
+                .await
+                .unwrap_err()
+                .contains("需要先确认")
+        );
         let again = retry(&state, "dpl_ok", true).await.unwrap();
         assert!(again.id.starts_with("dpl_new"));
-        assert_eq!(fake.body("POST", "/v13/deployments"), json!({"name": "web", "project": "prj_web", "deploymentId": "dpl_ok", "withLatestCommit": true}));
+        assert_eq!(
+            fake.body("POST", "/v13/deployments"),
+            json!({"name": "web", "project": "prj_web", "deploymentId": "dpl_ok", "withLatestCommit": true})
+        );
 
         // 取消
-        let building = list(&state, Some(web.id), None).unwrap().into_iter().find(|dep| dep.state == "building").unwrap();
+        let building = list(&state, Some(web.id), None)
+            .unwrap()
+            .into_iter()
+            .find(|dep| dep.state == "building")
+            .unwrap();
         cancel(&state, &building.id).await.unwrap();
-        assert_eq!(fake.call("PATCH", "/cancel").unwrap().0, format!("/v12/deployments/{}/cancel?teamId=team_a", building.id));
-        assert_eq!(load_deployment(&state.db.lock().unwrap(), &building.id).unwrap().state, "canceled");
+        assert_eq!(
+            fake.call("PATCH", "/cancel").unwrap().0,
+            format!("/v12/deployments/{}/cancel?teamId=team_a", building.id)
+        );
+        assert_eq!(
+            load_deployment(&state.db.lock().unwrap(), &building.id)
+                .unwrap()
+                .state,
+            "canceled"
+        );
 
         // 把预览部署提升为生产
-        assert!(promote(&state, "dpl_build").await.unwrap_err().contains("只有成功的部署"));
+        assert!(
+            promote(&state, "dpl_build")
+                .await
+                .unwrap_err()
+                .contains("只有成功的部署")
+        );
         promote(&state, "dpl_preview").await.unwrap();
-        assert_eq!(fake.call("POST", "/promote/").unwrap().0, "/v10/projects/prj_web/promote/dpl_preview?teamId=team_a");
+        assert_eq!(
+            fake.call("POST", "/promote/").unwrap().0,
+            "/v10/projects/prj_web/promote/dpl_preview?teamId=team_a"
+        );
 
         // 回滚候选：平台说能回滚的成功生产部署
         let candidates = history(&state, web.id).await.unwrap();
-        assert_eq!(candidates.iter().map(|item| (item.id.as_str(), item.current)).collect::<Vec<_>>(), [("dpl_ok", true), ("dpl_prev", false)]);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| (item.id.as_str(), item.current))
+                .collect::<Vec<_>>(),
+            [("dpl_ok", true), ("dpl_prev", false)]
+        );
         assert!(candidates.iter().all(|item| item.version_id.is_none()));
         // 平台没给标记的时候，成功的生产部署都算
         {
             let db = state.db.lock().unwrap();
-            db.execute("UPDATE deployments SET rollback_ok = 0 WHERE target_id = ?1", params![web.id]).unwrap();
+            db.execute(
+                "UPDATE deployments SET rollback_ok = 0 WHERE target_id = ?1",
+                params![web.id],
+            )
+            .unwrap();
         }
         assert_eq!(history(&state, web.id).await.unwrap().len(), 3);
         rollback(&state, web.id, "dpl_prev", None).await.unwrap();
-        assert_eq!(fake.call("POST", "/rollback/").unwrap().0, "/v1/projects/prj_web/rollback/dpl_prev?description=AutoAgents+rollback&teamId=team_a");
-        let current: Vec<String> = list(&state, Some(web.id), None).unwrap().into_iter().filter(|dep| dep.current).map(|dep| dep.id).collect();
+        assert_eq!(
+            fake.call("POST", "/rollback/").unwrap().0,
+            "/v1/projects/prj_web/rollback/dpl_prev?description=AutoAgents+rollback&teamId=team_a"
+        );
+        let current: Vec<String> = list(&state, Some(web.id), None)
+            .unwrap()
+            .into_iter()
+            .filter(|dep| dep.current)
+            .map(|dep| dep.id)
+            .collect();
         assert_eq!(current, ["dpl_prev"]);
 
         // 平台报错时把原因带回来
@@ -3503,8 +4334,19 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         assert!(load_deployment(&state.db.lock().unwrap(), "dpl_nope").is_err());
 
         let events = events_of(&state);
-        for needle in ["发起了生产部署：main", "发起了预览部署：feature/x", "取消了预览部署", "提升为生产", "生产部署已回滚"] {
-            assert!(events.iter().any(|(_, _, message)| message.contains(needle)), "缺事件：{needle}");
+        for needle in [
+            "发起了生产部署：main",
+            "发起了预览部署：feature/x",
+            "取消了预览部署",
+            "提升为生产",
+            "生产部署已回滚",
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, _, message)| message.contains(needle)),
+                "缺事件：{needle}"
+            );
         }
     }
 
@@ -3512,91 +4354,255 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
     async fn pages_and_workers_have_their_own_ways_to_deploy_and_roll_back() {
         let (fake, state) = rigged(idle()).await;
         seed(&fake);
-        let site = add_target(&state, "cloudflare-pages", "site", "site", Some(&fake.site("")), None).await.unwrap();
+        let site = add_target(
+            &state,
+            "cloudflare-pages",
+            "site",
+            "site",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
 
         // Pages：没有指定分支发起部署的接口，只能把这条分支最近的一次原样再来一遍
-        let err = trigger(&state, site.id, Some("feature/new"), None, false).await.unwrap_err();
+        let err = trigger(&state, site.id, Some("feature/new"), None, false)
+            .await
+            .unwrap_err();
         assert!(err.contains("还没有部署过"), "{err}");
-        let preview = trigger(&state, site.id, Some("feature/y"), None, false).await.unwrap();
+        let preview = trigger(&state, site.id, Some("feature/y"), None, false)
+            .await
+            .unwrap();
         assert!(preview.id.starts_with("pg_new"), "{}", preview.id);
         assert_eq!(preview.branch.as_deref(), Some("feature/y"));
-        assert!(fake.call("POST", "/retry").unwrap().0.ends_with("/pages/projects/site/deployments/pg_fail/retry"));
-        assert!(trigger(&state, site.id, Some("main"), None, false).await.unwrap_err().contains("需要先确认"));
-        let production = trigger(&state, site.id, Some("main"), None, true).await.unwrap();
+        assert!(
+            fake.call("POST", "/retry")
+                .unwrap()
+                .0
+                .ends_with("/pages/projects/site/deployments/pg_fail/retry")
+        );
+        assert!(
+            trigger(&state, site.id, Some("main"), None, false)
+                .await
+                .unwrap_err()
+                .contains("需要先确认")
+        );
+        let production = trigger(&state, site.id, Some("main"), None, true)
+            .await
+            .unwrap();
         assert_eq!(production.env, "production");
-        assert!(fake.call("POST", "/retry").unwrap().0.ends_with("/deployments/pg_ok/retry"));
+        assert!(
+            fake.call("POST", "/retry")
+                .unwrap()
+                .0
+                .ends_with("/deployments/pg_ok/retry")
+        );
 
         // Pages 没有取消接口；回滚是把生产切回某一次
-        assert!(cancel(&state, "pg_ok").await.unwrap_err().contains("没有取消部署的接口"));
-        assert_eq!(history(&state, site.id).await.unwrap().iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["pg_ok"]);
+        assert!(
+            cancel(&state, "pg_ok")
+                .await
+                .unwrap_err()
+                .contains("没有取消部署的接口")
+        );
+        assert_eq!(
+            history(&state, site.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["pg_ok"]
+        );
         rollback(&state, site.id, "pg_ok", None).await.unwrap();
-        assert_eq!(fake.call("POST", "/rollback").unwrap().0, "/accounts/acct1/pages/projects/site/deployments/pg_ok/rollback");
+        assert_eq!(
+            fake.call("POST", "/rollback").unwrap().0,
+            "/accounts/acct1/pages/projects/site/deployments/pg_ok/rollback"
+        );
         let failed = load_deployment(&state.db.lock().unwrap(), "pg_fail").unwrap();
         let pages_log = logs(&state, &failed).await.unwrap();
-        assert!(pages_log.contains("✘ [ERROR] Build failed with 1 error"), "{pages_log}");
+        assert!(
+            pages_log.contains("✘ [ERROR] Build failed with 1 error"),
+            "{pages_log}"
+        );
 
         // Workers：没有 Deploy Hook 就没法主动触发
-        let worker = add_target(&state, "cloudflare-workers", "api-worker", "tag_api_worker", Some(&fake.site("")), None).await.unwrap();
-        assert!(trigger(&state, worker.id, None, None, true).await.unwrap_err().contains("Deploy Hook"));
+        let worker = add_target(
+            &state,
+            "cloudflare-workers",
+            "api-worker",
+            "tag_api_worker",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            trigger(&state, worker.id, None, None, true)
+                .await
+                .unwrap_err()
+                .contains("Deploy Hook")
+        );
         // 真实的 Deploy Hook 是 https 的（产品要求）；假平台的地址只能直接放进凭据库
-        assert!(update_target(&state, worker.id, None, None, None, None, None, Some("http://insecure/hook")).is_err());
+        assert!(
+            update_target(
+                &state,
+                worker.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("http://insecure/hook")
+            )
+            .is_err()
+        );
         let hook = format!("{}/workers/builds/deploy_hooks/hook123", fake.addr);
         state.secrets.set(&hook_account(worker.id), &hook).unwrap();
-        update_target(&state, worker.id, None, None, None, None, None, Some("https://hooks.cloudflare.example/x")).unwrap();
+        update_target(
+            &state,
+            worker.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("https://hooks.cloudflare.example/x"),
+        )
+        .unwrap();
         state.secrets.set(&hook_account(worker.id), &hook).unwrap();
-        assert!(trigger(&state, worker.id, None, None, false).await.unwrap_err().contains("需要先确认"), "Hook 多半构建的是生产分支");
+        assert!(
+            trigger(&state, worker.id, None, None, false)
+                .await
+                .unwrap_err()
+                .contains("需要先确认"),
+            "Hook 多半构建的是生产分支"
+        );
         let build = trigger(&state, worker.id, None, None, true).await.unwrap();
         assert_eq!(build.id, "wk_new");
         assert_eq!(build.state, "queued");
-        assert_eq!(fake.call("POST", "/deploy_hooks/").unwrap().0, "/workers/builds/deploy_hooks/hook123");
+        assert_eq!(
+            fake.call("POST", "/deploy_hooks/").unwrap().0,
+            "/workers/builds/deploy_hooks/hook123"
+        );
 
         let failed = load_deployment(&state.db.lock().unwrap(), "wk_fail").unwrap();
         let build_log = logs(&state, &failed).await.unwrap();
         assert_eq!(build_log, "Running build command\n✘ [ERROR] build failed");
         cancel(&state, "wk_run").await.unwrap();
-        assert_eq!(fake.call("PUT", "/cancel").unwrap().0, "/accounts/acct1/builds/builds/wk_run/cancel");
+        assert_eq!(
+            fake.call("PUT", "/cancel").unwrap().0,
+            "/accounts/acct1/builds/builds/wk_run/cancel"
+        );
         // 重新部署也是走 Hook
-        assert!(retry(&state, "wk_ok", false).await.unwrap_err().contains("需要先确认"));
+        assert!(
+            retry(&state, "wk_ok", false)
+                .await
+                .unwrap_err()
+                .contains("需要先确认")
+        );
         retry(&state, "wk_ok", true).await.unwrap();
-        assert_eq!(fake.calls.lock().unwrap().iter().filter(|(method, path, _)| method == "POST" && path.contains("/deploy_hooks/")).count(), 2);
+        assert_eq!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, path, _)| method == "POST" && path.contains("/deploy_hooks/"))
+                .count(),
+            2
+        );
 
         // 回滚的单位是版本：列出历次部署，按时间新的在前
         let candidates = history(&state, worker.id).await.unwrap();
         assert_eq!(
-            candidates.iter().map(|item| (item.id.as_str(), item.version_id.as_deref(), item.current, item.commit_message.as_deref())).collect::<Vec<_>>(),
-            [("wdep2", Some("ver2"), true, Some("bump deps")), ("wdep1", Some("ver1"), false, Some("add health endpoint"))]
+            candidates
+                .iter()
+                .map(|item| (
+                    item.id.as_str(),
+                    item.version_id.as_deref(),
+                    item.current,
+                    item.commit_message.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("wdep2", Some("ver2"), true, Some("bump deps")),
+                ("wdep1", Some("ver1"), false, Some("add health endpoint"))
+            ]
         );
-        assert!(rollback(&state, worker.id, "wdep1", None).await.unwrap_err().contains("指定"));
-        rollback(&state, worker.id, "wdep1", Some("ver1")).await.unwrap();
+        assert!(
+            rollback(&state, worker.id, "wdep1", None)
+                .await
+                .unwrap_err()
+                .contains("指定")
+        );
+        rollback(&state, worker.id, "wdep1", Some("ver1"))
+            .await
+            .unwrap();
         assert_eq!(
             fake.body("POST", "/scripts/api-worker/deployments"),
             json!({"strategy": "percentage", "versions": [{"percentage": 100, "version_id": "ver1"}], "annotations": {"workers/message": "AutoAgents 回滚"}})
         );
-        assert!(promote(&state, "wk_ok").await.unwrap_err().contains("只有 Vercel"));
+        assert!(
+            promote(&state, "wk_ok")
+                .await
+                .unwrap_err()
+                .contains("只有 Vercel")
+        );
     }
 
     #[tokio::test]
     async fn deployments_link_back_to_the_tasks_that_produced_them() {
         let (fake, state) = rigged(idle()).await;
         seed(&fake);
-        let web = add_target(&state, "vercel", "web", "prj_web", Some(&fake.site("")), None).await.unwrap();
-        let by_branch = tasks::create_manual(&state.db.lock().unwrap(), "t1", "octo/demo", "x").unwrap();
-        let by_commit = tasks::create_manual(&state.db.lock().unwrap(), "t2", "octo/demo", "x").unwrap();
-        let elsewhere = tasks::create_manual(&state.db.lock().unwrap(), "t3", "someone/else", "x").unwrap();
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        let by_branch =
+            tasks::create_manual(&state.db.lock().unwrap(), "t1", "octo/demo", "x").unwrap();
+        let by_commit =
+            tasks::create_manual(&state.db.lock().unwrap(), "t2", "octo/demo", "x").unwrap();
+        let elsewhere =
+            tasks::create_manual(&state.db.lock().unwrap(), "t3", "someone/else", "x").unwrap();
         {
             let db = state.db.lock().unwrap();
-            db.execute("UPDATE tasks SET branch = 'feature/x', head_sha = 'fffff0000' WHERE id = ?1", params![by_branch.id]).unwrap();
+            db.execute(
+                "UPDATE tasks SET branch = 'feature/x', head_sha = 'fffff0000' WHERE id = ?1",
+                params![by_branch.id],
+            )
+            .unwrap();
             db.execute("UPDATE tasks SET branch = 'no-such-branch', head_sha = 'abcdef123456' WHERE id = ?1", params![by_commit.id]).unwrap();
         }
         // 按分支对上，或按推上去的提交对上
-        let ids = |task: i64| for_task(&state, task).unwrap().into_iter().map(|dep| dep.id).collect::<Vec<_>>();
+        let ids = |task: i64| {
+            for_task(&state, task)
+                .unwrap()
+                .into_iter()
+                .map(|dep| dep.id)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(by_branch.id), ["dpl_build", "dpl_preview"]);
         assert_eq!(ids(by_commit.id), ["dpl_ok"]);
         assert!(ids(elsewhere.id).is_empty());
         // 守护建的修复任务还没有分支：靠 deployments.task_id 找到触发它的那次部署
-        let repair = tasks::create_manual(&state.db.lock().unwrap(), "t4", "octo/demo", "x").unwrap();
+        let repair =
+            tasks::create_manual(&state.db.lock().unwrap(), "t4", "octo/demo", "x").unwrap();
         assert!(ids(repair.id).is_empty());
-        state.db.lock().unwrap().execute("UPDATE deployments SET task_id = ?1 WHERE id = 'dpl_err'", params![repair.id]).unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE deployments SET task_id = ?1 WHERE id = 'dpl_err'",
+                params![repair.id],
+            )
+            .unwrap();
         assert_eq!(ids(repair.id), ["dpl_err"]);
         assert!(for_task(&state, 999).is_err());
         assert_eq!(web.id, 1);
@@ -3638,20 +4644,45 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                                          "meta": {"githubCommitRef": "main", "githubCommitSha": "abc"}})).unwrap();
         assert!(listed.current && listed.rollback_ok && listed.terminal);
         assert_eq!((listed.env, listed.state), ("production", "ready"));
-        assert_eq!((listed.created_ms, listed.url.as_deref()), (Some(1_609_492_210_000), Some("https://web.vercel.app")));
-        assert_eq!(from_vercel(&json!({"id": "dpl_2", "target": null})).unwrap().id, "dpl_2");
-        assert_eq!(from_vercel(&json!({"id": "dpl_2", "target": null})).unwrap().env, "preview");
-        assert!(from_vercel(&json!({"readyState": "READY"})).is_none(), "没有编号的条目不要");
+        assert_eq!(
+            (listed.created_ms, listed.url.as_deref()),
+            (Some(1_609_492_210_000), Some("https://web.vercel.app"))
+        );
+        assert_eq!(
+            from_vercel(&json!({"id": "dpl_2", "target": null}))
+                .unwrap()
+                .id,
+            "dpl_2"
+        );
+        assert_eq!(
+            from_vercel(&json!({"id": "dpl_2", "target": null}))
+                .unwrap()
+                .env,
+            "preview"
+        );
+        assert!(
+            from_vercel(&json!({"readyState": "READY"})).is_none(),
+            "没有编号的条目不要"
+        );
 
         assert_eq!(with_scheme("http://x.test".into()), "http://x.test");
-        assert_eq!(commit_line(Some("1111111222"), Some(" break the build ")), "1111111 break the build");
+        assert_eq!(
+            commit_line(Some("1111111222"), Some(" break the build ")),
+            "1111111 break the build"
+        );
         assert_eq!(commit_line(None, None), "（没有提交信息）");
-        assert_eq!(failure_text(Some("BUILD_FAILED"), Some(" exit 1 "), None), "BUILD_FAILED：exit 1");
+        assert_eq!(
+            failure_text(Some("BUILD_FAILED"), Some(" exit 1 "), None),
+            "BUILD_FAILED：exit 1"
+        );
         assert_eq!(failure_text(None, None, Some("ERROR")), "构建失败（ERROR）");
         assert_eq!(clip_tail("一二三四五六七", 3), "…（前面省略）\n五六七");
         assert_eq!(clip_tail("short", 100), "short");
         assert_eq!(iso_ms("2024-01-01T00:00:00Z"), Some(1_704_067_200_000));
-        assert_eq!(repo_of(Some("octo".into()), Some("demo".into())).as_deref(), Some("octo/demo"));
+        assert_eq!(
+            repo_of(Some("octo".into()), Some("demo".into())).as_deref(),
+            Some("octo/demo")
+        );
         assert_eq!(repo_of(Some("octo".into()), None), None);
         assert_eq!(repo_of(Some(String::new()), Some("demo".into())), None);
     }

@@ -26,7 +26,7 @@
 - 不做云端 SaaS 多租户，定位**个人/小团队自托管**；中继可以自己架
 - 不做 Agent 间通用聊天室（协同以任务为载体）
 
-### 实现状态（v0.2.0）
+### 实现状态（v0.3.0）
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
@@ -37,6 +37,8 @@
 | 部署与守护 | 已实现，**未用真实账号验证** | Vercel / Cloudflare Pages / Workers 的部署跟踪、日志、发起、重做、取消、升为生产、回滚、健康检查、自动建修复任务 |
 | 可观测 | 部分 | 仪表盘、活动记录、近 24 小时花费；按机器 / Agent / 项目的成本分析未做 |
 | 工作流编排 | 已实现 | 三个模板（修 Issue / PR 审查 / 竞争模式）跑在有向无环图上：并行步骤、依赖解锁、软依赖、人工评审门、失败重跑、取消 |
+| 自动化规则 | 已实现 | 盯 GitHub：Issue 打标签自动开工、新 PR 自动交叉审查并贴回结论；去重、限流、可停用 |
+| 决策中心 | 已实现 | 所有等人拍板的事聚在一页（评审门、改动确认、待启动、PR 验收）；一键合并 PR |
 | 桌面 Agent 深度控制 | 未开始 | 只做发现与展示 |
 
 ---
@@ -193,7 +195,32 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 - 会话步骤的完成判定与任务流水线一致：会话不在运行列表里且最后一条是 Agent 回答（system 结尾算失败）
 - 一次运行里所有步骤共用一台机器，每步可以选不同的 Agent；模板建议的 Agent 建流时可以逐个改
 
-规划中：按步骤指定不同机器、可视化 DAG 编辑器、变量系统（`{{issue.title}}`…）、「新 PR 自动触发审查」。
+规划中：按步骤指定不同机器、可视化 DAG 编辑器、变量系统（`{{issue.title}}`…）。「新 PR 自动触发审查」已由自动化规则（§5.6.1）实现。
+
+#### 5.6.1 自动化规则（Automation）— 已实现
+
+工作流的触发器：盯 GitHub，条件满足就自动建工作流并启动（每 2 分钟扫一遍，可手动「立即检查」）。
+
+| 规则类型 | 触发条件 | 建什么 |
+|---|---|---|
+| `issue-label` | 仓库的 Issue 打上指定标签（`state=open`） | 修 Issue 流水线或竞争模式；可配「修完直接开 PR」 |
+| `new-pr` | 仓库来了新 PR（草稿不算） | PR 审查流水线；跑完把「汇总结论」贴成 PR 评论 |
+
+- 配置一次管以后：机器、每步的 Agent、模型、仓库位置建规则时选好；没配的项沿用这个仓库最近一次任务的设置（还没有的话在活动流里提示补全，不占去重键）
+- 去重与限流：`rule_runs` 以 `issue:7` / `pr:5` 为键，一条 Issue / 一个 PR 只自动处理一次；一条规则 24 小时内最多触发 10 次
+- 触发、贴评论、失败都进活动流（`automation.*` 事件，链回工作流页）
+- 已知取舍：靠轮询不是 Webhook；同一 PR 的新提交不会自动重审
+
+#### 5.6.2 决策中心（Inbox）— 已实现
+
+「我只负责决策和验收」的落点：把散在各页、等人拍板的事聚到一个页面，侧边栏挂待办数角标。
+
+| 区块 | 来源 | 动作 |
+|---|---|---|
+| 人工评审 | `gate` 步骤停在 `waiting` | 链去工作流页择优 |
+| 改动待确认 | 任务 `changes` | 链去任务页看 diff、确认提交 |
+| PR 等你验收 | 任务 `reviewing` 且已开 PR（带检查整体状态） | **一键合并**（squash）→ 刷新后任务自动 `done` |
+| 待启动的任务 | 任务 `pending` | 链去任务页选机器开工 |
 
 ### 5.7 GitHub 集成（GitHub）— 已实现
 
@@ -322,6 +349,8 @@ workflows(id, name, template, repo, issue_number, issue_url, issue_title, pr_num
           instructions, status, detail, created_at, updated_at)
 workflow_steps(id, workflow_id, seq, name, kind, depends_on, config, status,
                task_id, session_id, outcome, detail, failure, started_at, finished_at)
+rules(id, name, kind, repo, config, enabled, created_at, updated_at)      -- 自动化规则；config 是 JSON
+rule_runs(id, rule_id, key, workflow_id, posted, created_at, UNIQUE(rule_id, key))
 ```
 
 凭据（GitHub PAT、中继令牌、Vercel / Cloudflare 令牌、Deploy Hook 地址、与各台机器配对的密钥）都在系统钥匙串里。
@@ -340,7 +369,7 @@ workflow_steps(id, workflow_id, seq, name, kind, depends_on, config, status,
 | 节点程序 `crates/node` | `agentd`（tokio + tokio-rustls）与 `autoagents-relay`，同一个 crate 的两个可执行文件 |
 | 前端 | **React 19 + TypeScript + Vite**、**Tailwind CSS v4**、TanStack Query、React Router、Zustand |
 | IPC | Tauri `invoke` + `event`（进度流推送） |
-| 测试 | Rust 单元与集成测试（`cargo test --workspace`）；界面测试（无头 WebKit + 模拟的 Tauri 接口，四套共 235 项）；两个安装脚本的回归测试（替身的 curl 假装 GitHub Releases，不联网）。CI 在 Linux 与 macOS 上跑 Rust 和脚本测试，界面测试跑 Linux |
+| 测试 | Rust 单元与集成测试（`cargo test --workspace`）；界面测试（无头 WebKit + 模拟的 Tauri 接口，六套：会话、机器、任务、部署、工作流、自动化）；两个安装脚本的回归测试（替身的 curl 假装 GitHub Releases，不联网）。CI 在 Linux 与 macOS 上跑 Rust 和脚本测试，界面测试跑 Linux |
 | 发布 | 打 `v*` 标签 → GitHub Actions 构建 `agentd` / `autoagents-relay`（Linux x86_64 / arm64 静态链接，macOS Intel / Apple Silicon）→ 用构建出来的程序把多机联调走一遍，不过就不发 → GitHub Releases，附 SHA256SUMS → 发布之后再按安装命令在 Linux 和 macOS 上各装一遍 |
 | 许可证 | **GPL-3.0**：应用全部源码（Rust 核心、agentd、中继、前端）以 GPL-3.0 发布 |
 
@@ -358,8 +387,8 @@ workflow_steps(id, workflow_id, seq, name, kind, depends_on, config, status,
 |---|---|---|
 | **M1 单机版** | 本机 Agent 发现；CLI Agent 托管会话；GitHub PAT，Issue → 任务 → PR 全流程 | 已完成 |
 | **M2 多机** | agentd + 配对 + 中继 / 直连；机器监控；远程会话；安装脚本与发布 | 已完成 |
-| **M3 协同** | 部署跟踪与守护（已完成）；工作流 DAG 编排与运行时（已完成：并行、依赖、软依赖、人工门、重跑）；GitHub 介质异步协同；Webhook 触发 | 进行中 |
-| **M4 深水区** | 主动部署与回滚、发布守护闭环（已完成）；桌面 Agent 深度控制；用量成本分析；自动化规则引擎；自更新 | 进行中 |
+| **M3 协同** | 部署跟踪与守护（已完成）；工作流 DAG 编排与运行时（已完成：并行、依赖、软依赖、人工门、重跑）；GitHub 介质异步协同；Webhook 触发 | 轮询触发已完成，Webhook 未开始 |
+| **M4 深水区** | 主动部署与回滚、发布守护闭环（已完成）；桌面 Agent 深度控制；用量成本分析；自动化规则引擎（已完成：Issue 打标签 / 新 PR 触发，见 §5.6.1）、决策中心（已完成，见 §5.6.2）；自更新 | 进行中 |
 
 ---
 
@@ -373,6 +402,7 @@ workflow_steps(id, workflow_id, seq, name, kind, depends_on, config, status,
 | Agent 产出质量不可控直接写仓库 | 独立工作树 + 分支隔离 + 写操作人工卡点（确认后才提交 / 推送 / 开 PR） |
 | 自动发布殃及生产环境 | 生产操作先确认；健康检查；回滚兜底 |
 | 守护建的修复任务停不下来 | 一个项目 24 小时内最多三次；修复任务改完仍要人工确认才发 PR |
+| 自动化规则被标签风暴刷爆 | 一条 Issue / 一个 PR 只处理一次（键去重）；一条规则 24 小时最多触发十次；可随时停用 |
 | 各 Agent 用量计费口径不一 | 费用是「估算」，口径随各家 Agent |
 | 平台接口变了 | 两家平台的接口都对照官方文档核实过，并有照着接口形状搭的模拟平台跑全流程；**尚未用真实账号验证** |
 

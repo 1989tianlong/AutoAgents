@@ -2,6 +2,7 @@ import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import { useNodeEvents } from "./lib/nodeEvents";
 import Dashboard from "./pages/Dashboard";
+import Inbox from "./pages/Inbox";
 import Machines from "./pages/Machines";
 import Agents from "./pages/Agents";
 import Tasks from "./pages/Tasks";
@@ -21,6 +22,7 @@ export default function App() {
         <main className="min-w-0 flex-1 overflow-y-auto">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/inbox" element={<Inbox />} />
             <Route path="/machines" element={<Machines />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/tasks" element={<Tasks />} />

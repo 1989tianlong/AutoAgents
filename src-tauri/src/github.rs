@@ -5,7 +5,7 @@
 
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tauri::State;
 
@@ -123,10 +123,18 @@ async fn gh_get(state: &AppState, token: &str, path: &str) -> Result<Value, Stri
 }
 
 /// 发一个请求。失败时把 GitHub 给出的说明带出来（比如「这个分支已经有 PR 了」）
-async fn gh_call(state: &AppState, token: &str, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+async fn gh_call(
+    state: &AppState,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
     let mut request = http()?
         .request(
-            method.parse().map_err(|_| format!("HTTP 方法不对：{method}"))?,
+            method
+                .parse()
+                .map_err(|_| format!("HTTP 方法不对：{method}"))?,
             format!("{}{path}", state.gh_api.lock().unwrap()),
         )
         .bearer_auth(token)
@@ -135,10 +143,7 @@ async fn gh_call(state: &AppState, token: &str, method: &str, path: &str, body: 
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("网络错误: {e}"))?;
+    let resp = request.send().await.map_err(|e| format!("网络错误: {e}"))?;
     let code = resp.status().as_u16();
     if !resp.status().is_success() {
         let value: Option<Value> = resp.json::<Value>().await.ok();
@@ -167,7 +172,12 @@ async fn gh_call(state: &AppState, token: &str, method: &str, path: &str, body: 
 }
 
 /// 取一段原始文本（不是 JSON 的接口，比如 PR 的 diff：Accept 是 vnd.github.diff）
-async fn gh_text(state: &AppState, token: &str, path: &str, accept: &str) -> Result<String, String> {
+async fn gh_text(
+    state: &AppState,
+    token: &str,
+    path: &str,
+    accept: &str,
+) -> Result<String, String> {
     let resp = http()?
         .get(format!("{}{path}", state.gh_api.lock().unwrap()))
         .bearer_auth(token)
@@ -183,7 +193,13 @@ async fn gh_text(state: &AppState, token: &str, path: &str, accept: &str) -> Res
 }
 
 /// PR 的完整 diff（unified diff 文本）
-pub async fn pr_diff(state: &AppState, token: &str, owner: &str, repo: &str, number: i64) -> Result<String, String> {
+pub async fn pr_diff(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<String, String> {
     gh_text(
         state,
         token,
@@ -222,7 +238,13 @@ pub async fn github_connect(
     }
     let user = fetch_user(&state, &token).await?;
     state.secrets.set(PAT_ACCOUNT, &token)?;
-    record(&state, "github.connected", "info", &user.login, "GitHub 已连接");
+    record(
+        &state,
+        "github.connected",
+        "info",
+        &user.login,
+        "GitHub 已连接",
+    );
     Ok(user)
 }
 
@@ -239,7 +261,13 @@ pub async fn github_status(state: State<'_, Arc<AppState>>) -> Result<Option<GhU
 #[tauri::command]
 pub async fn github_disconnect(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.secrets.delete(PAT_ACCOUNT)?;
-    record(&state, "github.disconnected", "info", "GitHub", "GitHub 已断开连接");
+    record(
+        &state,
+        "github.disconnected",
+        "info",
+        "GitHub",
+        "GitHub 已断开连接",
+    );
     Ok(())
 }
 
@@ -261,7 +289,8 @@ pub fn record(state: &AppState, kind: &str, level: &str, source: &str, message: 
 #[tauri::command]
 pub async fn github_repos(state: State<'_, Arc<AppState>>) -> Result<Vec<GhRepo>, String> {
     let token = token_of(&state)?;
-    let v = gh_get(&state, 
+    let v = gh_get(
+        &state,
         &token,
         "/user/repos?sort=updated&per_page=50&affiliation=owner,collaborator,organization_member",
     )
@@ -288,18 +317,21 @@ pub async fn github_repos(state: State<'_, Arc<AppState>>) -> Result<Vec<GhRepo>
     Ok(repos)
 }
 
-/// Issue 列表（state=all；issues API 混有 PR，过滤掉）。
-#[tauri::command]
-pub async fn github_issues(
-    state: State<'_, Arc<AppState>>,
-    owner: String,
-    repo: String,
+/// Issue 列表（`query` 是 issues 接口的查询串；issues API 混有 PR，过滤掉）。
+pub async fn issues_list(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    query: &str,
 ) -> Result<Vec<GhIssue>, String> {
-    let token = token_of(&state)?;
-    let path = format!("/repos/{owner}/{repo}/issues?state=all&per_page=30&sort=updated");
-    let v = gh_get(&state, &token, &path).await?;
-    let list: Vec<GhIssue> = v
-        .as_array()
+    let v = gh_get(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/issues?{query}"),
+    )
+    .await?;
+    Ok(v.as_array()
         .map(|arr| {
             arr.iter()
                 .filter(|i| i.get("pull_request").is_none())
@@ -318,8 +350,44 @@ pub async fn github_issues(
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    Ok(list)
+        .unwrap_or_default())
+}
+
+/// Issue 列表（state=all）。
+#[tauri::command]
+pub async fn github_issues(
+    state: State<'_, Arc<AppState>>,
+    owner: String,
+    repo: String,
+) -> Result<Vec<GhIssue>, String> {
+    let token = token_of(&state)?;
+    issues_list(
+        &state,
+        &token,
+        &owner,
+        &repo,
+        "state=all&per_page=30&sort=updated",
+    )
+    .await
+}
+
+/// PR 列表（`query` 是 pulls 接口的查询串）。
+pub async fn prs_list(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    query: &str,
+) -> Result<Vec<GhPr>, String> {
+    let v = gh_get(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/pulls?{query}"),
+    )
+    .await?;
+    Ok(v.as_array()
+        .map(|arr| arr.iter().map(pr_from).collect())
+        .unwrap_or_default())
 }
 
 /// PR 列表（state=all）。
@@ -330,11 +398,14 @@ pub async fn github_prs(
     repo: String,
 ) -> Result<Vec<GhPr>, String> {
     let token = token_of(&state)?;
-    let path = format!("/repos/{owner}/{repo}/pulls?state=all&per_page=30&sort=updated&direction=desc");
-    let v = gh_get(&state, &token, &path).await?;
-    Ok(v.as_array()
-        .map(|arr| arr.iter().map(pr_from).collect())
-        .unwrap_or_default())
+    prs_list(
+        &state,
+        &token,
+        &owner,
+        &repo,
+        "state=all&per_page=30&sort=updated&direction=desc",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +413,19 @@ pub async fn github_prs(
 // ---------------------------------------------------------------------------
 
 /// 取一份 Issue 的标题与正文
-pub async fn issue(state: &AppState, token: &str, owner: &str, repo: &str, number: i64) -> Result<GhIssue, String> {
-    let v = gh_get(state, token, &format!("/repos/{owner}/{repo}/issues/{number}")).await?;
+pub async fn issue(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<GhIssue, String> {
+    let v = gh_get(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/issues/{number}"),
+    )
+    .await?;
     Ok(GhIssue {
         number,
         title: s(&v, "title"),
@@ -367,7 +449,8 @@ pub async fn create_pr(
     base: &str,
     body: &str,
 ) -> Result<GhPr, String> {
-    let created = gh_call(state, 
+    let created = gh_call(
+        state,
         token,
         "POST",
         &format!("/repos/{owner}/{repo}/pulls"),
@@ -382,7 +465,8 @@ pub async fn create_pr(
     match created {
         Ok(v) => Ok(pr_from(&v)),
         Err(e) if e.contains("already exists") => {
-            let v = gh_get(state, 
+            let v = gh_get(
+                state,
                 token,
                 &format!("/repos/{owner}/{repo}/pulls?head={owner}:{head}&state=open"),
             )
@@ -397,7 +481,12 @@ pub async fn create_pr(
 }
 
 /// 仓库的默认分支：没指定基础分支时以它为准
-pub async fn default_branch(state: &AppState, token: &str, owner: &str, repo: &str) -> Result<String, String> {
+pub async fn default_branch(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<String, String> {
     let v = gh_get(state, token, &format!("/repos/{owner}/{repo}")).await?;
     let branch = s(&v, "default_branch");
     if branch.is_empty() {
@@ -435,6 +524,49 @@ pub async fn append_pr_body(
         .map(|_| ())
 }
 
+/// 在 PR（Issue 接口）下发一条评论。自动审查的结论贴回 PR 用它
+pub async fn comment_pr(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    body: &str,
+) -> Result<(), String> {
+    gh_call(
+        state,
+        token,
+        "POST",
+        &format!("/repos/{owner}/{repo}/issues/{number}/comments"),
+        Some(json!({ "body": body })),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// 合并 PR。分支保护、必要的检查没过，GitHub 会拒绝——错误原样带给界面
+pub async fn merge_pr(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<(), String> {
+    let v = gh_call(
+        state,
+        token,
+        "PUT",
+        &format!("/repos/{owner}/{repo}/pulls/{number}/merge"),
+        Some(json!({ "merge_method": "squash" })),
+    )
+    .await?;
+    if v.get("merged").and_then(Value::as_bool).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(format!("GitHub 没有合并这个 PR：{}", v))
+    }
+}
+
 /// 检查的状态归类
 fn check_state(status: &str, conclusion: Option<&str>) -> String {
     match conclusion {
@@ -447,8 +579,19 @@ fn check_state(status: &str, conclusion: Option<&str>) -> String {
 }
 
 /// PR 当前状态与它的检查（CI 的每一项、状态接口上报的状态）
-pub async fn pr_state(state: &AppState, token: &str, owner: &str, repo: &str, number: i64) -> Result<PrState, String> {
-    let pr = gh_get(state, token, &format!("/repos/{owner}/{repo}/pulls/{number}")).await?;
+pub async fn pr_state(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<PrState, String> {
+    let pr = gh_get(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/pulls/{number}"),
+    )
+    .await?;
     let mut summary = PrState {
         number,
         state: s(&pr, "state"),
@@ -463,7 +606,13 @@ pub async fn pr_state(state: &AppState, token: &str, owner: &str, repo: &str, nu
     }
     let commit = &summary.head_sha;
     // 老式的提交状态（commit status）
-    if let Ok(v) = gh_get(state, token, &format!("/repos/{owner}/{repo}/commits/{commit}/status")).await {
+    if let Ok(v) = gh_get(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/commits/{commit}/status"),
+    )
+    .await
+    {
         for status in v["statuses"].as_array().into_iter().flatten() {
             let raw = s(status, "state");
             let mapped = match raw.as_str() {
@@ -479,7 +628,8 @@ pub async fn pr_state(state: &AppState, token: &str, owner: &str, repo: &str, nu
         }
     }
     // GitHub Actions 等检查框架上报的检查项（每个 job 一条）
-    if let Ok(v) = gh_get(state, 
+    if let Ok(v) = gh_get(
+        state,
         token,
         &format!("/repos/{owner}/{repo}/commits/{commit}/check-runs?per_page=100"),
     )
@@ -495,7 +645,9 @@ pub async fn pr_state(state: &AppState, token: &str, owner: &str, repo: &str, nu
     }
     // 同名的检查只留最新的那一条
     let mut seen = std::collections::HashSet::new();
-    summary.checks.retain(|check| seen.insert(check.name.clone()));
+    summary
+        .checks
+        .retain(|check| seen.insert(check.name.clone()));
     for check in &summary.checks {
         match check.state.as_str() {
             "success" => summary.success += 1,
@@ -515,7 +667,8 @@ pub async fn failed_check_logs(
     repo: &str,
     commit: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    let runs = gh_get(state, 
+    let runs = gh_get(
+        state,
         token,
         &format!("/repos/{owner}/{repo}/commits/{commit}/check-runs?per_page=100"),
     )
@@ -523,7 +676,9 @@ pub async fn failed_check_logs(
     let client = http()?;
     let mut logs = Vec::new();
     for run in runs["check_runs"].as_array().into_iter().flatten() {
-        let failed = run["conclusion"].as_str().is_some_and(|c| c != "success" && c != "skipped" && c != "neutral");
+        let failed = run["conclusion"]
+            .as_str()
+            .is_some_and(|c| c != "success" && c != "skipped" && c != "neutral");
         if !failed {
             continue;
         }
@@ -567,8 +722,6 @@ pub fn clip_tail(text: &str, max_chars: usize) -> String {
         .rev()
         .nth(max_chars)
         .map_or(0, |(i, _)| i);
-    let cut = text[start..]
-        .find('\n')
-        .map_or(0, |i| i + 1);
+    let cut = text[start..].find('\n').map_or(0, |i| i + 1);
     format!("…（前面省略）\n{}", &text[start + cut..])
 }

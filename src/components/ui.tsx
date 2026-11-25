@@ -3,12 +3,13 @@ import { useEffect, useState, type ReactNode } from "react";
 export function Card({
   className = "",
   children,
+  ...props
 }: {
   className?: string;
   children: ReactNode;
-}) {
+} & React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <div className={`rounded-xl border border-slate-800 bg-slate-900/60 ${className}`}>
+    <div className={`rounded-xl border border-slate-800 bg-slate-900/60 ${className}`} {...props}>
       {children}
     </div>
   );

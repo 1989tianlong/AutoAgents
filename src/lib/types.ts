@@ -554,3 +554,78 @@ export interface WorkflowTemplate {
   live: string | null;
   steps: WorkflowTemplateStep[];
 }
+
+// ---------- 自动化规则 ----------
+
+export type RuleKind = "issue-label" | "new-pr";
+
+export interface AutomationRule {
+  id: number;
+  name: string;
+  kind: RuleKind;
+  repo: string;
+  /** issue-label：盯的标签 */
+  label: string;
+  /** 触发哪个模板：issue-fix / race / pr-review */
+  template: string;
+  /** 各步骤的 Agent（与模板步骤一一对应） */
+  adapters: string[];
+  model: string | null;
+  autoPr: boolean;
+  comment: boolean;
+  nodeId: string;
+  workdir: string;
+  enabled: boolean;
+  /** 近 24 小时触发了几次 */
+  runsToday: number;
+}
+
+export interface AutomationRun {
+  id: number;
+  ruleId: number;
+  ruleName: string;
+  /** issue:7 / pr:5 */
+  key: string;
+  workflowId: number | null;
+  /** 审查结论已经贴回 PR 评论 */
+  posted: boolean;
+  createdAt: string;
+}
+
+// ---------- 决策中心 ----------
+
+export interface InboxGate {
+  workflowId: number;
+  workflowName: string;
+  stepId: number;
+  stepName: string;
+  repo: string;
+}
+
+export interface InboxTask {
+  id: number;
+  title: string;
+  repo: string | null;
+  branch: string | null;
+  detail: string | null;
+  updatedAt: string;
+}
+
+export interface InboxReview {
+  id: number;
+  title: string;
+  repo: string | null;
+  prNumber: number;
+  prUrl: string | null;
+  /** 检查整体状态：success / pending / failure；没取到为空 */
+  checks: string | null;
+  detail: string | null;
+  updatedAt: string;
+}
+
+export interface Inbox {
+  gates: InboxGate[];
+  changes: InboxTask[];
+  starts: InboxTask[];
+  reviews: InboxReview[];
+}

@@ -3,6 +3,11 @@ import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Button, Card, Empty, Modal, PageHeader, inputClass } from "../components/ui";
 import {
+  automationRuleCreate,
+  automationRuleDelete,
+  automationRuleSetEnabled,
+  automationRules,
+  automationScan,
   machinesList,
   workflowCancel,
   workflowCreate,
@@ -12,7 +17,13 @@ import {
   workflowStart,
   workflowTemplates,
 } from "../lib/api";
-import { CHAT_ADAPTERS, type Workflow, type WorkflowStep, type WorkflowTemplate } from "../lib/types";
+import {
+  CHAT_ADAPTERS,
+  type AutomationRule,
+  type Workflow,
+  type WorkflowStep,
+  type WorkflowTemplate,
+} from "../lib/types";
 
 const WF_STATUS: Record<string, { label: string; tone: "slate" | "sky" | "amber" | "emerald" | "rose" }> = {
   pending: { label: "待启动", tone: "slate" },
@@ -191,6 +202,247 @@ function WorkflowCard({ wf }: { wf: Workflow }) {
 
 /** 竖着的箭头分隔已经并进步骤徽章的渲染，这里不再需要单独的组件 */
 
+const RULE_KIND: Record<string, { label: string; desc: string }> = {
+  "issue-label": { label: "Issue 打标签", desc: "Issue 打上标签就自动开工" },
+  "new-pr": { label: "新 PR", desc: "来了新 PR 自动交叉审查、结论贴回 PR" },
+};
+
+const RULE_TEMPLATE: Record<string, string> = {
+  "issue-fix": "修 Issue 流水线",
+  race: "竞争模式",
+  "pr-review": "PR 审查流水线",
+};
+
+function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [kind, setKind] = useState("issue-label");
+  const [name, setName] = useState("");
+  const [repo, setRepo] = useState("");
+  const [label, setLabel] = useState("");
+  // 标签规则可选修 Issue 流水线或竞争模式；新 PR 固定走审查
+  const templateOptions = templates.filter((t) =>
+    kind === "issue-label" ? t.id === "issue-fix" || t.id === "race" : t.id === "pr-review",
+  );
+  const [templateId, setTemplateId] = useState("issue-fix");
+  const template = templates.find((t) => t.id === templateId);
+  const [node, setNode] = useState("local");
+  const [workdir, setWorkdir] = useState("");
+  const [model, setModel] = useState("");
+  const [autoPr, setAutoPr] = useState(true);
+  const [adapters, setAdapters] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const machines = useQuery({ queryKey: ["machines"], queryFn: machinesList });
+
+  useEffect(() => {
+    const t = templates.find((t) => t.id === templateId);
+    if (t) setAdapters(Object.fromEntries(t.steps.map((s) => [s.name, s.adapter ?? ""])));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [templateId]);
+
+  const create = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await automationRuleCreate({
+        name: name.trim(),
+        kind,
+        repo: repo.trim(),
+        label: kind === "issue-label" ? label.trim() : null,
+        template: templateId,
+        adapters: template?.steps.map((s) => adapters[s.name] ?? "") ?? [],
+        model: model.trim() || null,
+        // 竞争模式停在人工评审门，自动开 PR 会把两个方案都发出去：只在修 Issue 流水线给
+        autoPr: kind === "issue-label" && templateId === "issue-fix" && autoPr,
+        nodeId: node,
+        workdir: workdir.trim() || null,
+      });
+      qc.invalidateQueries({ queryKey: ["rules"] });
+      // 建完立刻看一眼 GitHub，别等下一轮
+      await automationScan();
+      qc.invalidateQueries({ queryKey: ["workflows"] });
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      title="新建自动化规则"
+      onClose={onClose}
+      width="max-w-2xl"
+      footer={
+        <>
+          <Button onClick={onClose}>取消</Button>
+          <Button variant="primary" disabled={busy} onClick={create} data-testid="rule-create-submit">
+            建规则并检查
+          </Button>
+        </>
+      }
+    >
+      <div className="max-h-[65vh] space-y-4 overflow-y-auto pr-1">
+        <div>
+          <label className="text-xs text-slate-400">盯什么</label>
+          <div className="mt-1.5 space-y-1.5">
+            {Object.entries(RULE_KIND).map(([id, meta]) => (
+              <label key={id} className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-800 p-2.5 hover:border-slate-700">
+                <input
+                  type="radio"
+                  name="rule-kind"
+                  checked={kind === id}
+                  onChange={() => {
+                    setKind(id);
+                    setTemplateId(id === "issue-label" ? "issue-fix" : "pr-review");
+                  }}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="text-sm text-slate-200">{meta.label}</span>
+                  <span className="ml-2 text-xs text-slate-500">{meta.desc}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-xs text-slate-400">规则名字</span>
+            <input value={name} onChange={(e) => setName(e.currentTarget.value)} placeholder="比如：o/r 的 bug 自动修" className={`${inputClass} mt-1`} data-testid="rule-name" />
+          </label>
+          <label className="block">
+            <span className="text-xs text-slate-400">仓库（owner/repo）</span>
+            <input value={repo} onChange={(e) => setRepo(e.currentTarget.value)} placeholder="owner/repo" className={`${inputClass} mt-1 font-mono`} data-testid="rule-repo" />
+          </label>
+        </div>
+        {kind === "issue-label" && (
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-xs text-slate-400">盯的标签（打上它就触发）</span>
+              <input value={label} onChange={(e) => setLabel(e.currentTarget.value)} placeholder="比如 agent-fix" className={`${inputClass} mt-1 font-mono`} data-testid="rule-label" />
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">用哪个流程</span>
+              <select
+                value={templateId}
+                onChange={(e) => setTemplateId(e.currentTarget.value)}
+                className={`${inputClass} mt-1`}
+                data-testid="rule-template"
+              >
+                {templateOptions.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-xs text-slate-400">在哪台机器上做</span>
+            <select value={node} onChange={(e) => setNode(e.currentTarget.value)} className={`${inputClass} mt-1`}>
+              <option value="local">本机</option>
+              {machines.data?.filter((m) => !m.local).map((m) => (
+                <option key={m.id} value={m.id} disabled={!m.online}>
+                  {m.name}{m.online ? "" : "（离线）"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="text-xs text-slate-400">仓库在机器上的位置（留空沿用这个仓库上次的）</span>
+            <input value={workdir} onChange={(e) => setWorkdir(e.currentTarget.value)} spellCheck={false} placeholder="可选" className={`${inputClass} mt-1 font-mono`} data-testid="rule-workdir" />
+          </label>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-xs text-slate-400">模型（留空用 Agent 默认）</span>
+            <input value={model} onChange={(e) => setModel(e.currentTarget.value)} placeholder="可选" className={`${inputClass} mt-1`} />
+          </label>
+          {kind === "issue-label" && templateId === "issue-fix" && (
+            <label className="mt-5 flex items-center gap-2 text-xs text-slate-300">
+              <input type="checkbox" checked={autoPr} onChange={(e) => setAutoPr(e.currentTarget.checked)} data-testid="rule-autopr" />
+              修完直接提交开 PR（验收就是在决策中心看 PR、合并）
+            </label>
+          )}
+        </div>
+        <div>
+          <span className="text-xs text-slate-400">每一步用哪个 Agent</span>
+          <div className="mt-1.5 grid grid-cols-2 gap-2">
+            {template?.steps.map((s) => (
+              <label key={s.name} className="flex items-center gap-2 text-xs">
+                <span className="w-28 shrink-0 truncate text-slate-300">{s.name}</span>
+                {s.kind === "gate" ? (
+                  <span className="text-slate-500">人工操作</span>
+                ) : (
+                  <select
+                    value={adapters[s.name] ?? s.adapter ?? ""}
+                    onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
+                    className={inputClass}
+                  >
+                    {CHAT_ADAPTERS.map((a) => (
+                      <option key={a} value={a}>{a}</option>
+                    ))}
+                  </select>
+                )}
+              </label>
+            ))}
+          </div>
+        </div>
+        {error && <p className="text-xs text-rose-400" data-testid="rule-error">{error}</p>}
+      </div>
+    </Modal>
+  );
+}
+
+function RuleCard({ rule }: { rule: AutomationRule }) {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    try {
+      await fn();
+      qc.invalidateQueries({ queryKey: ["rules"] });
+    } catch (e) {
+      window.alert(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const kind = RULE_KIND[rule.kind] ?? { label: rule.kind, desc: "" };
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-testid="rule">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-medium text-white">
+            {rule.name}
+            <span className="ml-2 text-xs font-normal text-slate-500">{rule.repo}</span>
+          </h3>
+          <p className="mt-1 text-xs text-slate-400">
+            {kind.label}
+            {rule.label && `「${rule.label}」`} → {RULE_TEMPLATE[rule.template] ?? rule.template}
+            {` · 近 24 小时 ${rule.runsToday} 次`}
+          </p>
+          {rule.adapters.length > 0 && (
+            <p className="mt-1 text-xs text-slate-500">Agents：{rule.adapters.filter(Boolean).join(" / ") || "模板默认"}</p>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Badge tone={rule.enabled ? "emerald" : "slate"}>{rule.enabled ? "生效中" : "已停用"}</Badge>
+          <Button className="!px-2 !py-1 text-xs" disabled={busy} onClick={() => run(() => automationRuleSetEnabled(rule.id, !rule.enabled))}>
+            {rule.enabled ? "停用" : "启用"}
+          </Button>
+          <Button variant="danger" className="!px-2 !py-1 text-xs" disabled={busy} onClick={() => run(() => automationRuleDelete(rule.id))}>
+            删除
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemplate[]; initial?: string; onClose: () => void }) {
   const qc = useQueryClient();
   const creatable = templates.filter((t) => !t.live);
@@ -362,7 +614,10 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
 
 export default function Workflows() {
   const [dialog, setDialog] = useState<string | null>(null);
+  const [ruleDialog, setRuleDialog] = useState(false);
+  const qc = useQueryClient();
   const templates = useQuery({ queryKey: ["wfTemplates"], queryFn: workflowTemplates });
+  const rules = useQuery({ queryKey: ["rules"], queryFn: automationRules, refetchInterval: 15000 });
   const workflows = useQuery({
     queryKey: ["workflows"],
     queryFn: workflowList,
@@ -432,6 +687,40 @@ export default function Workflows() {
           ))}
         </div>
       )}
+
+      {/* 自动化规则 */}
+      <div className="mb-3 mt-10 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-medium text-slate-300">自动化规则</h2>
+          <p className="mt-0.5 text-xs text-slate-500">盯 GitHub：Issue 打标签自动开工，新 PR 自动交叉审查、结论贴回。一条规则一天最多触发十次</p>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            onClick={async () => {
+              const n = await automationScan();
+              qc.invalidateQueries({ queryKey: ["workflows"] });
+              window.alert(n > 0 ? `这次触发了 ${n} 条` : "检查完了，这次没有新的");
+            }}
+          >
+            立即检查
+          </Button>
+          <Button variant="primary" onClick={() => setRuleDialog(true)}>
+            ＋ 建规则
+          </Button>
+        </div>
+      </div>
+      {rules.data != null &&
+        (rules.data.length === 0 ? (
+          <Empty title="还没有自动化规则" desc="建一条：给仓库的 Issue 打上指定标签就自动跑修 Issue 流水线；来了新 PR 自动交叉审查并把结论贴回 PR。" />
+        ) : (
+          <div className="space-y-2">
+            {rules.data.map((r) => (
+              <RuleCard key={r.id} rule={r} />
+            ))}
+          </div>
+        ))}
+
+      {ruleDialog && templates.data && <RuleDialog templates={templates.data} onClose={() => setRuleDialog(false)} />}
 
       {dialog && templates.data && (
         <CreateDialog

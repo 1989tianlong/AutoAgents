@@ -46,6 +46,9 @@ const MOCK = () => {
     /** 工作流编排 */
     workflows: [],
     wfTemplates: [],
+    /** 自动化规则 */
+    rules: [],
+    ruleRuns: [],
   };
   let nextTask = 4;
   let nextSessionId = 60;
@@ -688,6 +691,130 @@ const MOCK = () => {
       wfEvent(wf, "workflow.started", "info", "重跑失败步骤");
       wfTick(id);
       return wf;
+    },
+    // ---------- 自动化规则 ----------
+    automation_rules: () =>
+      state.rules.map((r) => ({
+        ...r,
+        runsToday: state.ruleRuns.filter((x) => x.ruleId === r.id).length,
+      })),
+    automation_runs: () => state.ruleRuns,
+    automation_rule_create: (args) => {
+      const name = (args.name ?? "").trim();
+      const repo = (args.repo ?? "").trim();
+      if (!name) throw new Error("给规则起个名字");
+      if (!/^[^/]+\/[^/]+$/.test(repo)) throw new Error("仓库要写成 owner/repo");
+      let template = "pr-review";
+      if (args.kind === "issue-label") {
+        if (!args.label?.trim()) throw new Error("填上要盯的标签（Issue 打上它就自动开工）");
+        template = args.template ?? "issue-fix";
+      } else if (args.kind !== "new-pr") {
+        throw new Error("规则类型只有 issue-label（Issue 打标签）和 new-pr（新 PR）");
+      }
+      const rule = {
+        id: state.rules.length + 1, name, kind: args.kind, repo, label: args.label?.trim() ?? "",
+        template, adapters: args.adapters ?? [], model: args.model ?? null,
+        autoPr: !!args.autoPr, comment: true,
+        nodeId: args.nodeId ?? "local", workdir: args.workdir ?? "", enabled: true, runsToday: 0,
+      };
+      state.rules.unshift(rule);
+      return rule;
+    },
+    automation_rule_set_enabled: ({ id, enabled }) => {
+      const rule = state.rules.find((r) => r.id === id);
+      if (!rule) throw new Error(`没有这条规则：${id}`);
+      rule.enabled = enabled;
+      return rule;
+    },
+    automation_rule_delete: ({ id }) => {
+      const before = state.rules.length;
+      state.rules = state.rules.filter((r) => r.id !== id);
+      if (state.rules.length === before) throw new Error(`没有这条规则：${id}`);
+    },
+    // 扫一遍：每条生效的规则触发一次（mock 里假装正好有一条新的带标签 Issue / 新 PR）；
+    // 同一个键不重复触发；PR 审查跑完了就把结论「贴回」
+    automation_scan: () => {
+      let triggered = 0;
+      for (const rule of state.rules.filter((r) => r.enabled)) {
+        const key = rule.kind === "issue-label" ? "issue:9" : "pr:12";
+        if (state.ruleRuns.some((x) => x.ruleId === rule.id && x.key === key)) continue;
+        const args =
+          rule.kind === "issue-label"
+            ? { template: rule.template, repo: rule.repo, issueNumber: 9, issueTitle: "首页加载太慢", instructions: null }
+            : { template: "pr-review", repo: rule.repo, prNumber: 12, instructions: null };
+        const wf = handlers.workflow_create({
+          ...args, nodeId: rule.nodeId, workdir: rule.workdir || "/Users/tester/code/demo",
+          model: rule.model, autoPr: rule.autoPr, adapters: rule.adapters,
+        });
+        handlers.workflow_start({ id: wf.id });
+        state.ruleRuns.unshift({
+          id: state.ruleRuns.length + 1, ruleId: rule.id, ruleName: rule.name,
+          key, workflowId: wf.id, posted: false, createdAt: now,
+        });
+        state.events.unshift({
+          id: state.events.length + 1, ts: now, kind: "automation.triggered", level: "info",
+          source: rule.name,
+          message: `规则触发：${key} → 工作流 #${wf.id}`,
+          link: `#/workflows?w=${wf.id}`,
+        });
+        triggered += 1;
+      }
+      // 新 PR 规则的审查流水线跑完的：结论贴回 PR 评论
+      for (const run of state.ruleRuns.filter((x) => !x.posted && x.workflowId != null)) {
+        const rule = state.rules.find((r) => r.id === run.ruleId);
+        const wf = state.workflows.find((w) => w.id === run.workflowId);
+        if (!rule || rule.kind !== "new-pr" || !wf || wf.status !== "done") continue;
+        run.posted = true;
+        state.events.unshift({
+          id: state.events.length + 1, ts: now, kind: "automation.commented", level: "info",
+          source: wf.repo, message: `PR #${wf.prNumber} 的自动审查结论已贴成评论`,
+          link: `#/workflows?w=${wf.id}`,
+        });
+        triggered += 1;
+      }
+      return triggered;
+    },
+    // ---------- 决策中心 ----------
+    inbox_list: () => {
+      const gates = [];
+      for (const wf of state.workflows) {
+        for (const s of wf.steps.filter((x) => x.kind === "gate" && x.status === "waiting")) {
+          gates.push({ workflowId: wf.id, workflowName: wf.name, stepId: s.id, stepName: s.name, repo: wf.repo });
+        }
+      }
+      const pick = (t) => ({
+        id: t.id, title: t.title, repo: t.repo, branch: t.branch, detail: t.detail, updatedAt: t.updatedAt,
+      });
+      const reviews = state.tasks
+        .filter((t) => t.status === "reviewing" && t.prNumber != null)
+        .map((t) => {
+          const states = (t.checks ?? []).map((c) => c.state);
+          const checks = states.length === 0 ? null
+            : states.includes("failure") ? "failure"
+            : states.includes("pending") ? "pending" : "success";
+          return {
+            id: t.id, title: t.title, repo: t.repo, prNumber: t.prNumber, prUrl: t.prUrl,
+            checks, detail: t.detail, updatedAt: t.updatedAt,
+          };
+        });
+      return {
+        gates,
+        changes: state.tasks.filter((t) => t.status === "changes").map(pick),
+        starts: state.tasks.filter((t) => t.status === "pending").map(pick),
+        reviews,
+      };
+    },
+    inbox_merge_pr: ({ taskId }) => {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (!task) throw new Error(`任务不存在：#${taskId}`);
+      if (task.prNumber == null) throw new Error("这个任务还没有开 PR");
+      task.status = "done";
+      task.detail = "PR 已合并，任务完成";
+      state.events.unshift({
+        id: state.events.length + 1, ts: now, kind: "task.merged", level: "info",
+        source: task.title, message: `PR #${task.prNumber} 已合并`, link: `#/tasks?t=${task.id}`,
+      });
+      return task;
     },
     chat_sessions: () => state.sessions,
     chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],

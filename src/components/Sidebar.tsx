@@ -1,7 +1,7 @@
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { SVGProps } from "react";
-import { getAppInfo } from "../lib/api";
+import { getAppInfo, inboxList } from "../lib/api";
 
 type IconProps = SVGProps<SVGSVGElement>;
 
@@ -42,6 +42,13 @@ const IcKanban = (p: IconProps) => (
   <svg {...base} {...p}>
     <rect x="3" y="3" width="18" height="18" rx="2" />
     <path d="M8 7v10M12 7v6M16 7v8" />
+  </svg>
+);
+
+const IcInbox = (p: IconProps) => (
+  <svg {...base} {...p}>
+    <path d="M22 12h-6l-2 3h-4l-2-3H2" />
+    <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
   </svg>
 );
 
@@ -90,6 +97,7 @@ const IcSliders = (p: IconProps) => (
 
 const NAV = [
   { to: "/", label: "仪表盘", Icon: IcGrid },
+  { to: "/inbox", label: "决策", Icon: IcInbox },
   { to: "/machines", label: "机器", Icon: IcMonitor },
   { to: "/agents", label: "Agents", Icon: IcBot },
   { to: "/tasks", label: "任务", Icon: IcKanban },
@@ -103,6 +111,13 @@ const NAV = [
 
 export default function Sidebar() {
   const { data: info } = useQuery({ queryKey: ["appInfo"], queryFn: getAppInfo, staleTime: Infinity });
+  // 待决策的事有多少：决策中心有数就亮个角标，不用一页页翻
+  const inbox = useQuery({ queryKey: ["inbox"], queryFn: inboxList, refetchInterval: 10000 });
+  const pending =
+    (inbox.data?.gates.length ?? 0) +
+    (inbox.data?.changes.length ?? 0) +
+    (inbox.data?.starts.length ?? 0) +
+    (inbox.data?.reviews.length ?? 0);
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-800/80 bg-slate-900/40">
       <div className="flex items-center gap-3 px-5 py-5">
@@ -131,6 +146,11 @@ export default function Sidebar() {
           >
             <Icon className="h-4.5 w-4.5" />
             {label}
+            {to === "/inbox" && pending > 0 && (
+              <span className="ml-auto rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[11px] font-semibold text-amber-300" data-testid="inbox-badge">
+                {pending}
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>

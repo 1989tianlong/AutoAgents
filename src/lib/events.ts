@@ -12,6 +12,7 @@ export const KIND_GROUPS: KindGroup[] = [
   { key: "node", label: "机器" },
   { key: "task", label: "任务" },
   { key: "workflow", label: "工作流" },
+  { key: "automation", label: "自动化" },
   { key: "deploy", label: "部署" },
   { key: "github", label: "GitHub" },
   { key: "relay", label: "中继" },
@@ -49,6 +50,9 @@ const KIND_LABEL: Record<string, string> = {
   "workflow.done": "工作流完成",
   "workflow.failed": "工作流失败",
   "workflow.cancelled": "工作流取消",
+  "automation.triggered": "规则触发",
+  "automation.commented": "结论贴回 PR",
+  "automation.error": "自动化提醒",
   "deploy.connected": "连接平台",
   "deploy.disconnected": "断开平台",
   "deploy.discover": "取项目清单",
@@ -74,6 +78,7 @@ export function kindLabel(kind: string): string {
 export function kindTone(kind: string, level: string): "emerald" | "amber" | "rose" | "slate" {
   if (level === "error") return "rose";
   if (level === "warning") return "amber";
-  if (kind === "node.online" || kind.endsWith(".connected") || kind === "workflow.done") return "emerald";
+  if (kind === "node.online" || kind.endsWith(".connected") || kind === "workflow.done" || kind === "automation.triggered")
+    return "emerald";
   return "slate";
 }

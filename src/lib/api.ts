@@ -30,6 +30,9 @@ import type {
   UsageSummary,
   Workflow,
   WorkflowTemplate,
+  AutomationRule,
+  AutomationRun,
+  Inbox,
 } from "./types";
 
 export const getAppInfo = () => invoke<AppInfo>("app_info");
@@ -319,3 +322,41 @@ export const workflowGate = (workflowId: number, stepId: number, chosenTaskId: n
 
 /** 重跑失败的工作流：失败的与被跳过的步骤重新排队 */
 export const workflowRetry = (id: number) => invoke<Workflow>("workflow_retry", { id });
+
+// ---------- 自动化规则 ----------
+
+/** 已建的自动化规则（含近 24 小时触发次数） */
+export const automationRules = () => invoke<AutomationRule[]>("automation_rules");
+
+/** 规则的触发记录 */
+export const automationRuns = (limit?: number) => invoke<AutomationRun[]>("automation_runs", { limit });
+
+export const automationRuleCreate = (p: {
+  name: string;
+  kind: string;
+  repo: string;
+  label?: string | null;
+  template?: string | null;
+  adapters?: string[];
+  model?: string | null;
+  autoPr?: boolean;
+  comment?: boolean;
+  nodeId?: string | null;
+  workdir?: string | null;
+}) => invoke<AutomationRule>("automation_rule_create", p);
+
+export const automationRuleSetEnabled = (id: number, enabled: boolean) =>
+  invoke<AutomationRule>("automation_rule_set_enabled", { id, enabled });
+
+export const automationRuleDelete = (id: number) => invoke<void>("automation_rule_delete", { id });
+
+/** 立刻检查一遍规则（平时每两分钟一次） */
+export const automationScan = () => invoke<number>("automation_scan");
+
+// ---------- 决策中心 ----------
+
+/** 等人决策的事：评审门、改动待确认、待启动、PR 等验收 */
+export const inboxList = () => invoke<Inbox>("inbox_list");
+
+/** 合并任务的 PR：验收的最后一步，合并后任务自动标完成 */
+export const inboxMergePr = (taskId: number) => invoke<unknown>("inbox_merge_pr", { taskId });

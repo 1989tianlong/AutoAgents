@@ -179,7 +179,33 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             started_at  TEXT,
             finished_at TEXT
         );
-        CREATE INDEX IF NOT EXISTS workflow_steps_wf ON workflow_steps(workflow_id, seq);",
+        CREATE INDEX IF NOT EXISTS workflow_steps_wf ON workflow_steps(workflow_id, seq);
+        -- 自动化规则：盯着 GitHub，满足条件就自动建工作流（Issue 打标签、新 PR）。
+        -- 机器 / Agent / 仓库位置在规则里配一份，之后不再要人介入
+        CREATE TABLE IF NOT EXISTS rules (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL,
+            -- issue-label（Issue 打上某个标签） / new-pr（仓库来了新 PR）
+            kind       TEXT NOT NULL,
+            repo       TEXT NOT NULL,
+            -- JSON：label、template、adapters、model、auto_pr、node_id、workdir、comment
+            config     TEXT NOT NULL DEFAULT '{}',
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        -- 规则跑过的记录：一条 Issue / 一个 PR 只自动处理一次
+        CREATE TABLE IF NOT EXISTS rule_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id     INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
+            -- 去重键：issue:7 / pr:5
+            key         TEXT NOT NULL,
+            workflow_id INTEGER,
+            -- 审查结论已经贴回 PR 评论
+            posted      INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT DEFAULT (datetime('now')),
+            UNIQUE(rule_id, key)
+        );",
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
     // 轻量迁移：给旧库补列（列已存在时 ALTER 会报错，直接忽略）
