@@ -1247,7 +1247,7 @@ mod tests {
     use super::*;
     use crate::secrets::SecretStore;
     use crate::testutil::{
-        fake_script, read_request, respond, setup_repo, test_state, Req, TestState,
+        fake_script, read_request, respond, setup_repo, test_state, Collect, Req, TestState,
     };
     use autoagents_core::runner::BinaryResolver;
     use autoagents_core::service::{Service, ServiceOptions};
@@ -1667,6 +1667,180 @@ exit 7"#;
             assert!(std::time::Instant::now() < deadline, "取消之后任务还停在 running");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "手动演示（真实 CLI + 真实模型）：cargo test -p autoagents --lib race_demo -- --ignored --nocapture。\
+               第二阶段评审：AUTOAGENTS_RACE_DEMO=choose AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号> 重跑同一条命令"]
+    async fn race_demo() {
+        let phase = std::env::var("AUTOAGENTS_RACE_DEMO").unwrap_or_else(|_| "run".into());
+        let root = std::path::PathBuf::from("/tmp/aa-race-demo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 假的 GitHub API：流水线只需要「默认分支是 main」这一条，一切都不出网
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gh = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let Req { method, path, .. } = read_request(&mut stream).await;
+                    let route = path.split('?').next().unwrap_or("").to_string();
+                    match (method.as_str(), route.as_str()) {
+                        ("GET", "/repos/me/greet") => {
+                            respond(&mut stream, "200 OK", "application/json", r#"{"default_branch": "main"}"#).await
+                        }
+                        _ => respond(&mut stream, "200 OK", "application/json", r#"{"login": "demo", "id": 1}"#).await,
+                    }
+                });
+            }
+        });
+
+        // 假远端 + 一份克隆（只建一次，重跑沿用）
+        let remote = root.join("github.com/me/greet.git");
+        let workdir = root.join("machine/greet");
+        if !remote.exists() {
+            std::fs::create_dir_all(&remote).unwrap();
+            let git = |dir: &std::path::Path, args: &[&str]| {
+                std::process::Command::new("git")
+                    .arg("-C").arg(dir).args(["-c", "user.name=demo", "-c", "user.email=demo@demo"])
+                    .args(args).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap()
+            };
+            assert!(git(&remote, &["init", "--bare", "-b", "main"]).status.success());
+            let seed = root.join("seed");
+            std::fs::create_dir_all(&seed).unwrap();
+            assert!(git(&seed, &["init", "-b", "main"]).status.success());
+            std::fs::write(seed.join("README.md"), "# greet\n\n竞争模式的演示仓库。\n").unwrap();
+            assert!(git(&seed, &["add", "-A"]).status.success());
+            assert!(git(&seed, &["commit", "-m", "init"]).status.success());
+            assert!(git(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
+            assert!(git(&seed, &["push", "-q", "origin", "main"]).status.success());
+            std::fs::create_dir_all(workdir.parent().unwrap()).unwrap();
+            assert!(git(&workdir.parent().unwrap(), &["clone", "-q", remote.to_str().unwrap(), "greet"]).status.success());
+        }
+
+        // 包装脚本：给无头模式注入「允许写文件」的开关（只作用于这个演示，不改全局配置）
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude_bin = which("claude");
+        let codex_bin = which("codex");
+        std::fs::write(bin.join("claude"), format!(
+            "#!/bin/sh\nexec {} --permission-mode acceptEdits \"$@\"\n", claude_bin)).unwrap();
+        std::fs::write(bin.join("codex"), format!(
+            "#!/bin/sh\nexec {} -c sandbox_mode='workspace-write' \"$@\"\n", codex_bin)).unwrap();
+        for f in [bin.join("claude"), bin.join("codex")] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 真实引擎 + 只认这两个包装脚本的 Service；用文件数据库，评审在另一次运行里做
+        let map: HashMap<String, PathBuf> = HashMap::from([
+            ("claude-cli".into(), bin.join("claude")),
+            ("codex-cli".into(), bin.join("codex")),
+        ]);
+        let resolve: BinaryResolver = Arc::new(move |name: &str| map.get(name).cloned());
+        let service = Service::new(ServiceOptions { name: Some("race-demo".into()), resolve: Some(resolve), ..Default::default() });
+        let state = crate::AppState::new(
+            crate::db::init(&root.join("state.db")).unwrap(),
+            service,
+            Arc::new(Collect::<crate::chat::ChatEvent>::default()),
+            Arc::new(Collect::<crate::remote::NodeStatusEvent>::default()),
+            Arc::new(crate::secrets::MemoryStore::default()),
+        );
+        *state.gh_api.lock().unwrap() = gh.clone();
+        state.secrets.set("github_pat", "demo").unwrap();
+
+        if phase == "choose" {
+            let chosen: i64 = std::env::var("AUTOAGENTS_RACE_DEMO_CHOSEN")
+                .expect("评审阶段要给 AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号>").parse().expect("任务号要是数字");
+            let db = state.db.lock().unwrap();
+            let gate_row: Option<(i64, i64)> = db.query_row(
+                "SELECT w.id, s.id FROM workflows w JOIN workflow_steps s ON s.workflow_id = w.id AND s.kind = 'gate'
+                 WHERE w.status IN ('running', 'waiting') ORDER BY w.id DESC LIMIT 1",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().unwrap();
+            let (wf_id, gate_id) = match gate_row {
+                Some(pair) => pair,
+                None => {
+                    let wf_id: i64 = db.query_row("SELECT id FROM workflows ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+                        .optional().unwrap().expect("没有工作流可评审");
+                    let wf = load_view(&db, wf_id).unwrap();
+                    println!("工作流 #{} 已经是 {}，不用再评审", wf.id, wf.status);
+                    return;
+                }
+            };
+            drop(db);
+            let wf = gate(&state, wf_id, gate_id, chosen).await.unwrap();
+            println!("=== 评审完成 ===");
+            println!("工作流 #{} 状态：{}", wf.id, wf.status);
+            for s in &wf.steps {
+                println!("  [{}] {} —— {}{}", s.seq, s.name, s.status,
+                    s.detail.as_deref().map(|d| format!("（{d}）")).unwrap_or_default());
+            }
+            return;
+        }
+
+        // 第一阶段：建流（只建一次）、启动、推进到评审门
+        let existing: Option<i64> = {
+            let db = state.db.lock().unwrap();
+            db.query_row("SELECT id FROM workflows ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).optional().unwrap()
+        };
+        let wf = match existing {
+            Some(id) => { let db = state.db.lock().unwrap(); load_view(&db, id).unwrap() }
+            None => create(
+                &state, "race", "me/greet", None, None, None, None,
+                Some("给这个仓库写一个 greet.sh：打印一句问候语（文案和实现自选），加上可执行权限；再写一个 GREET-README.md 说明怎么用。不要提交。".into()),
+                "", workdir.to_str().unwrap(), Some("glm-5.3-flash".into()), false, vec![],
+            ).await.unwrap(),
+        };
+        if wf.status == "pending" {
+            start(&state, wf.id).await.unwrap();
+        }
+        println!("=== 竞争模式开始 ===");
+        println!("仓库：{}（假远端 {}，不出网）", workdir.display(), remote.display());
+        println!("两个 Agent 并行开工（glm-5.3-flash），每 500ms 推一次引擎……");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            tick(&state).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let db = state.db.lock().unwrap();
+            let wf = load_view(&db, wf.id).unwrap();
+            if wf.status == "waiting" {
+                println!("\n=== 评审门打开了 ===");
+                for s in wf.steps.iter().filter(|s| s.kind == "task") {
+                    let task = tasks::load(&db, s.task_id.unwrap()).unwrap();
+                    let reply: Option<String> = task.session_id.and_then(|sid| {
+                        db.query_row(
+                            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'assistant' ORDER BY id DESC LIMIT 1",
+                            params![sid], |r| r.get::<_, String>(0),
+                        ).optional().unwrap()
+                    });
+                    println!("\n[方案 {}] {} · 任务 #{} · 分支 {}", s.name, s.adapter.as_deref().unwrap_or("?"), task.id, task.branch.as_deref().unwrap_or("?"));
+                    println!("  工作树：{}", task.worktree.as_deref().unwrap_or("?"));
+                    println!("  Agent 回复：{}", reply.as_deref().map(|t| clip(t, 300)).unwrap_or_else(|| "（无）".into()));
+                    let wt = task.worktree.clone().unwrap_or_default();
+                    let out = std::process::Command::new("git").arg("-C").arg(&wt)
+                        .args(["status", "--short"]).output().unwrap();
+                    println!("  改动：{}", String::from_utf8_lossy(&out.stdout).trim());
+                }
+                println!("\n→ 你来当裁判：AUTOAGENTS_RACE_DEMO=choose AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号> \\");
+                println!("  cargo test -p autoagents --lib race_demo -- --ignored --nocapture");
+                return;
+            }
+            if wf.status == "failed" {
+                println!("工作流失败了：{:?}", wf.steps.iter().map(|s| (s.name.as_str(), s.status.as_str(), s.failure.as_deref())).collect::<Vec<_>>());
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "10 分钟还没跑到评审门");
+        }
+    }
+
+    /// PATH 上的真实可执行文件
+    fn which(name: &str) -> String {
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("command -v {name}"))
+            .output().expect("找可执行文件");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
