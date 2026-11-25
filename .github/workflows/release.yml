@@ -143,6 +143,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          # 这个任务没有检出仓库，gh 自己认不出该发到哪儿，得直接告诉它
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # 一行一行拼：直接写成多行字符串的话，后面几行会带着 YAML 的缩进，表格就被当成代码块了

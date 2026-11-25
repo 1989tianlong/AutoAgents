@@ -58,3 +58,5 @@ jobs:
         run: until curl -sf -o /dev/null http://localhost:1430/; do sleep 1; done
       - name: 界面测试（Tauri 接口由 tests/ui/mock.mjs 模拟）
         run: npm run test:ui
+      - name: 发布流程里的脚本空跑一遍（替身的 gh，不发布）
+        run: npm run test:release

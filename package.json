@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "test:ui": "node tests/ui/sessions.e2e.mjs && node tests/ui/machines.e2e.mjs && node tests/ui/tasks.e2e.mjs && node tests/ui/deploy.e2e.mjs",
     "test:rust": "cargo test --workspace",
-    "test:scripts": "sh tests/scripts/install-scripts.sh"
+    "test:scripts": "sh tests/scripts/install-scripts.sh",
+    "test:release": "python3 tests/scripts/release-workflow.py"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.5",

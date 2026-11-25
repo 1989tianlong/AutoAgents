@@ -105,6 +105,7 @@ npm run tauri build   # 打包安装包
 ```bash
 npm run test:rust     # Rust：Agent 输出协议、任务流水线、部署与守护、多机联调
 npm run test:scripts  # 两个安装脚本（替身的 curl 假装 GitHub Releases，不联网）
+npm run test:release  # 发布流程里的脚本空跑一遍（替身的 gh，不发布；需要 PyYAML）
 npm run dev           # 另开一个终端：界面测试需要前端开发服务器
 npm run test:ui       # 会话、机器、任务、部署四套界面测试（无头 WebKit，模拟 Tauri 接口）
 ```

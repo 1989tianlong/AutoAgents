@@ -327,8 +327,8 @@ deployments(id, target_id, provider, project, env, state, raw_state, url, inspec
 | 节点程序 `crates/node` | `agentd`（tokio + tokio-rustls）与 `autoagents-relay`，同一个 crate 的两个可执行文件 |
 | 前端 | **React 19 + TypeScript + Vite**、**Tailwind CSS v4**、TanStack Query、React Router、Zustand |
 | IPC | Tauri `invoke` + `event`（进度流推送） |
-| 测试 | Rust 单元与集成测试（`cargo test --workspace`）；界面测试（无头 WebKit + 模拟的 Tauri 接口，四套共 235 项）；CI 在 Linux 与 macOS 上跑 |
-| 发布 | 打 `v*` 标签 → GitHub Actions 构建 `agentd` / `autoagents-relay`（Linux x86_64 / arm64 静态链接，macOS Intel / Apple Silicon）→ GitHub Releases，附 SHA256SUMS |
+| 测试 | Rust 单元与集成测试（`cargo test --workspace`）；界面测试（无头 WebKit + 模拟的 Tauri 接口，四套共 235 项）；两个安装脚本的回归测试（替身的 curl 假装 GitHub Releases，不联网）。CI 在 Linux 与 macOS 上跑 Rust 和脚本测试，界面测试跑 Linux |
+| 发布 | 打 `v*` 标签 → GitHub Actions 构建 `agentd` / `autoagents-relay`（Linux x86_64 / arm64 静态链接，macOS Intel / Apple Silicon）→ 用构建出来的程序把多机联调走一遍，不过就不发 → GitHub Releases，附 SHA256SUMS → 发布之后再按安装命令在 Linux 和 macOS 上各装一遍 |
 | 许可证 | **GPL-3.0**：应用全部源码（Rust 核心、agentd、中继、前端）以 GPL-3.0 发布 |
 
 约定：
