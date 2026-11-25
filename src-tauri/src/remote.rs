@@ -1762,6 +1762,8 @@ mod tests {
         assert!(state.remote.link("node-1").is_none(), "旧连接先让位");
         wait_until("重连后对话以失败收尾", || !state.live.lock().unwrap().contains_key(&id)).await;
         wait_until("旧连接上的对话被停掉", || service.running_turns() == 0).await;
+        // 主动重连时「在线」这个标记并不会先清掉，光看它说明不了新连接已经建好：等新连接到手
+        wait_until("新连接建立起来", || state.remote.link("node-1").is_some()).await;
         let again = wait_online(&state, "node-1").await;
         assert!(again.status.error.is_none(), "{again:?}");
 
