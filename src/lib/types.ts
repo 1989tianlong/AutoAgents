@@ -377,3 +377,118 @@ export interface UsageSummary {
   byMachine: UsageBucket[];
   topSessions: UsageBucket[];
 }
+
+// ---------- 部署 ----------
+
+/** 部署目标属于哪个平台 */
+export type DeployProvider = "vercel" | "cloudflare-pages" | "cloudflare-workers";
+
+/** 登记了的部署目标：Vercel 项目、Cloudflare Pages 项目或 Worker */
+export interface DeployTarget {
+  id: number;
+  provider: DeployProvider;
+  name: string;
+  /** 平台上的标识：Vercel 的项目 id、Worker 的标签；Pages 项目就是名字 */
+  platformId: string;
+  /** 属于哪个团队 / 账户；空表示 Vercel 个人账户 */
+  scope: string;
+  /** 生产地址 */
+  url: string | null;
+  /** 关联的 GitHub 仓库 */
+  repo: string | null;
+  repoId: string | null;
+  /** 平台那边连的 Git 服务（github …）；空表示没连 */
+  gitType: string | null;
+  /** 生产分支 */
+  branch: string | null;
+  framework: string | null;
+  /** 应用里发起生产部署要先确认 */
+  prodRequiresApproval: boolean;
+  /** 生产部署出问题时自动建修复任务 */
+  autoFix: boolean;
+  healthPath: string;
+  healthContains: string | null;
+  /** Workers：存了 Deploy Hook 的地址 */
+  hasHook: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type DeployState = "queued" | "building" | "ready" | "error" | "canceled" | "other";
+
+/** 一次部署：三个平台拉回来后归成同一种样子 */
+export interface Deployment {
+  id: string;
+  targetId: number;
+  provider: DeployProvider;
+  project: string;
+  env: "production" | "preview";
+  state: DeployState;
+  rawState: string | null;
+  url: string | null;
+  /** 平台控制台里这一次部署的页面 */
+  inspectorUrl: string | null;
+  branch: string | null;
+  commitSha: string | null;
+  commitMessage: string | null;
+  author: string | null;
+  createdMs: number | null;
+  buildingMs: number | null;
+  readyMs: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  /** 能回滚到这一次 */
+  rollbackOk: boolean;
+  /** 现在线上跑的就是这一次 */
+  current: boolean;
+  guarded: boolean;
+  /** 健康检查结果：ok，或没通过 / 没法检查的原因 */
+  health: string | null;
+  /** 守护为这次失败建的修复任务 */
+  taskId: number | null;
+}
+
+/** 平台上还没登记的项目 */
+export interface DeployCandidate {
+  provider: DeployProvider;
+  name: string;
+  platformId: string;
+  url: string | null;
+  repo: string | null;
+  repoId: string | null;
+  branch: string | null;
+  framework: string | null;
+  registered: number | null;
+}
+
+export interface DeployScope {
+  id: string;
+  name: string;
+}
+
+export interface DeployProviderStatus {
+  configured: boolean;
+  /** 令牌验证没通过的原因；通过时为空 */
+  error: string | null;
+  who: string | null;
+  /** Vercel 的团队 / Cloudflare 的账户 */
+  scopes: DeployScope[];
+  /** 选中的那一个 */
+  scope: string | null;
+}
+
+export interface DeployStatus {
+  vercel: DeployProviderStatus;
+  cloudflare: DeployProviderStatus;
+}
+
+/** 可以回滚到的一次部署 */
+export interface DeployHistoryItem {
+  id: string;
+  createdMs: number | null;
+  branch: string | null;
+  commitMessage: string | null;
+  current: boolean;
+  /** Workers：这一次部署用的版本 */
+  versionId: string | null;
+}

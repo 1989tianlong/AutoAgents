@@ -5,6 +5,12 @@ import type {
   AppInfo,
   ChatMessage,
   ChatSession,
+  DeployCandidate,
+  DeployHistoryItem,
+  DeployProviderStatus,
+  DeployStatus,
+  DeployTarget,
+  Deployment,
   DiffView,
   DiscoveredAgent,
   EventCounts,
@@ -194,3 +200,85 @@ export const eventsClear = (keep = 0) => invoke<number>("events_clear", { keep }
 
 /** 用量汇总：总计、最近几天、按 Agent / 机器 / 会话（不同 Agent 口径不同，费用与 token 分开看） */
 export const usageSummary = (days = 14) => invoke<UsageSummary>("usage_summary", { days });
+
+// ---------- 部署 ----------
+
+/** 两家平台的连接状态（会拿保存的令牌各验证一次） */
+export const deployStatus = () => invoke<DeployStatus>("deploy_status");
+
+/** 填入 API 令牌：验证通过才存进系统钥匙串 */
+export const deployConnect = (platform: string, token: string) =>
+  invoke<DeployProviderStatus>("deploy_connect", { platform, token });
+
+export const deployDisconnect = (platform: string) => invoke<void>("deploy_disconnect", { platform });
+
+/** 选定在哪个团队 / 账户下工作 */
+export const deploySetScope = (platform: string, scope: string | null) =>
+  invoke<void>("deploy_set_scope", { platform, scope });
+
+/** 平台上还没登记的项目 */
+export const deployDiscover = (platform: string) => invoke<DeployCandidate[]>("deploy_discover", { platform });
+
+export const deployTargets = () => invoke<DeployTarget[]>("deploy_targets");
+
+/** 登记一个部署目标。`url` 给了就当生产地址；Workers 要主动触发构建还得给 Deploy Hook 的地址 */
+export const deployTargetAdd = (
+  provider: string,
+  name: string,
+  platformId: string,
+  url: string | null,
+  hookUrl: string | null,
+) => invoke<DeployTarget>("deploy_target_add", { provider, name, platformId, url, hookUrl });
+
+/** 改目标设置：传了哪项改哪项 */
+export const deployTargetUpdate = (
+  id: number,
+  patch: {
+    url?: string | null;
+    prodRequiresApproval?: boolean;
+    autoFix?: boolean;
+    healthPath?: string | null;
+    healthContains?: string | null;
+    hookUrl?: string | null;
+  },
+) => invoke<DeployTarget>("deploy_target_update", { id, ...patch });
+
+/** 取消登记（平台上的项目不动） */
+export const deployTargetRemove = (id: number) => invoke<void>("deploy_target_remove", { id });
+
+/** 本地记着的部署，新的在前 */
+export const deployList = (targetId: number | null, limit?: number) =>
+  invoke<Deployment[]>("deploy_list", { targetId, limit: limit ?? null });
+
+/** 现在就向平台拉一次部署状态 */
+export const deployRefresh = (targetId: number | null) =>
+  invoke<number>("deploy_refresh", { targetId });
+
+/** 主动部署：Vercel 按分支（或提交）；Pages 把这条分支最近的一次重做；Workers 触发 Deploy Hook */
+export const deployTrigger = (targetId: number, branch: string | null, commit: string | null, confirmed: boolean) =>
+  invoke<Deployment>("deploy_trigger", { targetId, branch, commit, confirmed });
+
+/** 把某一次部署原样再来一遍 */
+export const deployRetry = (id: string, confirmed: boolean) =>
+  invoke<Deployment>("deploy_retry", { id, confirmed });
+
+export const deployCancel = (id: string) => invoke<void>("deploy_cancel", { id });
+
+/** Vercel：把一次预览部署直接提升为生产 */
+export const deployPromote = (id: string) => invoke<void>("deploy_promote", { id });
+
+/** 生产流量切回之前的某一次部署；Workers 回滚的单位是版本 */
+export const deployRollback = (targetId: number, toId: string, versionId: string | null) =>
+  invoke<void>("deploy_rollback", { targetId, toId, versionId });
+
+export const deployHistory = (targetId: number) =>
+  invoke<DeployHistoryItem[]>("deploy_history", { targetId });
+
+/** 构建日志 */
+export const deployLogs = (id: string) => invoke<string>("deploy_logs", { id });
+
+/** 现在就查一次健康，返回结果 */
+export const deployCheckHealth = (id: string) => invoke<string>("deploy_check_health", { id });
+
+/** 这个任务的分支（或它推上去的提交）对应的部署 */
+export const deployForTask = (taskId: number) => invoke<Deployment[]>("deploy_for_task", { taskId });

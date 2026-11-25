@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   agentModels,
   agentsAll,
+  deployForTask,
   githubRepos,
   machinesList,
   repoClone,
@@ -26,6 +27,7 @@ import { fmtAgo } from "../lib/format";
 import ModelPicker from "../components/ModelPicker";
 import DirPicker from "../components/DirPicker";
 import { Badge, Button, Card, Empty, Modal, StatusDot, inputClass } from "../components/ui";
+import { DEPLOY_STATE } from "./Deploy";
 
 type Tone = "slate" | "sky" | "amber" | "emerald" | "rose" | "violet";
 
@@ -187,6 +189,49 @@ function reachedStep(task: Task): number {
   }
 }
 
+/** 这个任务的分支（或它推上去的提交）对应的部署：预览地址、生产状态。没有登记部署目标时什么都不显示 */
+function TaskDeployments({ id, branch }: { id: number; branch: string | null }) {
+  const navigate = useNavigate();
+  const deps = useQuery({
+    queryKey: ["deployForTask", id],
+    queryFn: () => deployForTask(id),
+    refetchInterval: 15000,
+  });
+  if (!deps.data?.length) return null;
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-2 text-xs">
+      <span className="text-slate-500">部署</span>
+      {deps.data.slice(0, 4).map((d) => (
+        <span
+          key={d.id}
+          className="inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-slate-900/60 px-2 py-1"
+        >
+          <Badge tone={DEPLOY_STATE[d.state].tone}>{DEPLOY_STATE[d.state].label}</Badge>
+          <span className="text-slate-500">{d.project}</span>
+          <span className="text-slate-500">{d.env === "production" ? "生产" : "预览"}</span>
+          {d.health != null && d.health !== "ok" && (
+            <span className="text-rose-400" title={d.health}>
+              健康异常
+            </span>
+          )}
+          {d.url && (
+            <button className="text-sky-400 hover:text-sky-300" onClick={() => openUrl(d.url!)}>
+              打开 ↗
+            </button>
+          )}
+          <button
+            className="text-slate-500 hover:text-slate-300"
+            title={`这个分支：${branch ?? "—"}`}
+            onClick={() => navigate(`/deploy?t=${d.targetId}`)}
+          >
+            详情 →
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function TaskDetail({ id }: { id: number }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -337,6 +382,8 @@ function TaskDetail({ id }: { id: number }) {
           </div>
         ))}
       </dl>
+
+      <TaskDeployments id={t.id} branch={t.branch} />
 
       {t.detail && <p className="mt-3 text-xs text-slate-400">{t.detail}</p>}
       {t.failure && (

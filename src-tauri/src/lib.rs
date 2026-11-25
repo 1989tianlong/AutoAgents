@@ -1,5 +1,6 @@
 mod chat;
 mod db;
+mod deploy;
 mod discovery;
 mod events;
 mod github;
@@ -38,6 +39,11 @@ pub struct AppState {
     pub local_info: Mutex<Option<autoagents_core::machine::MachineInfo>>,
     /// GitHub API 的地址（测试里指向本地的假服务器）
     pub gh_api: Mutex<String>,
+    /// Vercel / Cloudflare API 的地址（测试里指向本地的假服务器）
+    pub vercel_api: Mutex<String>,
+    pub cf_api: Mutex<String>,
+    /// 部署模块的运行时状态（正在刷新的目标）
+    pub deploy: deploy::Deployer,
     /// 任务流水线的运行时状态（正在收尾的任务）
     pub pipeline: pipeline::Pipeline,
     /// 任务流水线挂在会话上的钩子
@@ -71,6 +77,9 @@ impl AppState {
             remote: Arc::new(remote),
             local_info: Mutex::new(None),
             gh_api: Mutex::new(github::DEFAULT_API.to_string()),
+            vercel_api: Mutex::new(deploy::VERCEL_API.to_string()),
+            cf_api: Mutex::new(deploy::CF_API.to_string()),
+            deploy: deploy::Deployer::default(),
             pipeline: pipeline::Pipeline::default(),
             turn_hooks: Mutex::new(chat::TurnHooks::default()),
         });
@@ -126,8 +135,9 @@ pub fn run() {
             app.manage(state.clone());
             // 连上配对过的机器、开始跟踪中继（都在后台，不拖慢启动）
             state.remote.start_all();
-            // 接着跟踪各个任务的 PR
+            // 接着跟踪各个任务的 PR，以及各个项目的部署
             pipeline::start_polling(state.clone());
+            deploy::start_polling(state.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -155,6 +165,27 @@ pub fn run() {
             pipeline::task_diff,
             pipeline::task_diff_file,
             pipeline::repo_clone,
+            // 部署
+            deploy::deploy_status,
+            deploy::deploy_connect,
+            deploy::deploy_disconnect,
+            deploy::deploy_set_scope,
+            deploy::deploy_discover,
+            deploy::deploy_targets,
+            deploy::deploy_target_add,
+            deploy::deploy_target_update,
+            deploy::deploy_target_remove,
+            deploy::deploy_list,
+            deploy::deploy_refresh,
+            deploy::deploy_trigger,
+            deploy::deploy_retry,
+            deploy::deploy_cancel,
+            deploy::deploy_promote,
+            deploy::deploy_rollback,
+            deploy::deploy_history,
+            deploy::deploy_logs,
+            deploy::deploy_check_health,
+            deploy::deploy_for_task,
             models::agent_models,
             models::model_remember,
             chat::chat_sessions,

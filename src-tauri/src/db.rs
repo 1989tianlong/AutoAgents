@@ -72,7 +72,72 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             source  TEXT,
             message TEXT NOT NULL,
             link    TEXT
-        );",
+        );
+        -- 部署目标：登记了的 Vercel 项目 / Cloudflare Pages 项目 / Worker。平台令牌不在这里，存 Keychain
+        CREATE TABLE IF NOT EXISTS deploy_targets (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider               TEXT NOT NULL,
+            name                   TEXT NOT NULL,
+            -- 平台上的标识：Vercel 的项目 id、Worker 的标签；Pages 项目就是名字
+            platform_id            TEXT NOT NULL,
+            -- 属于哪个团队 / 账户（Vercel teamId、Cloudflare account id）；空表示 Vercel 个人账户
+            scope                  TEXT NOT NULL DEFAULT '',
+            -- 生产地址
+            url                    TEXT,
+            repo                   TEXT,
+            -- GitHub 仓库的数字 id（Vercel 按它指定仓库）
+            repo_id                TEXT,
+            -- 平台那边连的 Git 服务：github / gitlab …；空表示没连
+            git_type               TEXT,
+            -- 生产分支
+            branch                 TEXT,
+            framework              TEXT,
+            -- 应用里发起生产部署要先确认
+            prod_requires_approval INTEGER NOT NULL DEFAULT 1,
+            -- 生产部署失败时自动建修复任务
+            auto_fix               INTEGER NOT NULL DEFAULT 1,
+            health_path            TEXT NOT NULL DEFAULT '/',
+            health_contains        TEXT,
+            -- Workers：存了 Deploy Hook 的地址（地址本身在 Keychain）
+            has_hook               INTEGER NOT NULL DEFAULT 0,
+            created_at             TEXT DEFAULT (datetime('now')),
+            updated_at             TEXT DEFAULT (datetime('now'))
+        );
+        -- 部署记录：从平台拉回来后归成同一种样子。项目名等抄一份，目标删了也还能看
+        CREATE TABLE IF NOT EXISTS deployments (
+            id             TEXT PRIMARY KEY,
+            target_id      INTEGER NOT NULL,
+            provider       TEXT NOT NULL,
+            project        TEXT NOT NULL,
+            env            TEXT NOT NULL,
+            -- queued / building / ready / error / canceled / other
+            state          TEXT NOT NULL,
+            raw_state      TEXT,
+            url            TEXT,
+            inspector_url  TEXT,
+            branch         TEXT,
+            commit_sha     TEXT,
+            commit_message TEXT,
+            author         TEXT,
+            created_ms     INTEGER,
+            building_ms    INTEGER,
+            ready_ms       INTEGER,
+            error_code     TEXT,
+            error_message  TEXT,
+            -- 能回滚到这一次
+            rollback_ok    INTEGER NOT NULL DEFAULT 0,
+            -- 现在线上跑的就是这一次
+            current        INTEGER NOT NULL DEFAULT 0,
+            -- 到终态后守护已经处理过（查过健康、该建的修复任务建过了）
+            guarded        INTEGER NOT NULL DEFAULT 0,
+            -- 健康检查结果：ok 或没通过的原因
+            health         TEXT,
+            -- 守护为这次失败建的修复任务
+            task_id        INTEGER,
+            updated_at     TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS deployments_target ON deployments(target_id, created_ms);
+        CREATE INDEX IF NOT EXISTS deployments_branch ON deployments(branch, commit_sha);",
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
     // 轻量迁移：给旧库补列（列已存在时 ALTER 会报错，直接忽略）

@@ -1087,8 +1087,7 @@ mod tests {
     use super::*;
     use crate::chat;
     use crate::secrets::SecretStore;
-    use crate::testutil::{fake_script, service_for, test_state, TestState};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::testutil::{fake_script, git_in, read_request, respond, service_for, setup_repo, test_state, Req, TestState};
 
     /// 假的 GitHub API：只实现流水线会调的那几个接口，并把收到的请求记下来
     struct FakeGithub {
@@ -1098,48 +1097,6 @@ mod tests {
         /// PR 头部提交上的检查：(名字, 是否失败)
         checks: Arc<Mutex<Vec<(String, bool)>>>,
         merged: Arc<Mutex<bool>>,
-    }
-
-    /// 极简的 HTTP 请求解析：读到请求头结束，再按 Content-Length 读请求体
-    async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, String, String) {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end = loop {
-            let n = stream.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "连接提前关闭");
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-        let length = head
-            .lines()
-            .find_map(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower.strip_prefix("content-length:").map(str::to_string)
-            })
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while buf.len() < header_end + length {
-            let n = stream.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "连接提前关闭");
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let mut lines = head.lines();
-        let mut first = lines.next().unwrap_or_default().split_whitespace();
-        let method = first.next().unwrap_or_default().to_string();
-        let path = first.next().unwrap_or_default().to_string();
-        let body = String::from_utf8_lossy(&buf[header_end..header_end + length]).into_owned();
-        (method, path, body)
-    }
-
-    async fn respond(stream: &mut tokio::net::TcpStream, status: &str, content_type: &str, body: &str) {
-        let text = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(text.as_bytes()).await;
     }
 
     /// 起一个假的 GitHub API
@@ -1158,7 +1115,7 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else { break };
                 let (calls, checks, merged) = (Arc::clone(&calls), Arc::clone(&checks), Arc::clone(&merged));
                 tokio::spawn(async move {
-                    let (method, path, body) = read_request(&mut stream).await;
+                    let Req { method, path, body, .. } = read_request(&mut stream).await;
                     calls.lock().unwrap().push((method.clone(), path.clone(), body.clone()));
                     // 回一段 JSON
                     macro_rules! json {
@@ -1219,37 +1176,6 @@ mod tests {
             }
         });
         fake
-    }
-
-    fn git_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=tester", "-c", "user.email=tester@example.com"])
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("运行 git")
-    }
-
-    /// 造一个「远端在 GitHub 上」的仓库：裸仓库放在 …/github.com/o/r.git（流水线按 origin 地址里的 github.com 认仓库），
-    /// 再克隆一份当作机器上正在用的那份代码
-    fn setup_repo(root: &std::path::Path) -> std::path::PathBuf {
-        let remote = root.join("github.com/o/r.git");
-        std::fs::create_dir_all(&remote).unwrap();
-        assert!(git_in(&remote, &["init", "--bare", "-b", "main"]).status.success());
-        let seed = root.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        assert!(git_in(&seed, &["init", "-b", "main"]).status.success());
-        std::fs::write(seed.join("README.md"), "# demo\n").unwrap();
-        assert!(git_in(&seed, &["add", "-A"]).status.success());
-        assert!(git_in(&seed, &["commit", "-m", "init"]).status.success());
-        assert!(git_in(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-        assert!(git_in(&seed, &["push", "-q", "origin", "main"]).status.success());
-        let machine = root.join("machine");
-        std::fs::create_dir_all(&machine).unwrap();
-        assert!(git_in(&machine, &["clone", "-q", remote.to_str().unwrap(), "app"]).status.success());
-        machine.join("app")
     }
 
     /// 冒充 Agent：第一轮写一个文件；让它修 CI 的那一轮（提示词里有「检查没有通过」）改另一个文件

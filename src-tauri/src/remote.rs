@@ -177,7 +177,7 @@ fn now_ms() -> u64 {
 // 设置、节点表、Keychain 的读写
 // ---------------------------------------------------------------------------
 
-fn setting(db: &Connection, key: &str) -> Option<String> {
+pub fn setting(db: &Connection, key: &str) -> Option<String> {
     db.query_row(
         "SELECT value FROM settings WHERE key = ?1",
         params![key],
@@ -189,7 +189,7 @@ fn setting(db: &Connection, key: &str) -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-fn set_setting(db: &Connection, key: &str, value: &str) -> Result<(), String> {
+pub fn set_setting(db: &Connection, key: &str, value: &str) -> Result<(), String> {
     db.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

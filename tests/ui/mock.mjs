@@ -32,6 +32,17 @@ const MOCK = () => {
     mergePr: false,
     cloneCalls: [],
     ghUser: null,
+    /** 部署：两家平台的连接、登记过的项目、部署记录 */
+    deploy: {
+      platforms: {
+        vercel: { configured: true, error: null, who: "octo", scopes: [{ id: "team_a", name: "Acme" }], scope: "team_a" },
+        cloudflare: { configured: false, error: null, who: null, scopes: [], scope: null },
+      },
+      targets: [],
+      deployments: [],
+      nextId: 10,
+      unhealthy: [],
+    },
   };
   let nextTask = 4;
   let nextSessionId = 60;
@@ -88,6 +99,51 @@ const MOCK = () => {
     }),
   );
   nextTask = 4;
+  // 部署：一个 Vercel 项目、一个 Cloudflare Pages 项目
+  const target = (fields) => ({
+    id: 0, provider: "vercel", name: "", platformId: "", scope: "team_a", url: null, repo: null, repoId: null, gitType: "github",
+    branch: "main", framework: null, prodRequiresApproval: true, autoFix: true, healthPath: "/", healthContains: null,
+    hasHook: false, createdAt: now, updatedAt: now, ...fields,
+  });
+  state.deploy.targets.push(
+    target({ id: 1, name: "web", platformId: "prj_web", url: "https://demo.example.com", repo: "octo/demo", framework: "nextjs" }),
+    target({
+      id: 2, provider: "cloudflare-pages", name: "site", platformId: "site", scope: "acct1", url: "https://site.example.com", repo: "octo/demo",
+    }),
+  );
+  const ms = Date.parse("2026-11-24T02:00:00Z");
+  const dep = (fields) => ({
+    id: "", targetId: 1, provider: "vercel", project: "web", env: "preview", state: "ready", rawState: "READY", url: null,
+    inspectorUrl: "https://vercel.com/acme/web/abc", branch: "main", commitSha: null, commitMessage: null, author: "Octo",
+    createdMs: ms, buildingMs: ms, readyMs: ms + 90_000, errorCode: null, errorMessage: null, rollbackOk: false, current: false,
+    guarded: true, health: null, taskId: null, ...fields,
+  });
+  state.deploy.deployments.push(
+    dep({ id: "dpl_cur", env: "production", commitSha: "abcdef123456", commitMessage: "ship it", current: true, rollbackOk: true, health: "ok" }),
+    dep({ id: "dpl_fail", env: "production", state: "error", rawState: "ERROR", commitSha: "1111111222", commitMessage: "break the build", errorCode: "BUILD_FAILED", errorMessage: 'Command "npm run build" exited with 1', taskId: 3 }),
+    dep({ id: "dpl_build", state: "building", rawState: "BUILDING", branch: "feature/x", commitSha: "fffff0000", commitMessage: "work in progress", createdMs: ms + 30_000, readyMs: null }),
+    dep({ id: "dpl_preview", branch: "agent/issue-3", commitSha: "abcdef123456", commitMessage: "给部署页补测试", url: "https://web-git-agent-issue-3.vercel.app", createdMs: ms - 60_000 }),
+    dep({ id: "dpl_prev", env: "production", commitSha: "aaaaaa0000", commitMessage: "previous release", rollbackOk: true, createdMs: ms - 3_600_000 }),
+    dep({ id: "pg_ok", targetId: 2, provider: "cloudflare-pages", project: "site", env: "production", commitSha: "cccccc3333", commitMessage: "ship pages", current: true, health: "ok", inspectorUrl: null }),
+  );
+  // 平台上还没登记的项目
+  const candidates = [
+    { provider: "vercel", name: "web", platformId: "prj_web", url: null, repo: "octo/demo", repoId: "1234", branch: "main", framework: "nextjs" },
+    { provider: "vercel", name: "api", platformId: "prj_api", url: null, repo: "octo/api", repoId: "5678", branch: "main", framework: null },
+    { provider: "cloudflare-pages", name: "site", platformId: "site", url: "https://site.example.com", repo: "octo/demo", repoId: "1234", branch: "main", framework: "nextjs" },
+    { provider: "cloudflare-pages", name: "docs", platformId: "docs", url: "https://docs.pages.dev", repo: "octo/docs", repoId: "9", branch: "main", framework: null },
+    { provider: "cloudflare-workers", name: "api-worker", platformId: "tag_api_worker", url: null, repo: null, repoId: null, branch: null, framework: null },
+  ];
+  const findTarget = (id) => {
+    const t = state.deploy.targets.find((x) => x.id === id);
+    if (!t) throw new Error(`部署目标不存在：#${id}`);
+    return t;
+  };
+  const findDep = (id) => {
+    const d = state.deploy.deployments.find((x) => x.id === id);
+    if (!d) throw new Error(`部署记录不存在：${id}`);
+    return d;
+  };
   const machineInfo = (name, home) => ({
     name, hostname: name, os: "macos", arch: "arm64", kernel: "25.5.0", version: "0.2.0",
     flavor: "桌面应用内置", home, uptimeS: 3600, cpuCount: 12, memTotal: 16 * 1024 ** 3,
@@ -368,6 +424,127 @@ const MOCK = () => {
     repo_clone: ({ nodeId, url, dir }) => {
       state.cloneCalls.push({ nodeId, url, dir });
       return dir;
+    },
+    // ---------- 部署 ----------
+    deploy_status: () => state.deploy.platforms,
+    deploy_connect: ({ platform, token }) => {
+      if (platform !== "vercel" && platform !== "cloudflare") throw new Error(`不认识的平台：${platform}`);
+      if (!token.trim()) throw new Error("请输入 API 令牌");
+      const good = platform === "vercel" ? "vcp_good" : "cf_good";
+      if (token.trim() !== good) {
+        throw new Error(`${platform === "vercel" ? "Vercel" : "Cloudflare"} API 错误（403）：Not authorized，令牌无效或已过期`);
+      }
+      const scopes = platform === "vercel"
+        ? [{ id: "team_a", name: "Acme" }, { id: "team_b", name: "Beta" }]
+        : [{ id: "acct1", name: "Acme" }, { id: "acct2", name: "Beta" }];
+      state.deploy.platforms[platform] = { configured: true, error: null, who: platform === "vercel" ? "octo" : null, scopes, scope: scopes[0].id };
+      return state.deploy.platforms[platform];
+    },
+    deploy_disconnect: ({ platform }) => {
+      state.deploy.platforms[platform] = { configured: false, error: null, who: null, scopes: [], scope: null };
+      return null;
+    },
+    deploy_set_scope: ({ platform, scope }) => {
+      state.deploy.platforms[platform].scope = scope;
+      return null;
+    },
+    deploy_discover: ({ platform }) => {
+      const s = state.deploy.platforms[platform];
+      if (!s.configured) throw new Error(`尚未连接 ${platform === "vercel" ? "Vercel" : "Cloudflare"}：请先填入 API 令牌`);
+      const scope = platform === "vercel" ? "team_a" : "acct1";
+      return candidates
+        .filter((c) => (platform === "vercel" ? c.provider === "vercel" : c.provider.startsWith("cloudflare")))
+        .map((c) => ({ ...c, registered: state.deploy.targets.find((t) => t.provider === c.provider && t.platformId === c.platformId)?.id ?? null, scope }));
+    },
+    deploy_targets: () => state.deploy.targets,
+    deploy_target_add: ({ provider, name, platformId, url, hookUrl }) => {
+      const c = candidates.find((x) => x.provider === provider && x.platformId === platformId);
+      const t = target({
+        id: state.deploy.nextId++, provider, name, platformId, scope: provider === "vercel" ? "team_a" : "acct1",
+        url: url || c?.url || null, repo: c?.repo ?? null, repoId: c?.repoId ?? null, gitType: c?.repo ? "github" : null,
+        branch: c?.branch ?? null, framework: c?.framework ?? null, hasHook: !!hookUrl,
+      });
+      state.deploy.targets.push(t);
+      return t;
+    },
+    deploy_target_update: ({ id, hookUrl, healthContains, ...patch }) => {
+      const t = findTarget(id);
+      if (hookUrl !== undefined && hookUrl !== null) {
+        if (hookUrl !== "" && !hookUrl.startsWith("https://")) throw new Error("Deploy Hook 的地址应该以 https:// 开头");
+        t.hasHook = hookUrl !== "";
+      }
+      Object.assign(t, patch, healthContains === "" ? { healthContains: null } : {});
+      return t;
+    },
+    deploy_target_remove: ({ id }) => {
+      findTarget(id);
+      state.deploy.targets = state.deploy.targets.filter((t) => t.id !== id);
+      state.deploy.deployments = state.deploy.deployments.filter((d) => d.targetId !== id);
+      return null;
+    },
+    deploy_list: ({ targetId, limit }) =>
+      state.deploy.deployments.filter((d) => targetId == null || d.targetId === targetId).slice(0, limit ?? 50),
+    deploy_refresh: () => 0,
+    /** 发起一次部署；生产分支（Workers 一律算生产）要确认 */
+    deploy_trigger: ({ targetId, branch, commit, confirmed }) => {
+      const t = findTarget(targetId);
+      const workers = t.provider === "cloudflare-workers";
+      if (workers && !t.hasHook) throw new Error("这个 Worker 没有配 Deploy Hook：在 Cloudflare 控制台「Settings → Builds → Deploy Hooks」里建一个，填到目标设置里");
+      const production = workers || branch === t.branch;
+      if (production && t.prodRequiresApproval && !confirmed) throw new Error("这是生产部署，需要先确认");
+      const fresh = dep({
+        id: `dpl_new${state.deploy.nextId++}`, targetId, provider: t.provider, project: t.name, env: production ? "production" : "preview",
+        state: "queued", rawState: "QUEUED", branch: workers ? t.branch : branch, commitSha: commit, commitMessage: "triggered", readyMs: null,
+      });
+      state.deploy.deployments.unshift(fresh);
+      return fresh;
+    },
+    deploy_retry: ({ id, confirmed }) => {
+      const d = findDep(id);
+      const t = findTarget(d.targetId);
+      if (d.env === "production" && t.prodRequiresApproval && !confirmed) throw new Error("这是生产部署，需要先确认");
+      const fresh = { ...d, id: `dpl_again${state.deploy.nextId++}`, state: "queued", rawState: "QUEUED", current: false, health: null, taskId: null };
+      state.deploy.deployments.unshift(fresh);
+      return fresh;
+    },
+    deploy_cancel: ({ id }) => {
+      Object.assign(findDep(id), { state: "canceled", rawState: "CANCELED" });
+      return null;
+    },
+    deploy_promote: ({ id }) => {
+      const d = findDep(id);
+      state.deploy.deployments.forEach((x) => { if (x.targetId === d.targetId) x.current = false; });
+      Object.assign(d, { env: "production", current: true });
+      return null;
+    },
+    deploy_rollback: ({ targetId, toId, versionId }) => {
+      findTarget(targetId);
+      const d = findDep(toId);
+      state.deploy.deployments.forEach((x) => { if (x.targetId === targetId) x.current = false; });
+      d.current = true;
+      d.rawState = versionId ? "ROLLED_BACK_TO_VERSION" : "ROLLED_BACK";
+      return null;
+    },
+    deploy_history: ({ targetId }) =>
+      state.deploy.deployments
+        .filter((d) => d.targetId === targetId && d.env === "production" && d.state === "ready")
+        .map((d) => ({ id: d.id, createdMs: d.createdMs, branch: d.branch, commitMessage: d.commitMessage, current: d.current, versionId: d.id === "wk_v" ? "ver1" : null })),
+    deploy_logs: ({ id }) => {
+      const d = findDep(id);
+      return `--- 构建 ${d.id} ---\nRunning "npm run build"\n${d.state === "error" ? "Type error: Cannot find name 'useEffect'" : "Compiled successfully"}`;
+    },
+    /** 复查健康：unhealthy 里列着的部署一律不通过 */
+    deploy_check_health: ({ id }) => {
+      const text = state.deploy.unhealthy.includes(id) ? "503 Service Unavailable" : "ok";
+      Object.assign(findDep(id), { health: text });
+      return text;
+    },
+    deploy_for_task: ({ taskId }) => {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (!task) throw new Error(`任务不存在：#${taskId}`);
+      return state.deploy.deployments.filter(
+        (d) => d.taskId === taskId || d.branch === task.branch || (task.headSha && d.commitSha === task.headSha),
+      );
     },
     chat_sessions: () => state.sessions,
     chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],
