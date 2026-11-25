@@ -351,6 +351,35 @@ await page.getByRole("button", { name: "＋ 登记" }).click();
 await page.getByRole("heading", { name: "登记项目" }).waitFor();
 check("断开的平台不能从中登记", await dialog().getByRole("button", { name: "Cloudflare（未连接）" }).isDisabled());
 await dialog().getByRole("button", { name: "取消", exact: true }).click();
+await closeDialog();
+
+console.log("\n[12] 活动页记下部署与任务的每一步；工作流页指向已上线的发布守护");
+await page.evaluate(() => {
+  window.__mock.state.events = [
+    { id: 3, ts: "2026-11-24 03:00:05", kind: "deploy.repair", level: "warning", source: "web", message: "生产部署失败，已建修复任务 #3", link: "#/tasks?t=3" },
+    { id: 2, ts: "2026-11-24 03:00:00", kind: "deploy.failed", level: "error", source: "web", message: "生产部署失败：abcdef1 ship it", link: "#/deploy?t=1" },
+    { id: 1, ts: "2026-11-23 22:00:00", kind: "task.merged", level: "info", source: "给首页加缓存", message: "PR #104 已合并", link: "#/tasks?t=4" },
+  ];
+});
+await page.evaluate(() => { location.hash = "#/activity"; });
+await page.getByRole("heading", { name: "活动", exact: true }).waitFor();
+await page.getByText("建修复任务", { exact: true }).first().waitFor();
+/** 事件左边那个归类标签 */
+const kindTag = (label) => page.locator("main span", { hasText: new RegExp(`^${label}$`) }).first();
+check("部署与任务的事件都有中文文案", (await kindTag("部署失败").isVisible()) && (await kindTag("PR 已合并").isVisible()) && (await page.getByText(/^deploy\./).count()) === 0);
+check("出错标红、要留意标黄", (await kindTag("部署失败").evaluate((el) => el.className.includes("rose"))) && (await kindTag("建修复任务").evaluate((el) => el.className.includes("amber"))));
+await page.getByRole("button", { name: /^部署\s*2$/ }).click();
+await waitFor(async () => (await page.locator("div.gap-3.px-4").count()) === 2);
+check("按部署归类筛选", (await page.getByText("PR #104 已合并").count()) === 0);
+await page.locator("div.gap-3.px-4", { hasText: "已建修复任务" }).getByRole("button", { name: "查看 →" }).click();
+await page.getByRole("heading", { name: "升级依赖" }).waitFor();
+check("从活动跳到修复任务", page.url().includes("/tasks?t=3"));
+await page.evaluate(() => { location.hash = "#/workflows"; });
+await page.getByRole("heading", { name: "工作流", exact: true }).waitFor();
+check("发布守护标成已上线，其余仍是规划中", (await page.getByRole("link", { name: "已上线 · 去部署页 →" }).count()) === 1 && (await page.locator("main span", { hasText: /^规划中$/ }).count()) === 3);
+await page.getByRole("link", { name: "已上线 · 去部署页 →" }).click();
+await page.getByRole("heading", { name: "部署", exact: true }).waitFor();
+check("点了就到部署页", page.url().includes("/deploy"));
 
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} 项通过${pageErrors.length ? `；页面错误 ${pageErrors.length} 条：` : ""}`);

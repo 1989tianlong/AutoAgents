@@ -1,7 +1,9 @@
 import { Fragment } from "react";
+import { Link } from "react-router-dom";
 import { Badge, Card, PageHeader } from "../components/ui";
 
-const TEMPLATES = [
+/** live：这条流水线已经不用编排、直接做在某个页面里了，后面跟的是去哪 */
+const TEMPLATES: { name: string; desc: string; steps: string[]; live?: string }[] = [
   {
     name: "修 Issue 流水线",
     desc: "分析修复 → 交叉审查 → 撰写变更说明",
@@ -14,8 +16,9 @@ const TEMPLATES = [
   },
   {
     name: "发布守护流水线",
-    desc: "merge 后部署 → 健康检查 → 失败自动建修复任务",
-    steps: ["Vercel/CF 部署", "健康检查", "回灌修复"],
+    desc: "生产部署 → 健康检查 → 失败自动建修复任务",
+    steps: ["Vercel / CF 部署", "健康检查", "回灌修复"],
+    live: "/deploy",
   },
   {
     name: "竞争模式",
@@ -27,14 +30,20 @@ const TEMPLATES = [
 export default function Workflows() {
   return (
     <div className="mx-auto max-w-6xl p-8">
-      <PageHeader title="工作流" desc="内置模板先睹为快，DAG 可视化编辑器将在 M3 上线" />
+      <PageHeader title="工作流" desc="多 Agent 编排还在做；「发布守护」已经先做进了部署页，不用编排就能跑" />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {TEMPLATES.map((t) => (
           <Card key={t.name} className="p-5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <h2 className="font-medium text-white">{t.name}</h2>
-              <Badge tone="violet">模板</Badge>
+              {t.live ? (
+                <Link to={t.live} className="text-xs text-emerald-400 hover:text-emerald-300">
+                  已上线 · 去部署页 →
+                </Link>
+              ) : (
+                <Badge tone="violet">规划中</Badge>
+              )}
             </div>
             <p className="mt-1.5 text-sm text-slate-400">{t.desc}</p>
             <div className="mt-4 flex flex-wrap items-center gap-1.5">
