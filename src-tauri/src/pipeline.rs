@@ -1420,8 +1420,9 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         let TestState { state: state2, secrets: secrets2, .. } = test_state(idle);
         secrets2.set("github_pat", "test-token").unwrap();
         let id2 = tasks::create_manual(&state2.db.lock().unwrap(), "不用改", "o/r", "看看就好。").unwrap().id;
-        let task = start(&state2, id2, &opts).await.unwrap();
-        assert_eq!(task.status, "running");
+        // 假 Agent 输出一行就退出：start 返回的时候这一轮可能已经收尾、任务已经不是「进行中」了，
+        // 所以这里不断言它此刻的状态，只等它走到头
+        start(&state2, id2, &opts).await.unwrap();
         let task = wait_status(&state2, id2, &["failed", "changes"]).await;
         assert_eq!(task.status, "failed");
         assert!(task.failure.as_deref().unwrap().contains("没有改动任何文件"), "{}", task.failure.as_deref().unwrap_or(""));

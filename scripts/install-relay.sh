@@ -21,6 +21,12 @@ set -eu
 REPO="1989tianlong/AutoAgents"
 VERSION="${AUTOAGENTS_VERSION:-latest}"
 BASE="${AUTOAGENTS_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}"
+# GitHub 上「最新版」的地址是 releases/latest/download/<文件>，中间没有版本号那一层
+# （releases/download/latest/ 是 404）。指定了别的下载地址时，照旧按 <地址>/<版本>/ 去取
+dir="${BASE}/${VERSION}"
+if [ "${VERSION}" = "latest" ] && [ "${BASE}" = "https://github.com/${REPO}/releases/download" ]; then
+  dir="https://github.com/${REPO}/releases/latest/download"
+fi
 NAME="autoagents-relay"
 LABEL="com.tianlong.autoagents.relay"
 
@@ -88,13 +94,13 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "这�
 work="$(mktemp -d 2>/dev/null || mktemp -d -t autoagents)"
 trap 'rm -rf "$work"' EXIT INT TERM
 asset="autoagents-node-${TARGET}.tar.gz"
-url="${BASE}/${VERSION}/${asset}"
+url="${dir}/${asset}"
 say "下载：${url}"
 fetch "${url}" "${work}/${asset}" || die \
   "下载失败。如果地址打不开（404），说明 ${VERSION} 这个版本没有提供 ${TARGET} 的构建：
   https://github.com/${REPO}/releases"
 if [ "${AUTOAGENTS_NO_CHECKSUM:-0}" != "1" ]; then
-  fetch "${BASE}/${VERSION}/SHA256SUMS" "${work}/SHA256SUMS" || die "下载校验文件失败"
+  fetch "${dir}/SHA256SUMS" "${work}/SHA256SUMS" || die "下载校验文件失败"
   want="$(grep " ${asset}\$" "${work}/SHA256SUMS" | awk '{print $1}')"
   [ -n "${want}" ] || die "校验文件里没有 ${asset}，这个版本不完整"
   if command -v sha256sum >/dev/null 2>&1; then

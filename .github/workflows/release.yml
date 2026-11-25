@@ -171,3 +171,28 @@ jobs:
               --generate-notes \
               --notes "$notes"
           fi
+
+  # 发出去之后照用户的方式装一遍：安装脚本从 main 取，程序从刚发布的 Release 取。
+  # 装到临时目录，不注册服务、不启动
+  verify:
+    name: 发布之后实际装一遍 · ${{ matrix.name }}
+    needs: release
+    if: github.ref_type == 'tag'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 按安装命令装 agentd 与中继
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/${{ github.repository }}/main/scripts"
+          export AUTOAGENTS_INSTALL_DIR="${RUNNER_TEMP}/autoagents-bin"
+          curl -fsSL "${base}/install-agentd.sh" | sh -s -- upgrade
+          curl -fsSL "${base}/install-relay.sh" | sh -s -- --public wss://relay.example.com:7000

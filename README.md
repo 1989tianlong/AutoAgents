@@ -104,6 +104,7 @@ npm run tauri build   # 打包安装包
 
 ```bash
 npm run test:rust     # Rust：Agent 输出协议、任务流水线、部署与守护、多机联调
+npm run test:scripts  # 两个安装脚本（替身的 curl 假装 GitHub Releases，不联网）
 npm run dev           # 另开一个终端：界面测试需要前端开发服务器
 npm run test:ui       # 会话、机器、任务、部署四套界面测试（无头 WebKit，模拟 Tauri 接口）
 ```
@@ -111,7 +112,9 @@ npm run test:ui       # 会话、机器、任务、部署四套界面测试（�
 `test:ui` 依赖 `playwright-core` 及其 WebKit：`npm i -D playwright-core && npx playwright-core install webkit`；
 也可以用环境变量 `PLAYWRIGHT_CORE` 指向本机已有的 playwright-core 目录。
 
-CI（`main` 分支每次推送）：Rust 测试跑 Linux 与 macOS，界面测试跑 Linux。打 `v*` 标签会构建 `agentd` 与 `autoagents-relay`（Linux x86_64 / arm64 静态链接，macOS Intel / Apple Silicon）并发到 GitHub Releases。
+CI（`main` 分支每次推送）：Rust 测试和安装脚本测试跑 Linux 与 macOS，界面测试跑 Linux。
+
+打 `v*` 标签会走一遍发布：构建 `agentd` 与 `autoagents-relay`（Linux x86_64 / arm64 静态链接，macOS Intel / Apple Silicon）→ 用构建出来的程序把多机联调走一遍 → 发到 GitHub Releases（附 SHA256SUMS）→ 再按安装命令在 Linux 和 macOS 上各装一遍。
 
 ## 代码结构
 

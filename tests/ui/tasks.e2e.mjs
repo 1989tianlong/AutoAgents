@@ -157,10 +157,12 @@ console.log("\n[7] GitHub 页：把 Issue 转成任务");
 await page.evaluate(() => { window.__mock.state.ghUser = { login: "octo", name: "Octo Cat", avatarUrl: null }; });
 await page.evaluate(() => { location.hash = "#/github"; });
 await page.getByRole("heading", { name: "GitHub", exact: true }).waitFor();
-// 新建任务时选过 octo/demo，GitHub 页记住了这个仓库，直接列它的 Issue
-if (await page.getByRole("button", { name: "← 换仓库" }).count() === 0) {
-  await page.getByRole("button", { name: /octo\/demo/ }).first().click();
-}
+// 新建任务时选过 octo/demo，GitHub 页记住了这个仓库，直接列它的 Issue。
+// 标题先出来，仓库那一块要等状态查回来才画：等到「换仓库」或某个仓库出现，再决定点哪里
+const switchRepo = page.getByRole("button", { name: "← 换仓库" });
+const pickRepo = page.getByRole("button", { name: /octo\/demo/ }).first();
+await waitFor(async () => (await switchRepo.count()) > 0 || (await pickRepo.count()) > 0);
+if ((await switchRepo.count()) === 0) await pickRepo.click();
 await page.getByRole("button", { name: "转任务" }).first().click();
 const issue = await lastCall("task_create_issue");
 check("task_create_issue 带仓库、Issue 号与链接", issue?.args.repo === "octo/demo" && issue.args.issueNumber === 9 && issue.args.issueUrl.endsWith("/issues/9"), JSON.stringify(issue?.args));

@@ -62,6 +62,8 @@ const open = async (name) => {
 console.log("\n[0] 连接平台");
 await page.getByRole("heading", { name: "部署", exact: true }).waitFor();
 await page.getByText("选一个项目", { exact: true }).waitFor();
+// 卡片先按「没连上」画，状态查回来才换：等它换完再看
+await page.getByText("已连接 · octo", { exact: true }).waitFor();
 check("已连接的 Vercel 标出账号", await page.getByText("已连接 · octo", { exact: true }).isVisible());
 check("没连的 Cloudflare 请你填入令牌", (await page.getByText("未连接", { exact: true }).count()) === 1 && (await page.getByRole("button", { name: "填入令牌" }).count()) === 1);
 await page.getByRole("button", { name: "填入令牌" }).click();
@@ -97,6 +99,7 @@ const first = (await calls("deploy_target_add"))[0];
 check("deploy_target_add 带项目在平台上的名字", first?.provider === "vercel" && first.name === "api" && first.platformId === "prj_api", JSON.stringify(first));
 await page.getByRole("heading", { name: "api", exact: true }).waitFor();
 const apiId = await idOf("api");
+await item("api").waitFor();
 check("登记完直接打开它", page.url().includes(`t=${apiId}`) && (await item("api").count()) === 1);
 
 // 第二轮：Cloudflare 的一个 Pages 项目和一个 Worker。Worker 没有关联仓库，生产地址要自己给
@@ -337,6 +340,7 @@ check("点详情跳到那个项目的部署页", page.url().includes("/deploy?t=
 
 console.log("\n[11] 取消登记、断开");
 await open("docs");
+await page.getByText(/还没有部署记录/).waitFor();
 check("还没部署过的项目", await page.getByText(/还没有部署记录/).isVisible());
 await page.getByRole("button", { name: "取消登记", exact: true }).click();
 check("说清楚只删本地记录", await dialog().getByText(has("取消登记「docs」：本地的部署记录会删掉，平台上的项目和线上服务都不动。")).isVisible());

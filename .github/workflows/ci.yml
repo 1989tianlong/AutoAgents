@@ -35,6 +35,8 @@ jobs:
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libssl-dev
       - name: cargo test --workspace
         run: cargo test --workspace
+      - name: 两个安装脚本的回归测试（替身的 curl 假装 GitHub Releases，不联网）
+        run: sh tests/scripts/install-scripts.sh
 
   ui:
     name: 界面测试
