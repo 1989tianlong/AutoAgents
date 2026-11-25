@@ -137,7 +137,49 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             updated_at     TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS deployments_target ON deployments(target_id, created_ms);
-        CREATE INDEX IF NOT EXISTS deployments_branch ON deployments(branch, commit_sha);",
+        CREATE INDEX IF NOT EXISTS deployments_branch ON deployments(branch, commit_sha);
+        -- 工作流：多个步骤串成的一张有向无环图（竞争模式、交叉审查这类多 Agent 协同）
+        CREATE TABLE IF NOT EXISTS workflows (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            -- 从哪个模板建的（issue-fix / pr-review / race）；自定义时为空
+            template     TEXT,
+            repo         TEXT NOT NULL,
+            issue_number INTEGER,
+            issue_url    TEXT,
+            issue_title  TEXT,
+            pr_number    INTEGER,
+            -- 没有 Issue 时的需求说明，建任务时原样交给 Agent
+            instructions TEXT,
+            -- pending / running / waiting / done / failed / cancelled
+            status       TEXT NOT NULL DEFAULT 'pending',
+            detail       TEXT,
+            created_at   TEXT DEFAULT (datetime('now')),
+            updated_at   TEXT DEFAULT (datetime('now'))
+        );
+        -- 工作流的步骤。depends_on 是步骤 seq 的数组（JSON），带 ? 前缀表示软依赖：
+        -- 上游失败也算解锁（竞争模式的评审门不因为一路失败而打不开）
+        CREATE TABLE IF NOT EXISTS workflow_steps (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            name        TEXT NOT NULL,
+            -- task: 走任务流水线；session: 一段纯会话（审查、写说明）；gate: 等人决策
+            kind        TEXT NOT NULL,
+            depends_on  TEXT NOT NULL DEFAULT '[]',
+            -- JSON：adapter、node_id、workdir、model、auto_pr、prompt
+            config      TEXT NOT NULL DEFAULT '{}',
+            -- pending / running / waiting / done / failed / skipped
+            status      TEXT NOT NULL DEFAULT 'pending',
+            task_id     INTEGER,
+            session_id  INTEGER,
+            outcome     TEXT,
+            detail      TEXT,
+            failure     TEXT,
+            started_at  TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS workflow_steps_wf ON workflow_steps(workflow_id, seq);",
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
     // 轻量迁移：给旧库补列（列已存在时 ALTER 会报错，直接忽略）

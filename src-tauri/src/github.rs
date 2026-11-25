@@ -166,6 +166,33 @@ async fn gh_call(state: &AppState, token: &str, method: &str, path: &str, body: 
         .map_err(|e| format!("解析响应失败: {e}"))
 }
 
+/// 取一段原始文本（不是 JSON 的接口，比如 PR 的 diff：Accept 是 vnd.github.diff）
+async fn gh_text(state: &AppState, token: &str, path: &str, accept: &str) -> Result<String, String> {
+    let resp = http()?
+        .get(format!("{}{path}", state.gh_api.lock().unwrap()))
+        .bearer_auth(token)
+        .header("Accept", accept)
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API 错误（{}）", resp.status().as_u16()));
+    }
+    resp.text().await.map_err(|e| format!("读取响应失败: {e}"))
+}
+
+/// PR 的完整 diff（unified diff 文本）
+pub async fn pr_diff(state: &AppState, token: &str, owner: &str, repo: &str, number: i64) -> Result<String, String> {
+    gh_text(
+        state,
+        token,
+        &format!("/repos/{owner}/{repo}/pulls/{number}"),
+        "application/vnd.github.diff",
+    )
+    .await
+}
+
 fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or_default().to_string()
 }

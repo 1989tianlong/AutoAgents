@@ -11,6 +11,7 @@ export const KIND_GROUPS: KindGroup[] = [
   { key: "session", label: "会话" },
   { key: "node", label: "机器" },
   { key: "task", label: "任务" },
+  { key: "workflow", label: "工作流" },
   { key: "deploy", label: "部署" },
   { key: "github", label: "GitHub" },
   { key: "relay", label: "中继" },
@@ -38,6 +39,16 @@ const KIND_LABEL: Record<string, string> = {
   "task.failed": "任务失败",
   "task.status": "任务状态",
   "task.deleted": "删除任务",
+  "workflow.created": "建工作流",
+  "workflow.started": "启动工作流",
+  "workflow.step_started": "步骤开始",
+  "workflow.step_done": "步骤完成",
+  "workflow.step_failed": "步骤失败",
+  "workflow.step_skipped": "跳过步骤",
+  "workflow.gate": "等人决策",
+  "workflow.done": "工作流完成",
+  "workflow.failed": "工作流失败",
+  "workflow.cancelled": "工作流取消",
   "deploy.connected": "连接平台",
   "deploy.disconnected": "断开平台",
   "deploy.discover": "取项目清单",
@@ -63,6 +74,6 @@ export function kindLabel(kind: string): string {
 export function kindTone(kind: string, level: string): "emerald" | "amber" | "rose" | "slate" {
   if (level === "error") return "rose";
   if (level === "warning") return "amber";
-  if (kind === "node.online" || kind.endsWith(".connected")) return "emerald";
+  if (kind === "node.online" || kind.endsWith(".connected") || kind === "workflow.done") return "emerald";
   return "slate";
 }

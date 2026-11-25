@@ -66,7 +66,7 @@ fn clip(text: &str, max_chars: usize) -> String {
 }
 
 /// `owner/repo` → (`owner`, `repo`)
-fn split_repo(repo: &str) -> Result<(String, String), String> {
+pub fn split_repo(repo: &str) -> Result<(String, String), String> {
     let (owner, name) = repo
         .trim()
         .split_once('/')

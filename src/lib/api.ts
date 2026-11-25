@@ -28,6 +28,8 @@ import type {
   RelayView,
   Task,
   UsageSummary,
+  Workflow,
+  WorkflowTemplate,
 } from "./types";
 
 export const getAppInfo = () => invoke<AppInfo>("app_info");
@@ -282,3 +284,38 @@ export const deployCheckHealth = (id: string) => invoke<string>("deploy_check_he
 
 /** 这个任务的分支（或它推上去的提交）对应的部署 */
 export const deployForTask = (taskId: number) => invoke<Deployment[]>("deploy_for_task", { taskId });
+
+// ---------- 工作流编排 ----------
+
+/** 内置的多 Agent 流程模板 */
+export const workflowTemplates = () => invoke<WorkflowTemplate[]>("workflow_templates");
+
+export const workflowList = () => invoke<Workflow[]>("workflow_list");
+export const workflowGet = (id: number) => invoke<Workflow>("workflow_get", { id });
+
+/** 从模板建一个工作流（还没启动）。Issue 的标题与地址界面上带上，缺了后端会去拉 */
+export const workflowCreate = (p: {
+  template: string;
+  repo: string;
+  issueNumber?: number | null;
+  issueTitle?: string | null;
+  issueUrl?: string | null;
+  prNumber?: number | null;
+  instructions?: string | null;
+  nodeId: string;
+  workdir: string;
+  model?: string | null;
+  autoPr?: boolean;
+  /** 按步骤顺序覆盖每一步用哪个 Agent */
+  adapters?: string[];
+}) => invoke<Workflow>("workflow_create", p);
+
+export const workflowStart = (id: number) => invoke<Workflow>("workflow_start", { id });
+export const workflowCancel = (id: number) => invoke<Workflow>("workflow_cancel", { id });
+
+/** 人工评审：在候选方案（依赖的任务）里选定一个 */
+export const workflowGate = (workflowId: number, stepId: number, chosenTaskId: number) =>
+  invoke<Workflow>("workflow_gate", { workflowId, stepId, chosenTaskId });
+
+/** 重跑失败的工作流：失败的与被跳过的步骤重新排队 */
+export const workflowRetry = (id: number) => invoke<Workflow>("workflow_retry", { id });

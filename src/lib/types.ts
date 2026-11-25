@@ -492,3 +492,65 @@ export interface DeployHistoryItem {
   /** Workers：这一次部署用的版本 */
   versionId: string | null;
 }
+
+// ---------- 工作流编排 ----------
+
+export type WorkflowStatus = "pending" | "running" | "waiting" | "done" | "failed" | "cancelled";
+export type WorkflowStepStatus = "pending" | "running" | "waiting" | "done" | "failed" | "skipped";
+
+export interface WorkflowStep {
+  id: number;
+  seq: number;
+  name: string;
+  /** task：走任务流水线；session：一段纯会话；gate：等人工决策 */
+  kind: "task" | "session" | "gate";
+  /** 依赖的步骤 seq；带 ? 前缀是软依赖：上游失败也算解锁 */
+  dependsOn: string[];
+  adapter: string | null;
+  nodeId: string | null;
+  workdir: string | null;
+  model: string | null;
+  autoPr: boolean;
+  prompt: string | null;
+  status: WorkflowStepStatus;
+  taskId: number | null;
+  sessionId: number | null;
+  outcome: string | null;
+  detail: string | null;
+  failure: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface Workflow {
+  id: number;
+  name: string;
+  template: string | null;
+  repo: string;
+  issueNumber: number | null;
+  issueTitle: string | null;
+  instructions: string | null;
+  prNumber: number | null;
+  status: WorkflowStatus;
+  detail: string | null;
+  createdAt: string;
+  updatedAt: string;
+  steps: WorkflowStep[];
+}
+
+export interface WorkflowTemplateStep {
+  name: string;
+  kind: "task" | "session" | "gate";
+  deps: string[];
+  adapter: string | null;
+}
+
+export interface WorkflowTemplate {
+  id: string;
+  name: string;
+  desc: string;
+  needsPr: boolean;
+  /** 不用编排、直接做在某个页面里的模板 */
+  live: string | null;
+  steps: WorkflowTemplateStep[];
+}

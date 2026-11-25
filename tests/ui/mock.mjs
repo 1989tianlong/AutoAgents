@@ -43,6 +43,9 @@ const MOCK = () => {
       nextId: 10,
       unhealthy: [],
     },
+    /** 工作流编排 */
+    workflows: [],
+    wfTemplates: [],
   };
   let nextTask = 4;
   let nextSessionId = 60;
@@ -157,6 +160,42 @@ const MOCK = () => {
     installScript: "https://raw.githubusercontent.com/1989tianlong/AutoAgents/main/scripts/install-agentd.sh",
     connected: false, message: null, online: [], pending: [],
   };
+  // 工作流模板：与后端 workflow.rs 里的 TEMPLATES 一一对应
+  state.nextWorkflow = 1;
+  state.wfFailNext = [];
+  state.wfTemplates = [
+    {
+      id: "issue-fix", name: "修 Issue 流水线", desc: "一个 Agent 分析修复，第二个交叉审查，第三个撰写变更说明",
+      needsPr: false, live: null,
+      steps: [
+        { name: "分析修复", kind: "task", deps: [], adapter: "claude-cli" },
+        { name: "交叉审查", kind: "session", deps: ["1"], adapter: "codex-cli" },
+        { name: "撰写变更说明", kind: "session", deps: ["2"], adapter: "grok-cli" },
+      ],
+    },
+    {
+      id: "pr-review", name: "PR 审查流水线", desc: "两位 Agent 并行交叉审查同一个 PR，第三人汇总结论",
+      needsPr: true, live: null,
+      steps: [
+        { name: "审查 · Agent 一", kind: "session", deps: [], adapter: "claude-cli" },
+        { name: "审查 · Agent 二", kind: "session", deps: [], adapter: "codex-cli" },
+        { name: "汇总结论", kind: "session", deps: ["1", "2"], adapter: null },
+      ],
+    },
+    {
+      id: "race", name: "竞争模式", desc: "两个 Agent 并行解决同一 Issue（各自分支），人工评审择优",
+      needsPr: false, live: null,
+      steps: [
+        { name: "方案 A", kind: "task", deps: [], adapter: "claude-cli" },
+        { name: "方案 B", kind: "task", deps: [], adapter: "codex-cli" },
+        { name: "人工评审", kind: "gate", deps: ["?1", "?2"], adapter: null },
+      ],
+    },
+    {
+      id: "publish-guard", name: "发布守护流水线", desc: "生产部署 → 健康检查 → 失败自动建修复任务",
+      needsPr: false, live: "/deploy", steps: [],
+    },
+  ];
   const agents = ["claude-cli", "codex-cli", "grok-cli", "pi"].map((adapter, i) => ({
     id: `local/${adapter}`,
     name: ["Claude CLI", "Codex CLI", "Grok CLI", "Pi Agent"][i],
@@ -546,6 +585,110 @@ const MOCK = () => {
         (d) => d.taskId === taskId || d.branch === task.branch || (task.headSha && d.commitSha === task.headSha),
       );
     },
+    // ---------- 工作流编排 ----------
+    workflow_templates: () => state.wfTemplates,
+    workflow_list: () => state.workflows,
+    workflow_get: ({ id }) => {
+      const wf = state.workflows.find((w) => w.id === id);
+      if (!wf) throw new Error(`工作流不存在：#${id}`);
+      return wf;
+    },
+    workflow_create: (args) => {
+      const t = state.wfTemplates.find((x) => x.id === args.template);
+      if (!t) throw new Error(`mock: 没有模板 ${args.template}`);
+      if (t.needsPr && !args.prNumber) throw new Error("这个模板要处理一个 PR，请填 PR 号");
+      if (!args.prNumber && !args.issueNumber && !args.instructions) {
+        throw new Error("请给出要处理的 Issue 号，或写一段需求说明");
+      }
+      const wf = {
+        id: state.nextWorkflow++,
+        name: `${t.name} · ${args.repo}`,
+        template: t.id,
+        repo: args.repo,
+        issueNumber: args.issueNumber ?? null,
+        issueTitle: null,
+        instructions: args.instructions ?? null,
+        prNumber: args.prNumber ?? null,
+        status: "pending",
+        detail: null,
+        createdAt: now,
+        updatedAt: now,
+        steps: t.steps.map((s, i) => ({
+          id: 1000 + state.nextWorkflow * 10 + i,
+          seq: i + 1,
+          name: s.name,
+          kind: s.kind,
+          dependsOn: s.deps,
+          adapter: args.adapters?.[i] || s.adapter || null,
+          nodeId: args.nodeId ?? "local",
+          workdir: args.workdir ?? null,
+          model: args.model ?? null,
+          autoPr: !!args.autoPr,
+          prompt: s.kind === "session" ? `（${s.name} 的提示词）` : null,
+          status: "pending",
+          taskId: null,
+          sessionId: null,
+          outcome: null,
+          detail: null,
+          failure: null,
+          startedAt: null,
+          finishedAt: null,
+        })),
+      };
+      state.workflows.unshift(wf);
+      wfEvent(wf, "workflow.created", "info", "已创建工作流（还没启动）");
+      return wf;
+    },
+    workflow_start: ({ id }) => {
+      const wf = mustWf(id);
+      wf.status = "running";
+      wf.detail = "刚启动";
+      wfEvent(wf, "workflow.started", "info", "工作流启动");
+      wfTick(id);
+      return wf;
+    },
+    workflow_cancel: ({ id }) => {
+      const wf = mustWf(id);
+      wf.status = "cancelled";
+      wf.detail = "已取消";
+      for (const s of wf.steps) {
+        if (["pending", "running", "waiting"].includes(s.status)) {
+          s.status = "skipped";
+          s.detail = "工作流已取消";
+          s.finishedAt = now;
+        }
+      }
+      wfEvent(wf, "workflow.cancelled", "warning", "工作流已取消");
+      return wf;
+    },
+    workflow_gate: ({ workflowId, stepId, chosenTaskId }) => {
+      const wf = mustWf(workflowId);
+      const step = wf.steps.find((s) => s.id === stepId);
+      const chosen = state.tasks.find((t) => t.id === chosenTaskId);
+      step.status = "done";
+      step.detail = `选定「${chosen?.title ?? `任务 #${chosenTaskId}`}」`;
+      step.outcome = JSON.stringify({ chosenTask: chosenTaskId, chosenTitle: chosen?.title ?? "" });
+      step.finishedAt = now;
+      wfEvent(wf, "workflow.step_done", "info", `评审完成：选定「${chosen?.title}」，其余方案保持原样`);
+      wfTick(workflowId);
+      return wf;
+    },
+    workflow_retry: ({ id }) => {
+      const wf = mustWf(id);
+      for (const s of wf.steps) {
+        if (["failed", "skipped"].includes(s.status)) {
+          Object.assign(s, {
+            status: "pending", taskId: null, sessionId: null, outcome: null,
+            detail: null, failure: null, startedAt: null, finishedAt: null,
+          });
+        }
+      }
+      wf.status = "running";
+      wf.detail = "重跑失败步骤";
+      wfEvent(wf, "workflow.started", "info", "重跑失败步骤");
+      wfTick(id);
+      return wf;
+    },
     chat_sessions: () => state.sessions,
     chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],
     chat_live: () => state.live.map((l) => ({ ...l, nodeId: "local" })),
@@ -572,6 +715,106 @@ const MOCK = () => {
       return null;
     },
     chat_stop: () => null,
+  };
+  // 工作流的模拟引擎：测试通过 wfTick 推进，wfFailNext 注入一次失败
+  const mustWf = (id) => {
+    const wf = state.workflows.find((w) => w.id === id);
+    if (!wf) throw new Error(`工作流不存在：#${id}`);
+    return wf;
+  };
+  const wfEvent = (wf, kind, level, message) => {
+    state.events.unshift({
+      id: state.events.length + 1, ts: now, kind, level,
+      source: wf.name, message, link: `#/workflows?w=${wf.id}`,
+    });
+  };
+  const wfTick = (id) => {
+    const wf = mustWf(id);
+    const fail = state.wfFailNext.find((f) => f.wfId === id);
+    // 0) 刚跑起来的步骤在这里挂上任务 / 会话
+    for (const s of wf.steps.filter((x) => x.status === "running")) {
+      if (s.kind === "task" && s.taskId == null) {
+        const task = makeTask({
+          title: `${wf.name} · ${s.name}`, repo: wf.repo, issueNumber: wf.issueNumber, issueUrl: null,
+          status: "running", nodeId: s.nodeId, adapter: s.adapter, workdir: s.workdir,
+          branch: `${wf.issueNumber != null ? `agent/issue-${wf.issueNumber}` : "agent/wf"}-w${s.seq}`,
+        });
+        state.tasks.unshift(task);
+        s.taskId = task.id;
+        wfEvent(wf, "workflow.step_started", "info", `「${s.name}」开始`);
+      } else if (s.kind === "session" && s.sessionId == null) {
+        s.sessionId = 900 + s.id;
+        wfEvent(wf, "workflow.step_started", "info", `「${s.name}」开始`);
+      }
+    }
+    // 1) 跑着的出结果（注入了失败的这一步算失败）
+    for (const s of wf.steps.filter((x) => x.status === "running")) {
+      s.finishedAt = now;
+      if (fail && fail.seq === s.seq) {
+        s.status = "failed";
+        s.failure = "这一轮没有完成：Agent 没有返回任何内容";
+        wfEvent(wf, "workflow.step_failed", "warning", `「${s.name}」失败`);
+      } else if (s.kind === "task") {
+        const task = state.tasks.find((t) => t.id === s.taskId);
+        Object.assign(task, { status: "changes", detail: "2 个文件有改动，等你确认" });
+        s.status = "done";
+        s.outcome = JSON.stringify({ taskId: task.id, branch: task.branch, prUrl: null, taskStatus: "changes" });
+        s.detail = task.detail;
+        wfEvent(wf, "workflow.step_done", "info", `「${s.name}」完成`);
+      } else {
+        s.status = "done";
+        s.outcome = `${s.name} 的结论：改动合理，建议补测试。`;
+        wfEvent(wf, "workflow.step_done", "info", `「${s.name}」完成`);
+      }
+    }
+    if (fail) state.wfFailNext = state.wfFailNext.filter((f) => f !== fail);
+    // 2) 硬依赖断掉的级联跳过；依赖满足的接着启动（一有变动就再看一遍）
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const s of wf.steps.filter((x) => x.status === "pending")) {
+        const depState = (d) => wf.steps.find((x) => x.seq === Number(d.replace("?", "")))?.status;
+        if (s.dependsOn.some((d) => !d.startsWith("?") && ["failed", "skipped"].includes(depState(d)))) {
+          s.status = "skipped";
+          s.detail = "上游失败，跳过";
+          s.finishedAt = now;
+          wfEvent(wf, "workflow.step_skipped", "warning", `「${s.name}」的上游失败，跳过`);
+          changed = true;
+          continue;
+        }
+        const ready = s.dependsOn.every(
+          (d) => depState(d) === "done" || (d.startsWith("?") && ["failed", "skipped"].includes(depState(d))),
+        );
+        if (ready) {
+          s.status = s.kind === "gate" ? "waiting" : "running";
+          s.startedAt = now;
+          if (s.kind === "gate") wfEvent(wf, "workflow.gate", "warning", `「${s.name}」等你决策`);
+          changed = true;
+        }
+      }
+    }
+    // 3) 工作流整体状态
+    const terminal = (st) => ["done", "failed", "skipped"].includes(st);
+    if (wf.steps.every((s) => terminal(s.status))) {
+      wf.status = wf.steps.some((s) => s.status === "done") ? "done" : "failed";
+      wf.detail =
+        wf.status === "done" && wf.steps.some((s) => s.status !== "done")
+          ? "完成（有步骤失败或被跳过，详情在下面）"
+          : wf.status === "done"
+            ? null
+            : "所有步骤都没能完成";
+      wfEvent(wf, wf.status === "done" ? "workflow.done" : "workflow.failed",
+        wf.status === "done" ? "info" : "warning",
+        wf.status === "done" ? "全部步骤完成" : "所有步骤都没能完成");
+    } else if (wf.steps.some((s) => s.status === "waiting")) {
+      wf.status = "waiting";
+      wf.detail = "等你在候选方案里选一个";
+    } else {
+      const done = wf.steps.filter((s) => s.status === "done").length;
+      wf.status = "running";
+      wf.detail = `进行中：${done}/${wf.steps.length} 步完成`;
+    }
+    wf.updatedAt = now;
   };
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
   window.__TAURI_INTERNALS__ = {
@@ -676,6 +919,10 @@ const MOCK = () => {
         "src/app/new.ts": "--- /dev/null\n+++ b/src/app/new.ts\n@@ -0,0 +1,1 @@\n+export const fresh = 1;\n",
       };
     },
+    /** 模拟引擎推进一步：跑着的出结果、依赖满足的接着启动 */
+    wfTick: (id) => wfTick(id),
+    /** 给某一步注入一次失败（下一次 wfTick 生效） */
+    wfFail: (wfId, seq) => state.wfFailNext.push({ wfId, seq }),
     lastCall: (cmd) => [...state.calls].reverse().find((c) => c.cmd === cmd) ?? null,
     listenerCount: () => [...listeners.values()].filter((l) => l.event === "chat-event").length,
     callCount: () => state.calls.length,

@@ -36,7 +36,7 @@
 | 任务流水线 | 已实现 | 独立工作树 → 看 diff → 确认后提交 / 推送 / 开 PR → 跟踪检查 → 合并 |
 | 部署与守护 | 已实现，**未用真实账号验证** | Vercel / Cloudflare Pages / Workers 的部署跟踪、日志、发起、重做、取消、升为生产、回滚、健康检查、自动建修复任务 |
 | 可观测 | 部分 | 仪表盘、活动记录、近 24 小时花费；按机器 / Agent / 项目的成本分析未做 |
-| 工作流编排 | 未开始 | 页面上只有模板预览 |
+| 工作流编排 | 已实现 | 三个模板（修 Issue / PR 审查 / 竞争模式）跑在有向无环图上：并行步骤、依赖解锁、软依赖、人工评审门、失败重跑、取消 |
 | 桌面 Agent 深度控制 | 未开始 | 只做发现与展示 |
 
 ---
@@ -63,7 +63,7 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 | **Session** | 与某个 Agent 的一次交互上下文（消息流、token 用量）；任务流水线为任务开的会话归属那个任务 |
 | **DeployTarget** | 登记进来的一个平台项目：Vercel 项目、Cloudflare Pages 项目、Worker。带生产分支、生产地址、健康检查规则、守护开关 |
 | **Deployment** | 平台上的一次部署，拉回来后归成同一种样子：`queued` / `building` / `ready` / `error` / `canceled` / `other` |
-| **Workflow** | 多 Agent 编排（规划中，见 §5.6） |
+| **Workflow** | 一次多 Agent 协同的运行（见 §5.6）：步骤是一张有向无环图，`task` 步骤走任务流水线，`session` 步骤把上游产物拼进提示词开一段纯会话，`gate` 步骤停下来等人决策 |
 
 ---
 
@@ -176,15 +176,24 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 
 规划中：看板视图、转派其他 Agent、暂停、定时与 Webhook 触发。
 
-### 5.6 工作流编排（Workflows）— 未开始
+### 5.6 工作流编排（Workflows）— 已实现
 
-页面上现在只有四个模板的预览。其中「发布守护流水线」已经不用编排、直接做进了部署页（§5.8），其余三个是规划：
+三个模板建好即用（引擎按步骤的依赖关系推进，每 10 秒对一次账，命令执行完也立刻推一把）：
 
-- **修 Issue 流水线**：`claude-cli 分析修复` → `codex-cli 审查 diff` → `grok-cli 撰写变更说明并评论`
-- **PR 审查流水线**：新 PR → 双 Agent 交叉审查 → 汇总结论
-- **竞争模式**：多 Agent 各自解同一 Issue，人择优 merge
+- **修 Issue 流水线**：`claude-cli 分析修复`（任务步骤，独立工作树）→ `codex-cli 审查 diff`（拿到工作树的改动）→ `grok-cli 撰写变更说明`（拿到改动与审查结论）
+- **PR 审查流水线**：两位 Agent 并行审查同一个 PR（各自拿到 PR 的完整 diff）→ 第三位汇总结论
+- **竞争模式**：两个 Agent 并行解决同一 Issue，各自一条分支（`agent/issue-7-w1` / `-w2`）→ 停在人工评审门，人选定一个方案；一路失败不会堵死评审门（软依赖）
 
-规划中的能力：可视化 DAG 编辑器、变量系统（`{{issue.title}}`、`{{repo}}`…）、运行视图。
+规则：
+
+- 步骤三种：`task` 走任务流水线（做完停在「改动待确认」，往外发仍要人确认）；`session` 纯会话，上游任务的工作树 diff、上游会话的结论自动拼进提示词；`gate` 人工门
+- 依赖写成步骤号的数组，带 `?` 前缀是软依赖（上游失败也算解锁）；硬依赖失败会级联跳过下游
+- 工作流状态：`pending → running → waiting（等人工）/ done / failed / cancelled`；只要有一路做成且所有步骤都有结局就算完成（部分失败会标在详情里）
+- 失败的与被跳过的步骤可以整批重跑：任务步骤建**新任务**，旧的失败记录留在任务页；取消会把正在跑的任务与会话一并停掉
+- 会话步骤的完成判定与任务流水线一致：会话不在运行列表里且最后一条是 Agent 回答（system 结尾算失败）
+- 一次运行里所有步骤共用一台机器，每步可以选不同的 Agent；模板建议的 Agent 建流时可以逐个改
+
+规划中：按步骤指定不同机器、可视化 DAG 编辑器、变量系统（`{{issue.title}}`…）、「新 PR 自动触发审查」。
 
 ### 5.7 GitHub 集成（GitHub）— 已实现
 
@@ -248,13 +257,13 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 
 平台各自的回滚机制、健康检查的通行做法、守护闭环怎么设计，出处见 [research/deploy-observability.md](research/deploy-observability.md)。
 
-### 5.9 协同机制（Collaboration）— 未开始
+### 5.9 协同机制（Collaboration）— 编排模式与竞争模式已实现（见 §5.6）
 
-三种协同模式，按需组合（依赖 §5.6 的工作流）：
+三种协同模式，按需组合：
 
-1. **编排模式（同步）**：工作流引擎按 DAG 调度，Agent 产出直接作为下游输入
-2. **GitHub 介质模式（异步）**：Agent A 完成后在 Issue / PR 留下结构化评论，监听该仓库的 Agent B 接续处理 —— 跨机器最稳妥，全程留痕
-3. **竞争模式**：N 个 Agent 并行解同一任务，控制端汇总对比，人选最优
+1. **编排模式（同步）**：已实现——工作流引擎按 DAG 调度，Agent 产出直接作为下游输入
+2. **GitHub 介质模式（异步）**：Agent A 完成后在 Issue / PR 留下结构化评论，监听该仓库的 Agent B 接续处理 —— 跨机器最稳妥，全程留痕。未开始
+3. **竞争模式**：已实现——N 个 Agent 并行解同一任务，人工评审择优
 
 ### 5.10 可观测性（Activity & Analytics）— 部分
 
@@ -309,11 +318,15 @@ deploy_targets(id, provider, name, platform_id, scope, url, repo, repo_id, git_t
 deployments(id, target_id, provider, project, env, state, raw_state, url, inspector_url,
             branch, commit_sha, commit_message, author, created_ms, building_ms, ready_ms,
             error_code, error_message, rollback_ok, current, guarded, health, task_id, updated_at)
+workflows(id, name, template, repo, issue_number, issue_url, issue_title, pr_number,
+          instructions, status, detail, created_at, updated_at)
+workflow_steps(id, workflow_id, seq, name, kind, depends_on, config, status,
+               task_id, session_id, outcome, detail, failure, started_at, finished_at)
 ```
 
 凭据（GitHub PAT、中继令牌、Vercel / Cloudflare 令牌、Deploy Hook 地址、与各台机器配对的密钥）都在系统钥匙串里。
 
-规划中尚未建表：`workflows`、`workflow_runs`、按 Agent / 机器 / 项目的用量汇总。
+规划中尚未建表：按 Agent / 机器 / 项目的用量汇总。
 
 ---
 
@@ -345,7 +358,7 @@ deployments(id, target_id, provider, project, env, state, raw_state, url, inspec
 |---|---|---|
 | **M1 单机版** | 本机 Agent 发现；CLI Agent 托管会话；GitHub PAT，Issue → 任务 → PR 全流程 | 已完成 |
 | **M2 多机** | agentd + 配对 + 中继 / 直连；机器监控；远程会话；安装脚本与发布 | 已完成 |
-| **M3 协同** | 部署跟踪与守护（已完成）；工作流 DAG 编辑器与运行时；GitHub 介质异步协同；竞争模式；Webhook 触发 | 进行中 |
+| **M3 协同** | 部署跟踪与守护（已完成）；工作流 DAG 编排与运行时（已完成：并行、依赖、软依赖、人工门、重跑）；GitHub 介质异步协同；Webhook 触发 | 进行中 |
 | **M4 深水区** | 主动部署与回滚、发布守护闭环（已完成）；桌面 Agent 深度控制；用量成本分析；自动化规则引擎；自更新 | 进行中 |
 
 ---

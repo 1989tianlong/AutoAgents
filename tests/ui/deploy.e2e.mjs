@@ -380,7 +380,7 @@ await page.getByRole("heading", { name: "升级依赖" }).waitFor();
 check("从活动跳到修复任务", page.url().includes("/tasks?t=3"));
 await page.evaluate(() => { location.hash = "#/workflows"; });
 await page.getByRole("heading", { name: "工作流", exact: true }).waitFor();
-check("发布守护标成已上线，其余仍是规划中", (await page.getByRole("link", { name: "已上线 · 去部署页 →" }).count()) === 1 && (await page.locator("main span", { hasText: /^规划中$/ }).count()) === 3);
+check("发布守护标成已上线，其余三个模板都能建流", (await page.getByRole("link", { name: "已上线 · 去部署页 →" }).count()) === 1 && (await page.getByRole("button", { name: "用这个模板" }).count()) === 3);
 await page.getByRole("link", { name: "已上线 · 去部署页 →" }).click();
 await page.getByRole("heading", { name: "部署", exact: true }).waitFor();
 check("点了就到部署页", page.url().includes("/deploy"));

@@ -11,6 +11,7 @@ mod remote;
 mod secrets;
 mod tasks;
 mod usage;
+mod workflow;
 
 #[cfg(all(test, unix))]
 mod testutil;
@@ -135,9 +136,10 @@ pub fn run() {
             app.manage(state.clone());
             // 连上配对过的机器、开始跟踪中继（都在后台，不拖慢启动）
             state.remote.start_all();
-            // 接着跟踪各个任务的 PR，以及各个项目的部署
+            // 接着跟踪各个任务的 PR、各个项目的部署，以及工作流的推进
             pipeline::start_polling(state.clone());
             deploy::start_polling(state.clone());
+            workflow::start_polling(state.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -155,6 +157,15 @@ pub fn run() {
             tasks::task_create_manual,
             tasks::task_set_status,
             tasks::task_delete,
+            // 工作流编排
+            workflow::workflow_templates,
+            workflow::workflow_create,
+            workflow::workflow_list,
+            workflow::workflow_get,
+            workflow::workflow_start,
+            workflow::workflow_cancel,
+            workflow::workflow_gate,
+            workflow::workflow_retry,
             // 任务流水线
             pipeline::task_start,
             pipeline::task_submit,
