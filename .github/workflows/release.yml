@@ -1,6 +1,7 @@
 # 打 v* 标签：构建 agentd 与 autoagents-relay（Linux 用静态链接的 musl，拷到哪都能跑），
-# 连同 SHA256SUMS 发到 GitHub Releases。scripts/install-*.sh 就是从这里下载的。
-# 手动触发（workflow_dispatch）只构建、把产物留作 artifact：先空跑一遍看构建过不过，不发 Release。
+# 用构建出来的程序把多机联调走一遍，连同 SHA256SUMS 发到 GitHub Releases。
+# scripts/install-*.sh 就是从这里下载的。
+# 手动触发（workflow_dispatch）只构建、联调、把产物留作 artifact：先空跑一遍看构建过不过，不发 Release。
 name: Release
 
 on:
@@ -71,10 +72,56 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # 发出去之前，拿刚构建出来的两个程序把多机联调走一遍：配对、握手换长期密钥、
+  # 凭密钥重连、转发请求、重启后仍连得上。Linux 的 musl 静态版在原生 Linux 上直接能跑
+  smoke:
+    name: 产物联调 · ${{ matrix.name }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 选出这台机器能直接跑的那一份
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) target=x86_64-unknown-linux-musl ;;
+            Darwin-arm64) target=aarch64-apple-darwin ;;
+            *) echo "这台机器（$(uname -sm)）没有对应的构建" >&2; exit 1 ;;
+          esac
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries-${{ steps.pick.outputs.target }}
+          path: dist
+      - name: 解包
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/autoagents-node-${{ steps.pick.outputs.target }}.tar.gz" -C dist
+          dist/agentd --version
+          dist/autoagents-relay --version
+      - name: 用发布出去的两个程序走一遍多机联调
+        env:
+          AUTOAGENTS_TEST_RELAY: ${{ github.workspace }}/dist/autoagents-relay
+          AUTOAGENTS_TEST_AGENTD: ${{ github.workspace }}/dist/agentd
+        run: cargo test -p autoagents-node --test multimachine
+
   release:
     name: 发布
-    needs: build
-    # 只有打标签才发 Release；从分支手动触发时上面的构建照跑，这里跳过
+    needs: [build, smoke]
+    # 只有打标签才发 Release；从分支手动触发时上面的构建和联调照跑，这里跳过
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     steps:
