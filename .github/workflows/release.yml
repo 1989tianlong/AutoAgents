@@ -1,5 +1,6 @@
-# 打 v* 标签：跑完测试后构建 agentd 与 autoagents-relay（Linux 用静态链接的 musl，拷到哪都能跑），
+# 打 v* 标签：构建 agentd 与 autoagents-relay（Linux 用静态链接的 musl，拷到哪都能跑），
 # 连同 SHA256SUMS 发到 GitHub Releases。scripts/install-*.sh 就是从这里下载的。
+# 手动触发（workflow_dispatch）只构建、把产物留作 artifact：先空跑一遍看构建过不过，不发 Release。
 name: Release
 
 on:
@@ -72,6 +73,8 @@ jobs:
   release:
     name: 发布
     needs: build
+    # 只有打标签才发 Release；从分支手动触发时上面的构建照跑，这里跳过
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
