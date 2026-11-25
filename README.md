@@ -123,6 +123,7 @@ CI（`main` 分支每次推送）：Rust 测试跑 Linux 与 macOS，界面测�
 | `crates/node/` | `agentd`（装在被管理的机器上）与 `autoagents-relay`（中继） |
 | `scripts/` | 两个安装脚本 |
 | `docs/product-design.md` | 产品设计、实现状态与对标 |
+| `docs/research/` | 对标与部署守护的调研笔记（英文原文，带出处） |
 
 ## 路线图
 

@@ -244,7 +244,9 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 - Pages 不能指定分支发起部署，只能把这条分支最近的一次原样重做
 - Worker 构建状态在平台那边的取值文档没有列全，现在是按关键字归类的
 
-规划中：把 `wrangler` 当作 CLI Adapter 由指定机器执行、Webhook 事件代替轮询、部署保护旁路、金丝雀发布、各平台原生的「Fix with agent」之外的其它修复策略。
+规划中：把 `wrangler` 当作 CLI Adapter 由指定机器执行、Webhook 事件代替轮询、部署保护旁路、金丝雀发布。
+
+平台各自的回滚机制、健康检查的通行做法、守护闭环怎么设计，出处见 [research/deploy-observability.md](research/deploy-observability.md)。
 
 ### 5.9 协同机制（Collaboration）— 未开始
 
@@ -365,7 +367,7 @@ deployments(id, target_id, provider, project, env, state, raw_state, url, inspec
 
 ## 11. 对标（2026 年 11 月）
 
-读了 24 个同类产品的公开文档（README、官方文档），下面是最接近的十个。「有 / 没有」指在读到的页面里有没有找到明确说明，没找到不等于一定没有。完整笔记见调研原文。
+读了 24 个同类产品的公开文档（README、官方文档），下面是最接近的十个。「有 / 没有」指在读到的页面里有没有找到明确说明，没找到不等于一定没有。完整笔记与逐条出处见 [research/competitors.md](research/competitors.md)。
 
 | 产品 | 形态 | 管自己的多台机器 | 远程接入 | 端到端加密 | 多种 CLI Agent | Issue → PR | 检查 / 评论交回 Agent | 跟踪部署并修复 |
 |---|---|---|---|---|---|---|---|---|
