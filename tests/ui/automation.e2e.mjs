@@ -133,6 +133,44 @@ await page.getByRole("heading", { name: "决策中心", exact: true }).waitFor()
 // 修 Issue 工作流跑完后它的任务停在「改动待确认」
 check("自动修出来的任务在等确认", await waitFor(async () => (await page.locator("[data-testid=inbox-change]").count()) >= 1));
 
+console.log("\n[7] PR 检查失败：自动让原任务修");
+// 放一个检查红着的 reviewing 任务进来，再建第三种规则
+await page.evaluate(() => {
+  window.__mock.state.tasks.unshift({
+    id: 50, title: "修首页的红检查", source: "issue", repo: "octo/demo", issueNumber: null, issueUrl: null,
+    agentId: null, status: "reviewing", branch: "agent/issue-50", createdAt: "", updatedAt: "",
+    nodeId: "local", adapter: "claude-cli", model: null, workdir: "/Users/tester/code/demo", worktree: null,
+    baseBranch: "main", baseSha: "aaa", headSha: "fff50", sessionId: 77, prNumber: 105,
+    prUrl: "https://github.com/octo/demo/pull/105", detail: "PR #105 等审查：1 项失败", failure: null,
+    instructions: null, autoPr: true,
+    checks: [{ name: "build", state: "failure", url: "https://github.com/octo/demo/actions/runs/9" }],
+  });
+});
+await page.goto("http://localhost:1430/#/workflows");
+await page.getByRole("heading", { name: "自动化规则", exact: true }).waitFor();
+await page.getByRole("button", { name: "＋ 建规则" }).click();
+await page.getByRole("heading", { name: "新建自动化规则" }).waitFor();
+await page.locator('input[name="rule-kind"]').nth(2).check();
+check("检查失败规则说明不用选机器", (await page.getByText("机器与 Agent 都沿用任务自己的", { exact: false }).count()) >= 1);
+await page.getByTestId("rule-name").fill("红检查自动修");
+await page.getByTestId("rule-repo").fill("octo/demo");
+await page.getByTestId("rule-create-submit").click();
+await waitFor(async () => (await dialog().count()) === 0);
+check("规则卡写着「自动修检查」", await waitFor(async () =>
+  (await ruleCard("红检查自动修").getByText(/自动修检查/).count()) >= 1));
+check("红检查的任务进入修复中", await page.evaluate(() =>
+  window.__mock.state.tasks.find((t) => t.id === 50).status === "running"
+  && window.__mock.state.tasks.find((t) => t.id === 50).detail.includes("修复")));
+check("触发记录按任务+提交去重", await page.evaluate(() =>
+  window.__mock.state.ruleRuns.some((x) => x.key === "check:50:fff50" && x.workflowId == null)));
+check("活动流里有自动修的记录", await page.evaluate(() =>
+  window.__mock.state.events.some((e) => e.kind === "automation.triggered" && e.message.includes("检查红了"))));
+// 再扫不重复修同一个提交
+await page.getByRole("button", { name: "立即检查" }).click();
+await sleep(200);
+check("同一个提交不重复修", await page.evaluate(() =>
+  window.__mock.state.ruleRuns.filter((x) => x.key === "check:50:fff50").length === 1));
+
 const failed = results.filter((r) => !r).length;
 console.log(`\nautomation.e2e: ${results.length - failed}/${results.length} 项通过${failed ? "" : "，全绿"}${pageErrors.length ? `；页面报错 ${pageErrors.length} 条` : ""}`);
 if (pageErrors.length) console.log(pageErrors.slice(0, 5).join("\n"));

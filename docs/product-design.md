@@ -269,7 +269,7 @@ Deployment（生产部署失败 / 健康不过）──守护──▶ 修复任
 1. **成功** → 访问「生产地址 + 检查路径」，返回 2xx（设了期望内容的话还要包含它）才算健康。超时算不通过；连不上、或者被访问保护挡住（401 / 403）记为「没法判断」，不算失败
 2. **构建失败**，或者**健康检查不通过** → 取构建日志，建一个修复任务，并挂到那次部署上
 
-建修复任务要同时满足：项目关联了 GitHub 仓库、开着「生产出问题时自动建修复任务」、这个项目 24 小时内自动建的不到三次。修复任务沿用上次处理这个仓库的机器、Agent 和仓库位置，在那次部署的分支上改；这个仓库还没跑过任务的话，任务建好了但停在「待启动」，由你选机器后启动。改完仍然走任务流水线，要你确认才发 PR。
+建修复任务要同时满足：项目关联了 GitHub 仓库、开着「生产出问题时自动建修复任务」、这个项目 24 小时内自动建的不到三次。修复任务沿用上次处理这个仓库的机器、Agent 和仓库位置，在那次部署的分支上改；这个仓库还没跑过任务的话，任务建好了但停在「待启动」，由你选机器后启动。改完走任务流水线，默认要你确认才发 PR；项目设置里可以开「修完直接开 PR」（`deploy_targets.auto_pr`），验收就变成在决策中心点合并。
 
 每一步都进活动记录：部署成功 / 失败、健康检查、建了修复任务、守护为什么没建（没开自动修复、次数用完、没有关联仓库）。
 
@@ -340,7 +340,7 @@ nodes(id, name, relay_url, addr, fingerprint, info, created_at)      -- 配对�
 settings(key, value)                                                  -- 令牌类不在这里
 events(id, ts, kind, level, source, message, link)                    -- 统一事件流
 deploy_targets(id, provider, name, platform_id, scope, url, repo, repo_id, git_type, branch,
-               framework, prod_requires_approval, auto_fix, health_path, health_contains,
+               framework, prod_requires_approval, auto_fix, auto_pr, health_path, health_contains,
                has_hook, created_at, updated_at)
 deployments(id, target_id, provider, project, env, state, raw_state, url, inspector_url,
             branch, commit_sha, commit_message, author, created_ms, building_ms, ready_ms,

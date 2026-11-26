@@ -406,6 +406,8 @@ export interface DeployTarget {
   prodRequiresApproval: boolean;
   /** 生产部署出问题时自动建修复任务 */
   autoFix: boolean;
+  /** 守护建的修复任务修完直接提交开 PR */
+  autoPr: boolean;
   healthPath: string;
   healthContains: string | null;
   /** Workers：存了 Deploy Hook 的地址 */

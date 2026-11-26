@@ -1,6 +1,6 @@
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import type { SVGProps } from "react";
+import { useEffect, useRef, type SVGProps } from "react";
 import { getAppInfo, inboxList } from "../lib/api";
 
 type IconProps = SVGProps<SVGSVGElement>;
@@ -118,6 +118,29 @@ export default function Sidebar() {
     (inbox.data?.changes.length ?? 0) +
     (inbox.data?.starts.length ?? 0) +
     (inbox.data?.reviews.length ?? 0);
+  // 新的待决策来了就发一条系统通知（不用一直盯着应用）。第一次拿到底数不打扰
+  const notified = useRef<number | null>(null);
+  useEffect(() => {
+    if (inbox.data == null) return;
+    const last = notified.current;
+    notified.current = pending;
+    if (last != null && pending > last) {
+      void (async () => {
+        try {
+          const plugin = await import("@tauri-apps/plugin-notification");
+          if (!(await plugin.isPermissionGranted())) {
+            if ((await plugin.requestPermission()) !== "granted") return;
+          }
+          plugin.sendNotification({
+            title: "AutoAgents 等你决策",
+            body: `新增了 ${pending - last} 件事等你拍板（评审门 / 改动确认 / PR 验收）`,
+          });
+        } catch {
+          // 拿不到通知权限（或测试环境里没有插件）：角标还在，不影响
+        }
+      })();
+    }
+  }, [pending, inbox.data]);
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-slate-800/80 bg-slate-900/40">
       <div className="flex items-center gap-3 px-5 py-5">

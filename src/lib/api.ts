@@ -242,6 +242,7 @@ export const deployTargetUpdate = (
     url?: string | null;
     prodRequiresApproval?: boolean;
     autoFix?: boolean;
+    autoPr?: boolean;
     healthPath?: string | null;
     healthContains?: string | null;
     hookUrl?: string | null;

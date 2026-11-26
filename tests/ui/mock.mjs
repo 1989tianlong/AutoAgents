@@ -108,7 +108,7 @@ const MOCK = () => {
   // 部署：一个 Vercel 项目、一个 Cloudflare Pages 项目
   const target = (fields) => ({
     id: 0, provider: "vercel", name: "", platformId: "", scope: "team_a", url: null, repo: null, repoId: null, gitType: "github",
-    branch: "main", framework: null, prodRequiresApproval: true, autoFix: true, healthPath: "/", healthContains: null,
+    branch: "main", framework: null, prodRequiresApproval: true, autoFix: true, autoPr: false, healthPath: "/", healthContains: null,
     hasHook: false, createdAt: now, updatedAt: now, ...fields,
   });
   state.deploy.targets.push(
@@ -708,8 +708,10 @@ const MOCK = () => {
       if (args.kind === "issue-label") {
         if (!args.label?.trim()) throw new Error("填上要盯的标签（Issue 打上它就自动开工）");
         template = args.template ?? "issue-fix";
+      } else if (args.kind === "pr-check-failed") {
+        template = "ci-fix";
       } else if (args.kind !== "new-pr") {
-        throw new Error("规则类型只有 issue-label（Issue 打标签）和 new-pr（新 PR）");
+        throw new Error("规则类型只有 issue-label（Issue 打标签）、new-pr（新 PR）和 pr-check-failed（检查失败自动修）");
       }
       const rule = {
         id: state.rules.length + 1, name, kind: args.kind, repo, label: args.label?.trim() ?? "",
@@ -735,7 +737,29 @@ const MOCK = () => {
     // 同一个键不重复触发；PR 审查跑完了就把结论「贴回」
     automation_scan: () => {
       let triggered = 0;
-      for (const rule of state.rules.filter((r) => r.enabled)) {
+      // 检查失败规则：任务流水线盯着的 PR 检查红了就让原任务修（按任务+提交去重）
+      for (const rule of state.rules.filter((r) => r.enabled && r.kind === "pr-check-failed")) {
+        for (const t of state.tasks.filter(
+          (x) => x.status === "reviewing" && x.repo === rule.repo && x.prNumber != null
+            && (x.checks ?? []).some((c) => c.state === "failure") && x.headSha,
+        )) {
+          const key = `check:${t.id}:${t.headSha}`;
+          if (state.ruleRuns.some((x) => x.ruleId === rule.id && x.key === key)) continue;
+          handlers.task_fix({ id: t.id });
+          state.ruleRuns.unshift({
+            id: state.ruleRuns.length + 1, ruleId: rule.id, ruleName: rule.name,
+            key, workflowId: null, posted: false, createdAt: now,
+          });
+          state.events.unshift({
+            id: state.events.length + 1, ts: now, kind: "automation.triggered", level: "info",
+            source: rule.name,
+            message: `PR #${t.prNumber} 的检查红了，已让原来那个 Agent 修（任务 #${t.id}）`,
+            link: `#/tasks?t=${t.id}`,
+          });
+          triggered += 1;
+        }
+      }
+      for (const rule of state.rules.filter((r) => r.enabled && r.kind !== "pr-check-failed")) {
         const key = rule.kind === "issue-label" ? "issue:9" : "pr:12";
         if (state.ruleRuns.some((x) => x.ruleId === rule.id && x.key === key)) continue;
         const args =

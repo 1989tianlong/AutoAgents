@@ -205,12 +205,14 @@ function WorkflowCard({ wf }: { wf: Workflow }) {
 const RULE_KIND: Record<string, { label: string; desc: string }> = {
   "issue-label": { label: "Issue 打标签", desc: "Issue 打上标签就自动开工" },
   "new-pr": { label: "新 PR", desc: "来了新 PR 自动交叉审查、结论贴回 PR" },
+  "pr-check-failed": { label: "PR 检查失败", desc: "PR 的检查红了自动让 Agent 修，修完接着推" },
 };
 
 const RULE_TEMPLATE: Record<string, string> = {
   "issue-fix": "修 Issue 流水线",
   race: "竞争模式",
   "pr-review": "PR 审查流水线",
+  "ci-fix": "自动修检查",
 };
 
 function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onClose: () => void }) {
@@ -219,7 +221,7 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
   const [name, setName] = useState("");
   const [repo, setRepo] = useState("");
   const [label, setLabel] = useState("");
-  // 标签规则可选修 Issue 流水线或竞争模式；新 PR 固定走审查
+  // 标签规则可选修 Issue 流水线或竞争模式；新 PR 固定走审查；检查失败不建工作流（直接让原任务修）
   const templateOptions = templates.filter((t) =>
     kind === "issue-label" ? t.id === "issue-fix" || t.id === "race" : t.id === "pr-review",
   );
@@ -250,13 +252,14 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
         kind,
         repo: repo.trim(),
         label: kind === "issue-label" ? label.trim() : null,
-        template: templateId,
+        // 检查失败不建工作流，后端忽略模板；这里传空免得误会
+        template: kind === "pr-check-failed" ? null : templateId,
         adapters: template?.steps.map((s) => adapters[s.name] ?? "") ?? [],
-        model: model.trim() || null,
+        model: kind === "pr-check-failed" ? null : model.trim() || null,
         // 竞争模式停在人工评审门，自动开 PR 会把两个方案都发出去：只在修 Issue 流水线给
         autoPr: kind === "issue-label" && templateId === "issue-fix" && autoPr,
-        nodeId: node,
-        workdir: workdir.trim() || null,
+        nodeId: kind === "pr-check-failed" ? null : node,
+        workdir: kind === "pr-check-failed" ? null : workdir.trim() || null,
       });
       qc.invalidateQueries({ queryKey: ["rules"] });
       // 建完立刻看一眼 GitHub，别等下一轮
@@ -339,39 +342,48 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
             </label>
           </div>
         )}
-        <div className="grid grid-cols-2 gap-3">
-          <label className="block">
-            <span className="text-xs text-slate-400">在哪台机器上做</span>
-            <select value={node} onChange={(e) => setNode(e.currentTarget.value)} className={`${inputClass} mt-1`}>
-              <option value="local">本机</option>
-              {machines.data?.filter((m) => !m.local).map((m) => (
-                <option key={m.id} value={m.id} disabled={!m.online}>
-                  {m.name}{m.online ? "" : "（离线）"}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="block">
-            <span className="text-xs text-slate-400">仓库在机器上的位置（留空沿用这个仓库上次的）</span>
-            <input value={workdir} onChange={(e) => setWorkdir(e.currentTarget.value)} spellCheck={false} placeholder="可选" className={`${inputClass} mt-1 font-mono`} data-testid="rule-workdir" />
-          </label>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <label className="block">
-            <span className="text-xs text-slate-400">模型（留空用 Agent 默认）</span>
-            <input value={model} onChange={(e) => setModel(e.currentTarget.value)} placeholder="可选" className={`${inputClass} mt-1`} />
-          </label>
-          {kind === "issue-label" && templateId === "issue-fix" && (
-            <label className="mt-5 flex items-center gap-2 text-xs text-slate-300">
-              <input type="checkbox" checked={autoPr} onChange={(e) => setAutoPr(e.currentTarget.checked)} data-testid="rule-autopr" />
-              修完直接提交开 PR（验收就是在决策中心看 PR、合并）
-            </label>
-          )}
-        </div>
-        <div>
-          <span className="text-xs text-slate-400">每一步用哪个 Agent</span>
-          <div className="mt-1.5 grid grid-cols-2 gap-2">
-            {template?.steps.map((s) => (
+        {kind === "pr-check-failed" && (
+          <p className="rounded-lg border border-slate-800 bg-slate-900 p-3 text-xs leading-5 text-slate-400">
+            检查红了不另起炉灶：让原来那个任务的 Agent 在同一个会话里继续修，修完照旧走它自己的收尾
+            （开着「直接开 PR」的任务会自动推上去，检查再红会再修，每条规则一天最多十次）。
+            机器与 Agent 都沿用任务自己的，这里不用选。
+          </p>
+        )}
+        {kind !== "pr-check-failed" && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-xs text-slate-400">在哪台机器上做</span>
+                <select value={node} onChange={(e) => setNode(e.currentTarget.value)} className={`${inputClass} mt-1`}>
+                  <option value="local">本机</option>
+                  {machines.data?.filter((m) => !m.local).map((m) => (
+                    <option key={m.id} value={m.id} disabled={!m.online}>
+                      {m.name}{m.online ? "" : "（离线）"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-xs text-slate-400">仓库在机器上的位置（留空沿用这个仓库上次的）</span>
+                <input value={workdir} onChange={(e) => setWorkdir(e.currentTarget.value)} spellCheck={false} placeholder="可选" className={`${inputClass} mt-1 font-mono`} data-testid="rule-workdir" />
+              </label>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-xs text-slate-400">模型（留空用 Agent 默认）</span>
+                <input value={model} onChange={(e) => setModel(e.currentTarget.value)} placeholder="可选" className={`${inputClass} mt-1`} />
+              </label>
+              {kind === "issue-label" && templateId === "issue-fix" && (
+                <label className="mt-5 flex items-center gap-2 text-xs text-slate-300">
+                  <input type="checkbox" checked={autoPr} onChange={(e) => setAutoPr(e.currentTarget.checked)} data-testid="rule-autopr" />
+                  修完直接提交开 PR（验收就是在决策中心看 PR、合并）
+                </label>
+              )}
+            </div>
+            <div>
+              <span className="text-xs text-slate-400">每一步用哪个 Agent</span>
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                {template?.steps.map((s) => (
               <label key={s.name} className="flex items-center gap-2 text-xs">
                 <span className="w-28 shrink-0 truncate text-slate-300">{s.name}</span>
                 {s.kind === "gate" ? (
@@ -389,8 +401,10 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
                 )}
               </label>
             ))}
-          </div>
-        </div>
+              </div>
+            </div>
+          </>
+        )}
         {error && <p className="text-xs text-rose-400" data-testid="rule-error">{error}</p>}
       </div>
     </Modal>

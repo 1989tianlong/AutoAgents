@@ -159,6 +159,8 @@ pub struct Target {
     pub prod_requires_approval: bool,
     /// 生产部署失败时自动建修复任务
     pub auto_fix: bool,
+    /// 守护建的修复任务修完直接提交开 PR（验收就变成看 PR）
+    pub auto_pr: bool,
     pub health_path: String,
     pub health_contains: Option<String>,
     /// Workers：存了 Deploy Hook 的地址
@@ -168,7 +170,7 @@ pub struct Target {
 }
 
 const TARGET_COLS: &str = "id, provider, name, platform_id, scope, url, repo, repo_id, git_type, branch, framework, \
-     prod_requires_approval, auto_fix, health_path, health_contains, has_hook, created_at, updated_at";
+     prod_requires_approval, auto_fix, auto_pr, health_path, health_contains, has_hook, created_at, updated_at";
 
 fn row_to_target(row: &rusqlite::Row) -> rusqlite::Result<Target> {
     let flag = |i: usize, default: i64| {
@@ -188,14 +190,15 @@ fn row_to_target(row: &rusqlite::Row) -> rusqlite::Result<Target> {
         framework: row.get(10)?,
         prod_requires_approval: flag(11, 1)?,
         auto_fix: flag(12, 1)?,
+        auto_pr: flag(13, 0)?,
         health_path: row
-            .get::<_, Option<String>>(13)?
+            .get::<_, Option<String>>(14)?
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| "/".to_string()),
-        health_contains: row.get(14)?,
-        has_hook: flag(15, 0)?,
-        created_at: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
-        updated_at: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+        health_contains: row.get(15)?,
+        has_hook: flag(16, 0)?,
+        created_at: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+        updated_at: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
     })
 }
 
@@ -225,8 +228,8 @@ fn targets(db: &Connection) -> Result<Vec<Target>, String> {
 fn save_target(db: &Connection, target: &Target) -> Result<(), String> {
     db.execute(
         "UPDATE deploy_targets SET name = ?2, platform_id = ?3, scope = ?4, url = ?5, repo = ?6, repo_id = ?7, git_type = ?8, \
-         branch = ?9, framework = ?10, prod_requires_approval = ?11, auto_fix = ?12, health_path = ?13, health_contains = ?14, \
-         has_hook = ?15, updated_at = datetime('now') WHERE id = ?1",
+         branch = ?9, framework = ?10, prod_requires_approval = ?11, auto_fix = ?12, auto_pr = ?13, health_path = ?14, \
+         health_contains = ?15, has_hook = ?16, updated_at = datetime('now') WHERE id = ?1",
         params![
             target.id,
             target.name,
@@ -240,6 +243,7 @@ fn save_target(db: &Connection, target: &Target) -> Result<(), String> {
             target.framework,
             target.prod_requires_approval as i64,
             target.auto_fix as i64,
+            target.auto_pr as i64,
             target.health_path,
             target.health_contains,
             target.has_hook as i64,
@@ -1352,8 +1356,9 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
     );
     // 上次在哪个机器上、用哪个 Agent 处理过这个仓库：有的话直接开工
     previous_settings(&db, &repo).map(|mut opts| {
-        // 基于出问题的那条分支修
+        // 基于出问题的那条分支修；修完直接开 PR 的话按目标上的开关来
         opts.base_branch = dep.branch.clone();
+        opts.auto_pr = target.auto_pr;
         RepairPlan {
             task_id: task.id,
             opts,
@@ -1895,12 +1900,14 @@ pub async fn add_target(
 }
 
 /// 改目标设置：传了哪项改哪项
+#[allow(clippy::too_many_arguments)]
 pub fn update_target(
     state: &AppState,
     id: i64,
     url: Option<&str>,
     prod_requires_approval: Option<bool>,
     auto_fix: Option<bool>,
+    auto_pr: Option<bool>,
     health_path: Option<&str>,
     health_contains: Option<&str>,
     hook_url: Option<&str>,
@@ -1914,6 +1921,9 @@ pub fn update_target(
     }
     if let Some(flag) = auto_fix {
         target.auto_fix = flag;
+    }
+    if let Some(flag) = auto_pr {
+        target.auto_pr = flag;
     }
     if let Some(path) = health_path.map(str::trim).filter(|path| !path.is_empty()) {
         target.health_path = if path.starts_with('/') {
@@ -2648,6 +2658,7 @@ pub async fn deploy_target_update(
     url: Option<String>,
     prod_requires_approval: Option<bool>,
     auto_fix: Option<bool>,
+    auto_pr: Option<bool>,
     health_path: Option<String>,
     health_contains: Option<String>,
     hook_url: Option<String>,
@@ -2658,6 +2669,7 @@ pub async fn deploy_target_update(
         url.as_deref(),
         prod_requires_approval,
         auto_fix,
+        auto_pr,
         health_path.as_deref(),
         health_contains.as_deref(),
         hook_url.as_deref(),
@@ -3424,6 +3436,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             Some("demo.example.com/api"),
             Some(false),
             Some(false),
+            Some(true),
             Some("health"),
             Some("  pong "),
             None,
@@ -3431,6 +3444,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         .unwrap();
         assert_eq!(updated.url.as_deref(), Some("https://demo.example.com/api"));
         assert!(!updated.prod_requires_approval && !updated.auto_fix);
+        assert!(updated.auto_pr);
         assert_eq!(
             (
                 updated.health_path.as_str(),
@@ -3451,19 +3465,30 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 None,
                 None,
                 None,
+                None,
                 Some("http://insecure/hook")
             )
             .is_err()
         );
         assert!(
-            !update_target(&state, worker.id, None, None, None, None, None, Some(""))
-                .unwrap()
-                .has_hook,
+            !update_target(
+                &state,
+                worker.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("")
+            )
+            .unwrap()
+            .has_hook,
             "清空 Hook"
         );
         assert!(ts.secrets.get(&hook_account(worker.id)).unwrap().is_none());
         assert_eq!(
-            update_target(&state, web.id, None, None, None, None, Some(""), None)
+            update_target(&state, web.id, None, None, None, None, None, Some(""), None)
                 .unwrap()
                 .health_contains,
             None
@@ -3474,6 +3499,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             Some(&fake.site("")),
             Some(true),
             Some(true),
+            None,
             Some("/"),
             None,
             None,
@@ -4048,7 +4074,18 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         };
 
         // 没开自动修复：只提醒，不建任务
-        update_target(&state, off.id, None, None, Some(false), None, None, None).unwrap();
+        update_target(
+            &state,
+            off.id,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         push("second");
         refresh(&state, Some(off.id)).await.unwrap();
         let second = load_deployment(&state.db.lock().unwrap(), "dpl_off_second").unwrap();
@@ -4073,7 +4110,18 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 .unwrap();
             }
         }
-        update_target(&state, off.id, None, None, Some(true), None, None, None).unwrap();
+        update_target(
+            &state,
+            off.id,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         push("third");
         refresh(&state, Some(off.id)).await.unwrap();
         let third = load_deployment(&state.db.lock().unwrap(), "dpl_off_third").unwrap();
@@ -4125,6 +4173,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(check_health(&state, "dpl_ok").await.unwrap(), "ok");
@@ -4155,8 +4204,18 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             fake.call("POST", "/v13/deployments").is_none(),
             "没确认就不该发请求"
         );
-        let gate_off =
-            update_target(&state, web.id, None, Some(false), None, None, None, None).unwrap();
+        let gate_off = update_target(
+            &state,
+            web.id,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!gate_off.prod_requires_approval);
         let dep = trigger(&state, web.id, Some(" main "), None, false)
             .await
@@ -4173,7 +4232,18 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             (dep.env.as_str(), dep.state.as_str(), dep.branch.as_deref())
                 == ("production", "queued", Some("main"))
         );
-        update_target(&state, web.id, None, Some(true), None, None, None, None).unwrap();
+        update_target(
+            &state,
+            web.id,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // 预览分支 + 指定提交：不用确认，不带 target
         let dep = trigger(
@@ -4453,6 +4523,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 None,
                 None,
                 None,
+                None,
                 Some("http://insecure/hook")
             )
             .is_err()
@@ -4462,6 +4533,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         update_target(
             &state,
             worker.id,
+            None,
             None,
             None,
             None,

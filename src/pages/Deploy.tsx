@@ -683,6 +683,7 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
     url: "",
     prodRequiresApproval: true,
     autoFix: true,
+    autoPr: false,
     healthPath: "/",
     healthContains: "",
     hookUrl: "",
@@ -693,16 +694,18 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
       url: target.url ?? "",
       prodRequiresApproval: target.prodRequiresApproval,
       autoFix: target.autoFix,
+      autoPr: target.autoPr,
       healthPath: target.healthPath,
       healthContains: target.healthContains ?? "",
       hookUrl: "",
     });
-  }, [target?.id, target?.url, target?.prodRequiresApproval, target?.autoFix, target?.healthPath, target?.healthContains]);
+  }, [target?.id, target?.url, target?.prodRequiresApproval, target?.autoFix, target?.autoPr, target?.healthPath, target?.healthContains]);
   const dirty =
     !!target &&
     (form.url !== (target.url ?? "") ||
       form.prodRequiresApproval !== target.prodRequiresApproval ||
       form.autoFix !== target.autoFix ||
+      form.autoPr !== target.autoPr ||
       form.healthPath !== target.healthPath ||
       form.healthContains !== (target.healthContains ?? "") ||
       form.hookUrl.trim() !== "");
@@ -712,6 +715,7 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
         url: form.url.trim() || null,
         prodRequiresApproval: form.prodRequiresApproval,
         autoFix: form.autoFix,
+        autoPr: form.autoPr,
         healthPath: form.healthPath.trim() || null,
         healthContains: form.healthContains,
         hookUrl: form.hookUrl.trim() || undefined,
@@ -839,6 +843,14 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
               onChange={(e) => setForm({ ...form, autoFix: e.target.checked })}
             />
             生产出问题时自动建修复任务
+          </label>
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={form.autoPr}
+              onChange={(e) => setForm({ ...form, autoPr: e.target.checked })}
+            />
+            修复任务修完直接提交开 PR（验收在决策中心点合并）
           </label>
           <label className="block text-xs text-slate-500">
             生产地址

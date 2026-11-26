@@ -7,9 +7,10 @@
 //! 一条 Issue / 一个 PR 只自动处理一次（`rule_runs` 去重），一条规则一天最多触发
 //! 十次，标签扫乱了也不会把工作流刷爆。
 
-use crate::{AppState, events, github, nodes, pipeline, workflow};
+use crate::{AppState, events, github, nodes, pipeline, tasks, workflow};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use tauri::State;
 
@@ -295,7 +296,11 @@ fn create_rule(state: &Arc<AppState>, p: Params) -> Result<RuleView, String> {
         "new-pr" => {
             config.template = "pr-review".into();
         }
-        _ => return Err("规则类型只有 issue-label（Issue 打标签）和 new-pr（新 PR）".into()),
+        "pr-check-failed" => {
+            // 不建工作流：检查红了直接让原来那个任务的 Agent 继续修
+            config.template = "ci-fix".into();
+        }
+        _ => return Err("规则类型只有 issue-label（Issue 打标签）、new-pr（新 PR）和 pr-check-failed（检查失败自动修）".into()),
     }
     let db = state.db.lock().unwrap();
     db.execute(
@@ -377,6 +382,7 @@ pub async fn tick(state: &Arc<AppState>) -> usize {
         let outcome = match rule.kind.as_str() {
             "issue-label" => trigger_issues(state, &token, &rule).await,
             "new-pr" => trigger_prs(state, &token, &rule).await,
+            "pr-check-failed" => trigger_check_fixes(state, &rule).await,
             other => Err(format!("不认识的规则类型：{other}")),
         };
         match outcome {
@@ -591,6 +597,73 @@ async fn trigger_prs(state: &Arc<AppState>, token: &str, rule: &Rule) -> Result<
         };
         launch(state, rule, &key, result).await?;
         triggered += 1;
+    }
+    Ok(triggered)
+}
+
+/// PR 的检查红了：直接让原来那个任务的 Agent 在同一个会话里继续修（不建新工作流）。
+/// 按任务 + 推送的头一个提交去重——修完推上来的新提交要是还红，会再修（有每日上限兜底）
+async fn trigger_check_fixes(state: &Arc<AppState>, rule: &Rule) -> Result<usize, String> {
+    // 只扫任务流水线盯着的 PR，不去 GitHub 列全部 PR：别的来源的 PR 归它的作者管
+    let reviewing = tasks::in_status(&state.db.lock().unwrap(), "reviewing")?;
+    let mut triggered = 0;
+    for task in reviewing
+        .iter()
+        .filter(|t| t.repo.as_deref() == Some(rule.repo.as_str()))
+        .filter(|t| t.pr_number.is_some() && t.session_id.is_some())
+    {
+        let red = task
+            .checks
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|c| c["state"] == "failure"));
+        if !red {
+            continue;
+        }
+        let Some(head) = task.head_sha.clone().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let key = format!("check:{}:{}", task.id, head);
+        if !reserve(&state.db.lock().unwrap(), rule, &key)? {
+            continue;
+        }
+        match pipeline::fix(state, task.id).await {
+            Ok(()) => {
+                let db = state.db.lock().unwrap();
+                events::record(
+                    &db,
+                    "automation.triggered",
+                    "info",
+                    &rule.name,
+                    &format!(
+                        "PR #{} 的检查红了，已让原来那个 Agent 修（任务 #{}）",
+                        task.pr_number.unwrap_or_default(),
+                        task.id
+                    ),
+                    Some(&format!("#/tasks?t={}", task.id)),
+                );
+                triggered += 1;
+            }
+            Err(e) => {
+                // 发不出去（上一轮还没停之类）：把键还回去，下一轮再试
+                let db = state.db.lock().unwrap();
+                let _ = db.execute(
+                    "DELETE FROM rule_runs WHERE rule_id = ?1 AND key = ?2",
+                    params![rule.id, &key],
+                );
+                events::record(
+                    &db,
+                    "automation.error",
+                    "warning",
+                    &rule.name,
+                    &format!(
+                        "任务 #{} 的检查红了，但这次没能让 Agent 修，下一轮再试：{e}",
+                        task.id
+                    ),
+                    Some(&format!("#/tasks?t={}", task.id)),
+                );
+            }
+        }
     }
     Ok(triggered)
 }
@@ -1000,6 +1073,83 @@ printf '%s\n' '{{"type":"task_complete"}}'"#
             .query_row("SELECT COUNT(*) FROM rule_runs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(runs, 0, "没占键：配好位置之后同一批 Issue 还能触发");
+    }
+
+    /// PR 的检查红了：自动让原来那个任务的 Agent 修；同一提交不重复修
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn red_checks_get_fixed_automatically() {
+        // 慢一点的 Agent：断言时这一轮还在跑，任务停在「正在修复」
+        let (_gh, ts, _workdir) = rig(vec![(
+            "claude-cli",
+            "sleep 2\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"修好了\"}'",
+        )])
+        .await;
+        make_rule(&ts.state, "pr-check-failed", "", &[]);
+        // 一个 PR 已开、检查红着的任务（带着它自己的会话）
+        let task_id = {
+            let db = ts.state.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO sessions (adapter, title, workdir) VALUES ('claude-cli', '修检查', ?1)",
+                params![_workdir.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            let session = db.last_insert_rowid();
+            db.execute(
+                "INSERT INTO tasks (title, repo, status, session_id, pr_number, head_sha, checks, node_id, adapter, workdir) \
+                 VALUES ('修首页', 'o/r', 'reviewing', ?1, 5, 'abc123', ?2, 'local', 'claude-cli', ?3)",
+                params![
+                    session,
+                    r#"[{"name": "ci", "state": "failure"}, {"name": "lint", "state": "success"}]"#,
+                    _workdir.to_string_lossy().to_string(),
+                ],
+            )
+            .unwrap();
+            db.last_insert_rowid()
+        };
+
+        assert_eq!(tick(&ts.state).await, 1, "红检查触发了一次自动修");
+        let (status, detail): (String, Option<String>) = ts
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, detail FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running", "{detail:?}");
+        // 发给 Agent 的最后一条提示词就是把检查的问题交过去修
+        let prompt: String = ts
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT m.content FROM messages m JOIN tasks t ON t.session_id = m.session_id \
+                 WHERE t.id = ?1 AND m.role = 'user' ORDER BY m.id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(prompt.contains("检查没有通过"), "{prompt}");
+        assert!(event_exists(&ts.state, "检查红了，已让原来那个 Agent 修"));
+        let runs: Vec<String> = ts
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT key FROM rule_runs")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(runs, vec![format!("check:{task_id}:abc123")]);
+
+        // 同一个提交再扫不重复修（任务也已经不在 reviewing 了）
+        assert_eq!(tick(&ts.state).await, 0);
     }
 
     /// 规则的增删改与参数校验；关掉的规则不再触发

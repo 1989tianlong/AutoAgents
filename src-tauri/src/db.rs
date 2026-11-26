@@ -96,6 +96,8 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             prod_requires_approval INTEGER NOT NULL DEFAULT 1,
             -- 生产部署失败时自动建修复任务
             auto_fix               INTEGER NOT NULL DEFAULT 1,
+            -- 守护建的修复任务修完直接提交开 PR
+            auto_pr                INTEGER NOT NULL DEFAULT 0,
             health_path            TEXT NOT NULL DEFAULT '/',
             health_contains        TEXT,
             -- Workers：存了 Deploy Hook 的地址（地址本身在 Keychain）
@@ -232,6 +234,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE tasks ADD COLUMN auto_pr INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tasks ADD COLUMN checks TEXT",
         "ALTER TABLE tasks ADD COLUMN instructions TEXT",
+        "ALTER TABLE deploy_targets ADD COLUMN auto_pr INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = conn.execute(column, []);
     }
