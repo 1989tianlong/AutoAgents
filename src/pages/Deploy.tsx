@@ -684,6 +684,8 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
     prodRequiresApproval: true,
     autoFix: true,
     autoPr: false,
+    autoDeploy: false,
+    autoRollback: false,
     healthPath: "/",
     healthContains: "",
     hookUrl: "",
@@ -695,17 +697,21 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
       prodRequiresApproval: target.prodRequiresApproval,
       autoFix: target.autoFix,
       autoPr: target.autoPr,
+      autoDeploy: target.autoDeploy,
+      autoRollback: target.autoRollback,
       healthPath: target.healthPath,
       healthContains: target.healthContains ?? "",
       hookUrl: "",
     });
-  }, [target?.id, target?.url, target?.prodRequiresApproval, target?.autoFix, target?.autoPr, target?.healthPath, target?.healthContains]);
+  }, [target?.id, target?.url, target?.prodRequiresApproval, target?.autoFix, target?.autoPr, target?.autoDeploy, target?.autoRollback, target?.healthPath, target?.healthContains]);
   const dirty =
     !!target &&
     (form.url !== (target.url ?? "") ||
       form.prodRequiresApproval !== target.prodRequiresApproval ||
       form.autoFix !== target.autoFix ||
       form.autoPr !== target.autoPr ||
+      form.autoDeploy !== target.autoDeploy ||
+      form.autoRollback !== target.autoRollback ||
       form.healthPath !== target.healthPath ||
       form.healthContains !== (target.healthContains ?? "") ||
       form.hookUrl.trim() !== "");
@@ -716,6 +722,8 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
         prodRequiresApproval: form.prodRequiresApproval,
         autoFix: form.autoFix,
         autoPr: form.autoPr,
+        autoDeploy: form.autoDeploy,
+        autoRollback: form.autoRollback,
         healthPath: form.healthPath.trim() || null,
         healthContains: form.healthContains,
         hookUrl: form.hookUrl.trim() || undefined,
@@ -851,6 +859,22 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
               onChange={(e) => setForm({ ...form, autoPr: e.target.checked })}
             />
             修复任务修完直接提交开 PR（验收在决策中心点合并）
+          </label>
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={form.autoDeploy}
+              onChange={(e) => setForm({ ...form, autoDeploy: e.target.checked })}
+            />
+            PR 合并进生产分支后自动发起部署（平台自己已经在部署这个提交就不重复触发）
+          </label>
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={form.autoRollback}
+              onChange={(e) => setForm({ ...form, autoRollback: e.target.checked })}
+            />
+            健康检查没过时自动回滚到最近健康的版本（先止血，修复任务照建）
           </label>
           <label className="block text-xs text-slate-500">
             生产地址

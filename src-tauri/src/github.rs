@@ -103,6 +103,10 @@ pub struct PrState {
     pub merged_at: Option<String>,
     /// PR 头部提交
     pub head_sha: String,
+    /// 合并进目标分支后的提交（合并后才有了；去重「平台是不是已经在部署它」用）
+    pub merge_commit_sha: Option<String>,
+    /// PR 的目标分支（合并进的那条）
+    pub base_branch: String,
     pub html_url: String,
     pub checks: Vec<GhCheck>,
     pub success: usize,
@@ -598,6 +602,8 @@ pub async fn pr_state(
         merged: pr["merged"].as_bool().unwrap_or(false),
         merged_at: so(&pr, "merged_at"),
         head_sha: s(&pr["head"], "sha"),
+        merge_commit_sha: so(&pr, "merge_commit_sha"),
+        base_branch: s(&pr["base"], "ref"),
         html_url: s(&pr, "html_url"),
         ..Default::default()
     };

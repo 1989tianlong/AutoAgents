@@ -155,11 +155,19 @@ check("node_pair 带机器 id 与配对码", await waitFor(async () => {
 }), JSON.stringify(await lastCall("node_pair")));
 check("配对后加入清单", await waitFor(() => card("lab-pc").isVisible()));
 
-console.log("\n[8] Agents 页：按机器分组，可以直接在那台机器上开会话");
+console.log("\n[8] Agents 页：按机器分组，可以直接在那台机器上开会话；桌面 Agent 可以启停");
 await goto("#/agents", "Agents");
 await page.getByRole("heading", { name: "家里的 Mac", exact: true }).waitFor();
 check("按机器分组", await page.getByRole("heading", { name: "本机", exact: true }).isVisible());
-check("列出所有机器上的 Agent", (await page.locator("tbody tr").count()) === 6, `行数=${await page.locator("tbody tr").count()}`);
+// 本机 4 个 CLI + 1 个桌面（ZCode），家里的 Mac 2 个 → 7 行
+check("列出所有机器上的 Agent（含桌面 Agent）", (await page.locator("tbody tr").count()) === 7, `行数=${await page.locator("tbody tr").count()}`);
+const zcode = page.locator("tbody tr", { hasText: "ZCode" });
+check("桌面 Agent 显示「未运行」", await waitFor(async () => (await zcode.locator("[data-testid=desktop-running]").innerText()).includes("未运行")));
+await zcode.locator("[data-testid=desktop-launch]").click();
+check("启动后显示「运行中」", await waitFor(async () => (await zcode.locator("[data-testid=desktop-running]").innerText()).includes("运行中")));
+await zcode.locator("[data-testid=desktop-quit]").click();
+check("停止后回到「未运行」", await waitFor(async () => (await zcode.locator("[data-testid=desktop-running]").innerText()).includes("未运行")));
+// 远程机器的桌面控制拒绝由 Rust 测试覆盖（mock 的远程机器没有桌面 Agent）
 // 在「家里的 Mac」那一组里找，不依赖各组的先后
 const homeGroup = page
   .locator("section")

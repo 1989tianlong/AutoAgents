@@ -953,6 +953,11 @@ pub async fn refresh(state: &Arc<AppState>, task_id: i64) -> Result<Task, String
             .map_err(|e| e.to_string())?;
         }
     }
+    // PR 合并了：开了「合并即部署」的部署目标自动发起部署（网络请求，放在锁外）
+    if pr.merged && !pr.base_branch.is_empty() {
+        let sha = pr.merge_commit_sha.clone().or(Some(pr.head_sha.clone()));
+        crate::deploy::on_pr_merged(state, &repo, &pr.base_branch, sha.as_deref()).await;
+    }
     tasks::load(&state.db.lock().unwrap(), task_id)
 }
 

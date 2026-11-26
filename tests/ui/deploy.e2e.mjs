@@ -288,6 +288,9 @@ await prev.getByRole("button", { name: "复查", exact: true }).click();
 check("恢复后显示正常", await waitFor(async () => (await prev.locator("span", { hasText: /^正常$/ }).count()) === 1));
 
 await page.getByRole("checkbox", { name: "在这里发起生产部署要先确认" }).uncheck();
+// 主动部署与回滚：合并即部署、健康不过先回滚止血
+await page.getByRole("checkbox", { name: "PR 合并进生产分支后自动发起部署" }).check();
+await page.getByRole("checkbox", { name: "健康检查没过时自动回滚到最近健康的版本" }).check();
 await page.getByLabel("健康检查路径").fill("/healthz");
 await page.getByLabel("期望包含").fill("ok");
 await page.getByLabel("生产地址", { exact: true }).fill("https://demo2.example.com");
@@ -295,7 +298,7 @@ await page.getByRole("button", { name: "保存设置" }).click();
 const saved = (await calls("deploy_target_update")).at(-1);
 check(
   "deploy_target_update 带上每一项设置",
-  saved?.id === 1 && saved.prodRequiresApproval === false && saved.autoFix === true && saved.healthPath === "/healthz" && saved.healthContains === "ok" && saved.url === "https://demo2.example.com" && saved.hookUrl === undefined,
+  saved?.id === 1 && saved.prodRequiresApproval === false && saved.autoFix === true && saved.healthPath === "/healthz" && saved.healthContains === "ok" && saved.url === "https://demo2.example.com" && saved.hookUrl === undefined && saved.autoDeploy === true && saved.autoRollback === true,
   JSON.stringify(saved),
 );
 check(
@@ -309,6 +312,22 @@ await deployBtn().click();
 await closeDialog();
 const free = (await lastCall("deploy_trigger"))?.args;
 check("deploy_trigger 不带确认", free?.targetId === 1 && free.confirmed === false, JSON.stringify(free));
+
+// 在决策中心合并 PR：这个仓库的目标开着「合并即部署」，自动发起部署
+await page.goto("http://localhost:1430/#/inbox");
+await page.getByRole("heading", { name: "决策中心", exact: true }).waitFor();
+if (await page.locator("[data-testid=inbox-review]").count()) {
+  await page.locator("[data-testid=inbox-merge]").first().click();
+  check("合并 PR 后自动发起部署（活动流有记录）", await waitFor(() => page.evaluate(() =>
+    window.__mock.state.events.some((e) => e.kind === "deploy.auto" && e.message.includes("自动发起了部署")))));
+} else {
+  check("合并 PR 后自动发起部署（活动流有记录）", false, "决策中心没有待验收的 PR");
+}
+// 回到部署页继续 [9]
+await page.goto("http://localhost:1430/#/deploy");
+await page.getByRole("heading", { name: "部署", exact: true }).waitFor();
+await open("web");
+await row("ship it").waitFor();
 
 console.log("\n[9] Cloudflare Pages");
 await page.evaluate(() => {

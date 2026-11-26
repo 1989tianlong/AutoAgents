@@ -1,10 +1,54 @@
 import { useMemo } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { agentsAll } from "../lib/api";
+import { agentsAll, desktopLaunch, desktopQuit, desktopRestart, desktopStates } from "../lib/api";
 import { CHAT_ADAPTERS } from "../lib/types";
 import type { AgentEntry } from "../lib/types";
 import { Badge, Empty, LevelBadge, PageHeader, StatusDot } from "../components/ui";
+
+/** 桌面 Agent 的进程控制（目前只有本机 macOS 支持） */
+function DesktopControls({ agent }: { agent: AgentEntry }) {
+  const qc = useQueryClient();
+  const states = useQuery({ queryKey: ["desktopStates"], queryFn: desktopStates, refetchInterval: 15000 });
+  const running = (states.data ?? []).find((s) => s.path === agent.path)?.running ?? false;
+  const local = agent.nodeId === "local";
+  const refresh = { onSuccess: () => qc.invalidateQueries({ queryKey: ["desktopStates"] }) };
+  const launch = useMutation({ mutationFn: () => desktopLaunch(agent.nodeId, agent.path, agent.name), ...refresh });
+  const quit = useMutation({ mutationFn: () => desktopQuit(agent.nodeId, agent.path, agent.name), ...refresh });
+  const restart = useMutation({ mutationFn: () => desktopRestart(agent.nodeId, agent.path, agent.name), ...refresh });
+  const busy = launch.isPending || quit.isPending || restart.isPending;
+  const btn =
+    "rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 transition enabled:hover:border-sky-600 enabled:hover:text-white disabled:cursor-not-allowed disabled:opacity-40";
+  const err = [launch.error, quit.error, restart.error].find(Boolean);
+  return (
+    <div className="flex items-center gap-1.5">
+      {!local ? null : (
+        <span data-testid="desktop-running" className={running ? "text-xs text-emerald-400" : "text-xs text-slate-500"}>
+          {running ? "● 运行中" : "○ 未运行"}
+        </span>
+      )}
+      {running ? (
+        <button data-testid="desktop-quit" className={btn} disabled={!local || busy} onClick={() => quit.mutate()}>
+          停止
+        </button>
+      ) : (
+        <button data-testid="desktop-launch" className={btn} disabled={!local || busy} onClick={() => launch.mutate()}>
+          启动
+        </button>
+      )}
+      <button
+        data-testid="desktop-restart"
+        className={btn}
+        disabled={!local || busy || !running}
+        title={local ? undefined : "桌面 Agent 的控制目前只支持本机"}
+        onClick={() => restart.mutate()}
+      >
+        重启
+      </button>
+      {err ? <span className="text-xs text-rose-400">{String(err)}</span> : null}
+    </div>
+  );
+}
 
 export default function Agents() {
   const qc = useQueryClient();
@@ -114,6 +158,9 @@ export default function Agents() {
                               {a.path}
                             </td>
                             <td className="px-4 py-3">
+                              {a.kind === "desktop" ? (
+                                <DesktopControls agent={a} />
+                              ) : (
                               <button
                                 onClick={() =>
                                   chatOk && navigate(`/sessions?adapter=${a.adapter}&node=${a.nodeId}`)
@@ -124,14 +171,13 @@ export default function Agents() {
                                     ? "这台机器不在线"
                                     : chatOk
                                       ? `在「${a.nodeName}」上开启托管会话`
-                                      : a.kind === "desktop"
-                                        ? "桌面 Agent 的深度控制尚未支持"
-                                        : "该 Agent 暂不支持会话"
+                                      : "该 Agent 暂不支持会话"
                                 }
                                 className="rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 transition enabled:hover:border-sky-600 enabled:hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                               >
                                 {chatOk ? "💬 会话" : "会话"}
                               </button>
+                                )}
                             </td>
                           </tr>
                         );

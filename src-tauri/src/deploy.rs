@@ -161,6 +161,10 @@ pub struct Target {
     pub auto_fix: bool,
     /// 守护建的修复任务修完直接提交开 PR（验收就变成看 PR）
     pub auto_pr: bool,
+    /// PR 合并进生产分支后自动发起部署
+    pub auto_deploy: bool,
+    /// 健康检查没过时自动回滚到最近健康的版本
+    pub auto_rollback: bool,
     pub health_path: String,
     pub health_contains: Option<String>,
     /// Workers：存了 Deploy Hook 的地址
@@ -170,7 +174,8 @@ pub struct Target {
 }
 
 const TARGET_COLS: &str = "id, provider, name, platform_id, scope, url, repo, repo_id, git_type, branch, framework, \
-     prod_requires_approval, auto_fix, auto_pr, health_path, health_contains, has_hook, created_at, updated_at";
+     prod_requires_approval, auto_fix, auto_pr, auto_deploy, auto_rollback, health_path, health_contains, has_hook, \
+     created_at, updated_at";
 
 fn row_to_target(row: &rusqlite::Row) -> rusqlite::Result<Target> {
     let flag = |i: usize, default: i64| {
@@ -191,14 +196,16 @@ fn row_to_target(row: &rusqlite::Row) -> rusqlite::Result<Target> {
         prod_requires_approval: flag(11, 1)?,
         auto_fix: flag(12, 1)?,
         auto_pr: flag(13, 0)?,
+        auto_deploy: flag(14, 0)?,
+        auto_rollback: flag(15, 0)?,
         health_path: row
-            .get::<_, Option<String>>(14)?
+            .get::<_, Option<String>>(16)?
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| "/".to_string()),
-        health_contains: row.get(15)?,
-        has_hook: flag(16, 0)?,
-        created_at: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
-        updated_at: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+        health_contains: row.get(17)?,
+        has_hook: flag(18, 0)?,
+        created_at: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+        updated_at: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
     })
 }
 
@@ -228,8 +235,8 @@ fn targets(db: &Connection) -> Result<Vec<Target>, String> {
 fn save_target(db: &Connection, target: &Target) -> Result<(), String> {
     db.execute(
         "UPDATE deploy_targets SET name = ?2, platform_id = ?3, scope = ?4, url = ?5, repo = ?6, repo_id = ?7, git_type = ?8, \
-         branch = ?9, framework = ?10, prod_requires_approval = ?11, auto_fix = ?12, auto_pr = ?13, health_path = ?14, \
-         health_contains = ?15, has_hook = ?16, updated_at = datetime('now') WHERE id = ?1",
+         branch = ?9, framework = ?10, prod_requires_approval = ?11, auto_fix = ?12, auto_pr = ?13, auto_deploy = ?14, \
+         auto_rollback = ?15, health_path = ?16, health_contains = ?17, has_hook = ?18, updated_at = datetime('now') WHERE id = ?1",
         params![
             target.id,
             target.name,
@@ -244,6 +251,8 @@ fn save_target(db: &Connection, target: &Target) -> Result<(), String> {
             target.prod_requires_approval as i64,
             target.auto_fix as i64,
             target.auto_pr as i64,
+            target.auto_deploy as i64,
+            target.auto_rollback as i64,
             target.health_path,
             target.health_contains,
             target.has_hook as i64,
@@ -407,6 +416,8 @@ pub struct DeployStatus {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
+    /// 守护查过的健康结论；「ok」表示我们亲眼见过它健康
+    pub health: Option<String>,
     pub id: String,
     pub created_ms: Option<i64>,
     pub branch: Option<String>,
@@ -1224,6 +1235,8 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
         )
     });
     let mut health = None;
+    // 只有「部署成功但健康没过」才需要回滚：构建失败时线上还是旧版本
+    let mut health_failed = false;
     if production && dep.state == "ready" {
         let url = health_url(target);
         let verdict = match &url {
@@ -1245,6 +1258,7 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
             }
             Health::Fail(reason) => {
                 health = Some(reason.clone());
+                health_failed = true;
                 let checked = url.clone().unwrap_or_default();
                 problem = Some(format!(
                     "部署成功了，但健康检查没通过：{reason}（查的是 {checked}）"
@@ -1258,6 +1272,10 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
             "UPDATE deployments SET health = ?1, guarded = 1 WHERE id = ?2",
             params![health, dep.id],
         );
+    }
+    // 健康没过且开了自动回滚：先止血，修复任务照建（两个开关独立）
+    if health_failed && target.auto_rollback {
+        rollback_to_healthy(state, target, dep).await;
     }
     let reason = problem?;
 
@@ -1364,6 +1382,143 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
             opts,
         }
     })
+}
+
+/// 健康没过时自动回滚：优先回到我们亲眼见过健康的部署，没有这样的候选就回到最近一次成功的；
+/// 什么都没有就只交给修复任务。回滚到的版本要是也坏，守护会对它再查一次、再回滚一次——
+/// 每一步都有事件，修复任务的 24 小时上限也拦着失控。
+async fn rollback_to_healthy(state: &Arc<AppState>, target: &Target, dep: &Deployment) {
+    let items = match history(state, target.id).await {
+        Ok(items) => items,
+        Err(e) => {
+            record(
+                state,
+                "deploy.rollback",
+                "error",
+                &target.name,
+                &format!("健康检查没过，但拿不到可回滚的部署列表：{e}"),
+                &event_link(target.id),
+            );
+            return;
+        }
+    };
+    let candidate = items
+        .iter()
+        .find(|item| item.id != dep.id && item.health.as_deref() == Some("ok"))
+        .or_else(|| items.iter().find(|item| item.id != dep.id));
+    let Some(candidate) = candidate else {
+        record(
+            state,
+            "deploy.rollback",
+            "warning",
+            &target.name,
+            "健康检查没过，但没有可以回滚的部署，先交给修复任务",
+            &event_link(target.id),
+        );
+        return;
+    };
+    let note = candidate
+        .commit_message
+        .clone()
+        .map(|msg| format!("（{msg}）"))
+        .unwrap_or_default();
+    // 回滚完会刷新部署、又走一遍守护：把这一步 box 住，异步递归才有界
+    match Box::pin(rollback(
+        state,
+        target.id,
+        &candidate.id,
+        candidate.version_id.as_deref(),
+    ))
+    .await
+    {
+        Ok(()) => record(
+            state,
+            "deploy.auto",
+            "warning",
+            &target.name,
+            &format!("健康检查没过，先自动回滚止血{note}，修复任务照建"),
+            &event_link(target.id),
+        ),
+        Err(e) => record(
+            state,
+            "deploy.rollback",
+            "error",
+            &target.name,
+            &format!("自动回滚没成功：{e}"),
+            &event_link(target.id),
+        ),
+    }
+}
+
+/// PR 合并进生产分支后：开了「合并即部署」的目标自动发起部署。
+/// 平台自己已经在部署这个提交（连了 Git 的 Vercel / Pages 推上去就会部署）就不重复触发；
+/// 目标没记生产分支的话没法判断这次合并该不该部署，也不触发。
+pub async fn on_pr_merged(state: &Arc<AppState>, repo: &str, branch: &str, sha: Option<&str>) {
+    let all = {
+        let db = state.db.lock().unwrap();
+        targets(&db).unwrap_or_default()
+    };
+    for target in all {
+        if !target.auto_deploy || target.repo.as_deref() != Some(repo) {
+            continue;
+        }
+        let Some(production) = target
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+        else {
+            record(
+                state,
+                "deploy.auto",
+                "warning",
+                &target.name,
+                "PR 合并了，但这个目标没有记生产分支，没法判断该不该自动部署",
+                &event_link(target.id),
+            );
+            continue;
+        };
+        if production != branch {
+            continue;
+        }
+        // 平台自己已经在部署这个提交了吗（连了 Git 的 Vercel / Pages 推上去就部署了）
+        if let Some(sha) = sha.filter(|sha| !sha.is_empty()) {
+            let already = list(state, Some(target.id), Some(50))
+                .unwrap_or_default()
+                .into_iter()
+                .any(|dep| dep.commit_sha.as_deref() == Some(sha));
+            if already {
+                record(
+                    state,
+                    "deploy.auto",
+                    "info",
+                    &target.name,
+                    &format!("PR 合并了，平台已经在部署 {sha}，不重复触发"),
+                    &event_link(target.id),
+                );
+                continue;
+            }
+        }
+        // 开着「合并即部署」就视为这次生产部署已确认
+        match trigger(state, target.id, Some(branch), sha, true).await {
+            Ok(_) => record(
+                state,
+                "deploy.auto",
+                "info",
+                &target.name,
+                &format!("PR 合并进 {branch}，自动发起了部署"),
+                &event_link(target.id),
+            ),
+            Err(e) => record(
+                state,
+                "deploy.auto",
+                "warning",
+                &target.name,
+                &format!("PR 合并了，但自动部署没发出去：{e}"),
+                &event_link(target.id),
+            ),
+        }
+    }
 }
 
 /// 这个仓库最近一次任务用的机器、Agent 与仓库位置
@@ -1908,6 +2063,8 @@ pub fn update_target(
     prod_requires_approval: Option<bool>,
     auto_fix: Option<bool>,
     auto_pr: Option<bool>,
+    auto_deploy: Option<bool>,
+    auto_rollback: Option<bool>,
     health_path: Option<&str>,
     health_contains: Option<&str>,
     hook_url: Option<&str>,
@@ -1924,6 +2081,12 @@ pub fn update_target(
     }
     if let Some(flag) = auto_pr {
         target.auto_pr = flag;
+    }
+    if let Some(flag) = auto_deploy {
+        target.auto_deploy = flag;
+    }
+    if let Some(flag) = auto_rollback {
+        target.auto_rollback = flag;
     }
     if let Some(path) = health_path.map(str::trim).filter(|path| !path.is_empty()) {
         target.health_path = if path.starts_with('/') {
@@ -2420,6 +2583,7 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
                 commit_message: dep.commit_message,
                 current: dep.current,
                 version_id: None,
+                health: dep.health,
             })
             .collect());
     }
@@ -2456,6 +2620,7 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
             let version_id = text(&deployment["versions"][0], "version_id")?;
             let (created_ms, message) = info.get(&version_id).cloned().unwrap_or((None, None));
             Some(HistoryItem {
+                health: None,
                 id: text(deployment, "id")?,
                 created_ms: created_ms
                     .or_else(|| text(deployment, "created_on").and_then(|s| iso_ms(&s))),
@@ -2659,6 +2824,8 @@ pub async fn deploy_target_update(
     prod_requires_approval: Option<bool>,
     auto_fix: Option<bool>,
     auto_pr: Option<bool>,
+    auto_deploy: Option<bool>,
+    auto_rollback: Option<bool>,
     health_path: Option<String>,
     health_contains: Option<String>,
     hook_url: Option<String>,
@@ -2670,6 +2837,8 @@ pub async fn deploy_target_update(
         prod_requires_approval,
         auto_fix,
         auto_pr,
+        auto_deploy,
+        auto_rollback,
         health_path.as_deref(),
         health_contains.as_deref(),
         hook_url.as_deref(),
@@ -2799,6 +2968,8 @@ mod tests {
         vercel: Arc<Mutex<Vec<Value>>>,
         pages: Arc<Mutex<Vec<Value>>>,
         workers: Arc<Mutex<Vec<Value>>>,
+        /// GET /repos/*/pulls/* 的应答（PR 详情）
+        pulls: Arc<Mutex<Value>>,
         seq: Arc<AtomicI64>,
     }
 
@@ -2877,11 +3048,20 @@ mod tests {
         vercel: &Mutex<Vec<Value>>,
         pages: &Mutex<Vec<Value>>,
         workers: &Mutex<Vec<Value>>,
+        pulls: &Mutex<Value>,
         seq: &AtomicI64,
     ) -> (String, &'static str, String) {
         let reply = |status: &'static str, value: &Value| {
             (status.to_string(), "application/json", value.to_string())
         };
+        // GitHub：PR 详情（merged 与否、目标分支、合并提交）
+        if req.method == "GET" && req.path.starts_with("/repos/") && req.path.contains("/pulls/") {
+            let detail = pulls.lock().unwrap().clone();
+            if detail.is_null() {
+                return reply("404 Not Found", &json!({"message": "not found"}));
+            }
+            return reply("200 OK", &detail);
+        }
         let envelope = |result: Value| {
             reply(
                 "200 OK",
@@ -3063,19 +3243,22 @@ mod tests {
     async fn start_fake() -> Fake {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let pulls = Arc::new(Mutex::new(Value::Null));
         let fake = Fake {
             addr,
             calls: Arc::default(),
+            pulls,
             vercel: Arc::default(),
             pages: Arc::default(),
             workers: Arc::default(),
             seq: Arc::new(AtomicI64::new(0)),
         };
-        let (calls, vercel, pages, workers, seq) = (
+        let (calls, vercel, pages, workers, pulls, seq) = (
             Arc::clone(&fake.calls),
             Arc::clone(&fake.vercel),
             Arc::clone(&fake.pages),
             Arc::clone(&fake.workers),
+            Arc::clone(&fake.pulls),
             Arc::clone(&fake.seq),
         );
         tokio::spawn(async move {
@@ -3083,11 +3266,12 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let (calls, vercel, pages, workers, seq) = (
+                let (calls, vercel, pages, workers, pulls, seq) = (
                     Arc::clone(&calls),
                     Arc::clone(&vercel),
                     Arc::clone(&pages),
                     Arc::clone(&workers),
+                    Arc::clone(&pulls),
                     Arc::clone(&seq),
                 );
                 tokio::spawn(async move {
@@ -3097,7 +3281,7 @@ mod tests {
                         req.path.clone(),
                         req.body.clone(),
                     ));
-                    let (status, kind, body) = route(&req, &vercel, &pages, &workers, &seq);
+                    let (status, kind, body) = route(&req, &vercel, &pages, &workers, &pulls, &seq);
                     respond(&mut stream, &status, kind, &body).await;
                 });
             }
@@ -3437,6 +3621,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             Some(false),
             Some(false),
             Some(true),
+            Some(true),
+            Some(true),
             Some("health"),
             Some("  pong "),
             None,
@@ -3444,7 +3630,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         .unwrap();
         assert_eq!(updated.url.as_deref(), Some("https://demo.example.com/api"));
         assert!(!updated.prod_requires_approval && !updated.auto_fix);
-        assert!(updated.auto_pr);
+        assert!(updated.auto_pr && updated.auto_deploy && updated.auto_rollback);
         assert_eq!(
             (
                 updated.health_path.as_str(),
@@ -3466,6 +3652,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 None,
                 None,
                 None,
+                None,
+                None,
                 Some("http://insecure/hook")
             )
             .is_err()
@@ -3480,6 +3668,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 None,
                 None,
                 None,
+                None,
+                None,
                 Some("")
             )
             .unwrap()
@@ -3488,9 +3678,21 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         );
         assert!(ts.secrets.get(&hook_account(worker.id)).unwrap().is_none());
         assert_eq!(
-            update_target(&state, web.id, None, None, None, None, None, Some(""), None)
-                .unwrap()
-                .health_contains,
+            update_target(
+                &state,
+                web.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(""),
+                None
+            )
+            .unwrap()
+            .health_contains,
             None
         );
         update_target(
@@ -3499,6 +3701,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             Some(&fake.site("")),
             Some(true),
             Some(true),
+            None,
+            None,
             None,
             Some("/"),
             None,
@@ -3962,6 +4166,182 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         let _ = bin;
     }
 
+    /// PR 合并进生产分支：开「合并即部署」的目标自动发起部署；别的仓库/别的分支不触发；
+    /// 平台已经在部署这个提交就不重复；pipeline 看到 PR 合并也会走到这里
+    #[tokio::test]
+    async fn merged_pr_triggers_auto_deploy_and_dedupes() {
+        let (fake, state) = rigged(idle()).await;
+        seed(&fake);
+        *fake.pulls.lock().unwrap() = json!({
+            "number": 9, "state": "closed", "merged": true, "merged_at": "2026-11-26T00:00:00Z",
+            "head": {"sha": "head123"}, "base": {"ref": "main"}, "merge_commit_sha": "mrg123",
+            "html_url": "https://github.test/octo/demo/pull/9"
+        });
+        let web = add_target(&state, "vercel", "web", "prj_web", None, None)
+            .await
+            .unwrap();
+        // 开「合并即部署」（参数顺位：url / 生产确认 / 自动修复 / 自动 PR / 合并即部署 / 自动回滚 …）
+        update_target(
+            &state,
+            web.id,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 别的仓库、别的分支：不动
+        on_pr_merged(&state, "octo/other", "main", Some("mrg123")).await;
+        on_pr_merged(&state, "octo/demo", "feature", Some("mrg123")).await;
+        assert!(fake.call("POST", "/v13/deployments").is_none());
+
+        // 合并进 main：自动发起部署，提交指定的是合并提交
+        on_pr_merged(&state, "octo/demo", "main", Some("mrg123")).await;
+        let body = fake.body("POST", "/v13/deployments");
+        assert_eq!(body["gitSource"]["sha"], "mrg123", "{body}");
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, _, message)| kind == "deploy.auto"
+                    && message.contains("自动发起了部署"))
+        );
+
+        // 平台已经在部署这个提交了：不再重复触发
+        let before = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.contains("/v13/deployments"))
+            .count();
+        fake.vercel.lock().unwrap().insert(
+            0,
+            json!({"uid": "dpl_merged", "projectId": "prj_web", "name": "web", "readyState": "READY",
+                   "target": "production", "created": now_ms(), "ready": now_ms(),
+                   "meta": {"githubCommitRef": "main", "githubCommitSha": "mrg123", "githubCommitMessage": "merge pr 9"}}),
+        );
+        refresh(&state, Some(web.id)).await.unwrap();
+        on_pr_merged(&state, "octo/demo", "main", Some("mrg123")).await;
+        let after = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.contains("/v13/deployments"))
+            .count();
+        assert_eq!(before, after, "同一个提交不该重复触发");
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, _, message)| kind == "deploy.auto" && message.contains("不重复触发"))
+        );
+
+        // 集成：任务流水线看到 PR 合并 → 自动部署（决策中心点合并走的是同一条路）。
+        // 换一个新的合并提交：mrg123 平台已经在部署，会被去重拦住
+        fake.pulls.lock().unwrap()["merge_commit_sha"] = json!("mrg999");
+        state.secrets.set("github_pat", "gh-token").unwrap();
+        let task = tasks::create_manual(
+            &state.db.lock().unwrap(),
+            "上线搜索",
+            "octo/demo",
+            "把搜索做了",
+        )
+        .unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "UPDATE tasks SET pr_number = 9, status = 'reviewing' WHERE id = ?1",
+                params![task.id],
+            )
+            .unwrap();
+        }
+        pipeline::refresh(&state, task.id).await.unwrap();
+        let task = tasks::load(&state.db.lock().unwrap(), task.id).unwrap();
+        assert_eq!(task.status, "done");
+        let triggered = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.contains("/v13/deployments"))
+            .count();
+        assert_eq!(triggered, after + 1, "合并之后又发起了一次部署");
+    }
+
+    /// 部署成功但健康没过、目标开着自动回滚：先回到已知健康的部署止血，修复任务照建
+    #[tokio::test]
+    async fn unhealthy_production_rolls_back_and_still_repairs() {
+        let (fake, state) = rigged(idle()).await;
+        seed(&fake);
+        // 先用健康页登记：dpl_ok 过了检查，成了「已知健康」的候选
+        let web = add_target(
+            &state,
+            "vercel",
+            "web",
+            "prj_web",
+            Some(&fake.site("")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            list(&state, Some(web.id), None)
+                .unwrap()
+                .iter()
+                .any(|dep| dep.id == "dpl_ok" && dep.health.as_deref() == Some("ok"))
+        );
+
+        // 生产地址挂了 + 开自动回滚，推一条新部署上来
+        update_target(
+            &state,
+            web.id,
+            Some(&fake.site("/down")),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        fake.vercel.lock().unwrap().insert(
+            0,
+            json!({"uid": "dpl_new_bad", "projectId": "prj_web", "name": "web", "readyState": "READY",
+                   "readySubstate": "PROMOTED", "target": "production", "created": now_ms(), "ready": now_ms(),
+                   "isRollbackCandidate": true,
+                   "meta": {"githubCommitRef": "main", "githubCommitSha": "9999999eee", "githubCommitMessage": "bad ship"}}),
+        );
+        refresh(&state, Some(web.id)).await.unwrap();
+
+        // 回滚到已知健康的 dpl_ok（不是 dpl_prev：它没被我们见过健康）
+        let (path, _) = fake
+            .call("POST", "/rollback/dpl_ok")
+            .expect("应该回滚到 dpl_ok");
+        assert!(path.contains("teamId"), "{path}");
+        let bad = load_deployment(&state.db.lock().unwrap(), "dpl_new_bad").unwrap();
+        assert!(
+            bad.health.as_deref().unwrap().contains("HTTP 500"),
+            "{:?}",
+            bad.health
+        );
+        assert!(bad.task_id.is_some(), "回滚了也照样建修复任务");
+        assert!(
+            events_of(&state)
+                .iter()
+                .any(|(kind, level, message)| kind == "deploy.auto"
+                    && level == "warning"
+                    && message.contains("自动回滚止血"))
+        );
+    }
+
     #[tokio::test]
     async fn health_checks_and_limits_decide_whether_to_start_a_repair() {
         let (fake, state) = rigged(idle()).await;
@@ -4084,6 +4464,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         push("second");
@@ -4116,6 +4498,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             Some(true),
+            None,
+            None,
             None,
             None,
             None,
@@ -4174,6 +4558,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(check_health(&state, "dpl_ok").await.unwrap(), "ok");
@@ -4214,6 +4600,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(!gate_off.prod_requires_approval);
@@ -4237,6 +4625,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             web.id,
             None,
             Some(true),
+            None,
+            None,
             None,
             None,
             None,
@@ -4524,6 +4914,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
                 None,
                 None,
                 None,
+                None,
+                None,
                 Some("http://insecure/hook")
             )
             .is_err()
@@ -4533,6 +4925,8 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
         update_target(
             &state,
             worker.id,
+            None,
+            None,
             None,
             None,
             None,

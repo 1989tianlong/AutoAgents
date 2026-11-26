@@ -125,7 +125,11 @@ pub fn child_path() -> std::ffi::OsString {
 #[cfg(windows)]
 pub fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let names: Vec<String> = std::iter::once(binary.to_string())
-        .chain(["cmd", "exe", "bat"].iter().map(|ext| format!("{binary}.{ext}")))
+        .chain(
+            ["cmd", "exe", "bat"]
+                .iter()
+                .map(|ext| format!("{binary}.{ext}")),
+        )
         .collect();
     dirs.iter().find_map(|d| {
         names.iter().find_map(|name| {
@@ -173,8 +177,9 @@ async fn probe_version(bin: &Path) -> Option<String> {
     }
 }
 
+/// 桌面 Agent 清单（同步、只扫应用目录）：桌面控制要按路径查运行状态用
 #[cfg(target_os = "macos")]
-fn scan_desktop_apps() -> Vec<DiscoveredAgent> {
+pub fn desktop_apps() -> Vec<DiscoveredAgent> {
     let home = home_dir();
     let roots = [PathBuf::from("/Applications"), home.join("Applications")];
     let mut agents = Vec::new();
@@ -188,8 +193,9 @@ fn scan_desktop_apps() -> Vec<DiscoveredAgent> {
                 continue;
             }
             let lower = file_name.to_lowercase();
-            if let Some((_, display, adapter)) =
-                DESKTOP_PATTERNS.iter().find(|(kw, _, _)| lower.contains(kw))
+            if let Some((_, display, adapter)) = DESKTOP_PATTERNS
+                .iter()
+                .find(|(kw, _, _)| lower.contains(kw))
             {
                 let path = entry.path().to_string_lossy().into_owned();
                 // 同一 adapter 或同一路径只保留第一个匹配
@@ -215,7 +221,7 @@ fn scan_desktop_apps() -> Vec<DiscoveredAgent> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn scan_desktop_apps() -> Vec<DiscoveredAgent> {
+pub fn desktop_apps() -> Vec<DiscoveredAgent> {
     Vec::new()
 }
 
@@ -242,7 +248,7 @@ pub async fn discover() -> Vec<DiscoveredAgent> {
         })
         .collect();
     let mut agents = futures_util::future::join_all(probes).await;
-    agents.extend(scan_desktop_apps());
+    agents.extend(desktop_apps());
     agents
 }
 

@@ -2,6 +2,7 @@ mod automation;
 mod chat;
 mod db;
 mod deploy;
+mod desktop;
 mod discovery;
 mod events;
 mod github;
@@ -189,6 +190,10 @@ pub fn run() {
             pipeline::task_diff_file,
             pipeline::repo_clone,
             // 部署
+            desktop::desktop_states,
+            desktop::desktop_launch,
+            desktop::desktop_quit,
+            desktop::desktop_restart,
             deploy::deploy_status,
             deploy::deploy_connect,
             deploy::deploy_disconnect,

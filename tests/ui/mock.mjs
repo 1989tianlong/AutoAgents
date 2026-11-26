@@ -26,6 +26,8 @@ const MOCK = () => {
     events: [],
     /** 任务流水线 */
     tasks: [],
+    /** 本机桌面 Agent 的运行状态（desktop_states 用） */
+    desktop: [{ path: "/Applications/ZCode.app", running: false }],
     taskDiffs: {},
     taskPatches: {},
     /** 为 true 时，下一次刷新把审查中的任务标成已合并 */
@@ -108,7 +110,7 @@ const MOCK = () => {
   // 部署：一个 Vercel 项目、一个 Cloudflare Pages 项目
   const target = (fields) => ({
     id: 0, provider: "vercel", name: "", platformId: "", scope: "team_a", url: null, repo: null, repoId: null, gitType: "github",
-    branch: "main", framework: null, prodRequiresApproval: true, autoFix: true, autoPr: false, healthPath: "/", healthContains: null,
+    branch: "main", framework: null, prodRequiresApproval: true, autoFix: true, autoPr: false, autoDeploy: false, autoRollback: false, healthPath: "/", healthContains: null,
     hasHook: false, createdAt: now, updatedAt: now, ...fields,
   });
   state.deploy.targets.push(
@@ -208,6 +210,10 @@ const MOCK = () => {
     path: `/bin/${adapter}`,
     version: "1.0",
   }));
+  agents.push({
+    id: "local/zcode", name: "ZCode", kind: "desktop", level: "L1", adapter: "zcode",
+    path: "/Applications/ZCode.app", version: null,
+  });
   const models = {
     "claude-cli": {
       adapter: "claude-cli",
@@ -838,7 +844,31 @@ const MOCK = () => {
         id: state.events.length + 1, ts: now, kind: "task.merged", level: "info",
         source: task.title, message: `PR #${task.prNumber} 已合并`, link: `#/tasks?t=${task.id}`,
       });
+      // 合并即部署：这个仓库的目标开着 autoDeploy 的话，自动发起一次部署
+      const target = state.deploy.targets.find((t) => t.repo === task.repo && t.autoDeploy);
+      if (target) {
+        state.events.unshift({
+          id: state.events.length + 1, ts: now, kind: "deploy.auto", level: "info",
+          source: target.name, message: `PR 合并进 main，自动发起了部署`, link: `#/deploy`,
+        });
+      }
       return task;
+    },
+    desktop_states: () => state.desktop,
+    desktop_launch: ({ path }) => {
+      const one = state.desktop.find((d) => d.path === path);
+      if (one) one.running = true;
+      return null;
+    },
+    desktop_quit: ({ path }) => {
+      const one = state.desktop.find((d) => d.path === path);
+      if (one) one.running = false;
+      return null;
+    },
+    desktop_restart: ({ path }) => {
+      const one = state.desktop.find((d) => d.path === path);
+      if (one) one.running = true;
+      return null;
     },
     chat_sessions: () => state.sessions,
     chat_messages: ({ sessionId }) => state.messages.get(sessionId) ?? [],

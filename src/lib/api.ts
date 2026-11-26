@@ -243,6 +243,8 @@ export const deployTargetUpdate = (
     prodRequiresApproval?: boolean;
     autoFix?: boolean;
     autoPr?: boolean;
+    autoDeploy?: boolean;
+    autoRollback?: boolean;
     healthPath?: string | null;
     healthContains?: string | null;
     hookUrl?: string | null;
@@ -361,3 +363,20 @@ export const inboxList = () => invoke<Inbox>("inbox_list");
 
 /** 合并任务的 PR：验收的最后一步，合并后任务自动标完成 */
 export const inboxMergePr = (taskId: number) => invoke<unknown>("inbox_merge_pr", { taskId });
+
+// ---------------------------------------------------------------------------
+// 桌面 Agent 的进程控制（本机 macOS）
+// ---------------------------------------------------------------------------
+
+export type DesktopState = { path: string; running: boolean };
+
+export const desktopStates = () => invoke<DesktopState[]>("desktop_states");
+
+export const desktopLaunch = (nodeId: string, path: string, name: string) =>
+  invoke<void>("desktop_launch", { nodeId, path, name });
+
+export const desktopQuit = (nodeId: string, path: string, name: string) =>
+  invoke<void>("desktop_quit", { nodeId, path, name });
+
+export const desktopRestart = (nodeId: string, path: string, name: string) =>
+  invoke<void>("desktop_restart", { nodeId, path, name });

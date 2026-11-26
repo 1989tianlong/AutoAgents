@@ -408,6 +408,8 @@ export interface DeployTarget {
   autoFix: boolean;
   /** 守护建的修复任务修完直接提交开 PR */
   autoPr: boolean;
+  autoDeploy: boolean;
+  autoRollback: boolean;
   healthPath: string;
   healthContains: string | null;
   /** Workers：存了 Deploy Hook 的地址 */
