@@ -74,6 +74,8 @@ check("每步的 Agent 按模板建议填好", await page.evaluate(() => {
   const sel = document.querySelectorAll("main select");
   return [...sel].some((s) => s.value === "claude-cli");
 }));
+// 第一步单独指定模型（另两步留空，沿用全局）
+await page.getByTestId("step-model-方案 A").fill("opus-plan");
 await dialog().getByRole("button", { name: "创建" }).click();
 await waitFor(async () => (await dialog().count()) === 0);
 check("卡片出现：待启动", (await wfCard("竞争模式").count()) === 1
@@ -83,6 +85,12 @@ const createArgs = await lastCallOf("workflow_create");
 check("建流的参数带上了每步的 Agent", createArgs?.template === "race"
   && createArgs?.repo === "octo/demo" && createArgs?.issueNumber === 7
   && createArgs?.adapters?.[0] === "claude-cli" && createArgs?.adapters?.[1] === "codex-cli");
+check("建流的参数带上了每步单独指定的模型", createArgs?.models?.[0] === "opus-plan"
+  && createArgs?.models?.[1] === "" && createArgs?.models?.[2] === "");
+check("步骤落在它单独指定的模型上", await waitFor(() => page.evaluate(() => {
+  const wf = window.__mock.state.workflows.find((w) => w.template === "race");
+  return wf?.steps?.[0]?.model === "opus-plan" && wf?.steps?.[1]?.model == null;
+})));
 
 console.log("\n[2] 启动并推进：并行两路，评审门等人");
 await wfCard("竞争模式").getByRole("button", { name: "启动" }).click();

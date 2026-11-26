@@ -232,6 +232,7 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
   const [model, setModel] = useState("");
   const [autoPr, setAutoPr] = useState(true);
   const [adapters, setAdapters] = useState<Record<string, string>>({});
+  const [models, setModels] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -239,7 +240,10 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
 
   useEffect(() => {
     const t = templates.find((t) => t.id === templateId);
-    if (t) setAdapters(Object.fromEntries(t.steps.map((s) => [s.name, s.adapter ?? ""])));
+    if (t) {
+      setAdapters(Object.fromEntries(t.steps.map((s) => [s.name, s.adapter ?? ""])));
+      setModels({});
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templateId]);
 
@@ -255,6 +259,7 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
         // 检查失败不建工作流，后端忽略模板；这里传空免得误会
         template: kind === "pr-check-failed" ? null : templateId,
         adapters: template?.steps.map((s) => adapters[s.name] ?? "") ?? [],
+        models: template?.steps.map((s) => models[s.name] ?? "") ?? [],
         model: kind === "pr-check-failed" ? null : model.trim() || null,
         // 竞争模式停在人工评审门，自动开 PR 会把两个方案都发出去：只在修 Issue 流水线给
         autoPr: kind === "issue-label" && templateId === "issue-fix" && autoPr,
@@ -385,19 +390,33 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
               <div className="mt-1.5 grid grid-cols-2 gap-2">
                 {template?.steps.map((s) => (
               <label key={s.name} className="flex items-center gap-2 text-xs">
-                <span className="w-28 shrink-0 truncate text-slate-300">{s.name}</span>
+                <span className="w-24 shrink-0 truncate text-slate-300">{s.name}</span>
                 {s.kind === "gate" ? (
                   <span className="text-slate-500">人工操作</span>
                 ) : (
-                  <select
-                    value={adapters[s.name] ?? s.adapter ?? ""}
-                    onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
-                    className={inputClass}
-                  >
-                    {CHAT_ADAPTERS.map((a) => (
-                      <option key={a} value={a}>{a}</option>
-                    ))}
-                  </select>
+                  <>
+                    <select
+                      value={adapters[s.name] ?? s.adapter ?? ""}
+                      onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
+                      className={inputClass}
+                      title="这一步用哪个 Agent"
+                    >
+                      {CHAT_ADAPTERS.map((a) => (
+                        <option key={a} value={a}>{a}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={models[s.name] ?? ""}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setModels((prev) => ({ ...prev, [s.name]: value }));
+                      }}
+                      placeholder="默认模型"
+                      className={`${inputClass} w-24`}
+                      title="这一步单独用的模型；空则沿用整个流的模型"
+                      data-testid={`step-model-${s.name}`}
+                    />
+                  </>
                 )}
               </label>
             ))}
@@ -442,6 +461,9 @@ function RuleCard({ rule }: { rule: AutomationRule }) {
           {rule.adapters.length > 0 && (
             <p className="mt-1 text-xs text-slate-500">Agents：{rule.adapters.filter(Boolean).join(" / ") || "模板默认"}</p>
           )}
+          {rule.models.filter(Boolean).length > 0 && (
+            <p className="mt-1 text-xs text-slate-500">各步模型：{rule.models.map((m, i) => m || "默认").join(" / ")}</p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Badge tone={rule.enabled ? "emerald" : "slate"}>{rule.enabled ? "生效中" : "已停用"}</Badge>
@@ -471,6 +493,7 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
   const [model, setModel] = useState("");
   const [autoPr, setAutoPr] = useState(false);
   const [adapters, setAdapters] = useState<Record<string, string>>({});
+  const [models, setModels] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -482,10 +505,14 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
   const pickTemplate = (t: WorkflowTemplate) => {
     setTemplateId(t.id);
     setAdapters(Object.fromEntries(t.steps.map((s) => [s.name, s.adapter ?? ""])));
+    setModels({});
   };
   // 换模板：各步的 Agent 换成新模板的建议值（用户改过的也一并换掉）
   useEffect(() => {
-    if (template) setAdapters(Object.fromEntries(template.steps.map((s) => [s.name, s.adapter ?? ""])));
+    if (template) {
+      setAdapters(Object.fromEntries(template.steps.map((s) => [s.name, s.adapter ?? ""])));
+      setModels({});
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templateId]);
 
@@ -505,6 +532,7 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
         autoPr,
         // 按步骤顺序原样传（空的是人工门，后端会忽略）
         adapters: template?.steps.map((s) => adapters[s.name] ?? "") ?? [],
+        models: template?.steps.map((s) => models[s.name] ?? "") ?? [],
       });
       qc.invalidateQueries({ queryKey: ["workflows"] });
       onClose();
@@ -602,19 +630,33 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
           <div className="mt-1.5 grid grid-cols-2 gap-2">
             {template?.steps.map((s) => (
               <label key={s.name} className="flex items-center gap-2 text-xs">
-                <span className="w-28 shrink-0 truncate text-slate-300">{s.name}</span>
+                <span className="w-24 shrink-0 truncate text-slate-300">{s.name}</span>
                 {s.kind === "gate" ? (
                   <span className="text-slate-500">人工操作</span>
                 ) : (
-                  <select
-                    value={adapters[s.name] ?? s.adapter ?? ""}
-                    onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
-                    className={inputClass}
-                  >
-                    {CHAT_ADAPTERS.map((a) => (
-                      <option key={a} value={a}>{a}</option>
-                    ))}
-                  </select>
+                  <>
+                    <select
+                      value={adapters[s.name] ?? s.adapter ?? ""}
+                      onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
+                      className={inputClass}
+                      title="这一步用哪个 Agent"
+                    >
+                      {CHAT_ADAPTERS.map((a) => (
+                        <option key={a} value={a}>{a}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={models[s.name] ?? ""}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setModels((prev) => ({ ...prev, [s.name]: value }));
+                      }}
+                      placeholder="默认模型"
+                      className={`${inputClass} w-24`}
+                      title="这一步单独用的模型；空则沿用整个流的模型"
+                      data-testid={`step-model-${s.name}`}
+                    />
+                  </>
                 )}
               </label>
             ))}

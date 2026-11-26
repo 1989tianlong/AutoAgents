@@ -574,6 +574,8 @@ export interface AutomationRule {
   template: string;
   /** 各步骤的 Agent（与模板步骤一一对应） */
   adapters: string[];
+  /** 各步骤单独指定的模型（空字符串 = 沿用规则的全局模型） */
+  models: string[];
   model: string | null;
   autoPr: boolean;
   comment: boolean;

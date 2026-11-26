@@ -631,7 +631,7 @@ const MOCK = () => {
           adapter: args.adapters?.[i] || s.adapter || null,
           nodeId: args.nodeId ?? "local",
           workdir: args.workdir ?? null,
-          model: args.model ?? null,
+          model: (args.models?.[i] || "").trim() || args.model || null,
           autoPr: !!args.autoPr,
           prompt: s.kind === "session" ? `（${s.name} 的提示词）` : null,
           status: "pending",
@@ -721,7 +721,7 @@ const MOCK = () => {
       }
       const rule = {
         id: state.rules.length + 1, name, kind: args.kind, repo, label: args.label?.trim() ?? "",
-        template, adapters: args.adapters ?? [], model: args.model ?? null,
+        template, adapters: args.adapters ?? [], models: args.models ?? [], model: args.model ?? null,
         autoPr: !!args.autoPr, comment: true,
         nodeId: args.nodeId ?? "local", workdir: args.workdir ?? "", enabled: true, runsToday: 0,
       };
@@ -774,7 +774,7 @@ const MOCK = () => {
             : { template: "pr-review", repo: rule.repo, prNumber: 12, instructions: null };
         const wf = handlers.workflow_create({
           ...args, nodeId: rule.nodeId, workdir: rule.workdir || "/Users/tester/code/demo",
-          model: rule.model, autoPr: rule.autoPr, adapters: rule.adapters,
+          model: rule.model, autoPr: rule.autoPr, adapters: rule.adapters, models: rule.models ?? [],
         });
         handlers.workflow_start({ id: wf.id });
         state.ruleRuns.unshift({

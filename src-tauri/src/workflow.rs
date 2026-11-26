@@ -11,21 +11,28 @@
 //! 依赖写成 seq 的数组（`["2", "?3"]`）：带 `?` 前缀是软依赖，上游失败也算解锁——
 //! 竞争模式的评审门不会因为其中一路失败而打不开。
 
+use crate::AppState;
 use crate::chat;
 use crate::events;
 use crate::github;
 use crate::nodes;
 use crate::pipeline::{self, StartOptions};
 use crate::tasks::{self, Task};
-use crate::AppState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tauri::State;
 
 /// 工作流的状态：pending 建好没启动；waiting 只剩人工门没处理
-pub const STATUSES: &[&str] = &["pending", "running", "waiting", "done", "failed", "cancelled"];
+pub const STATUSES: &[&str] = &[
+    "pending",
+    "running",
+    "waiting",
+    "done",
+    "failed",
+    "cancelled",
+];
 
 /// 会话步骤产出的上限（字符）
 const OUTCOME_LIMIT: usize = 4_000;
@@ -80,9 +87,30 @@ pub const TEMPLATES: &[Template] = &[
         needs_pr: false,
         live: None,
         steps: &[
-            TemplateStep { name: "分析修复", kind: "task", deps: &[], adapter: Some("claude-cli"), prompt: None, diff_source: "none" },
-            TemplateStep { name: "交叉审查", kind: "session", deps: &["1"], adapter: Some("codex-cli"), prompt: Some(ISSUE_FIX_REVIEW), diff_source: "worktree" },
-            TemplateStep { name: "撰写变更说明", kind: "session", deps: &["2"], adapter: Some("grok-cli"), prompt: Some(ISSUE_FIX_NOTES), diff_source: "worktree" },
+            TemplateStep {
+                name: "分析修复",
+                kind: "task",
+                deps: &[],
+                adapter: Some("claude-cli"),
+                prompt: None,
+                diff_source: "none",
+            },
+            TemplateStep {
+                name: "交叉审查",
+                kind: "session",
+                deps: &["1"],
+                adapter: Some("codex-cli"),
+                prompt: Some(ISSUE_FIX_REVIEW),
+                diff_source: "worktree",
+            },
+            TemplateStep {
+                name: "撰写变更说明",
+                kind: "session",
+                deps: &["2"],
+                adapter: Some("grok-cli"),
+                prompt: Some(ISSUE_FIX_NOTES),
+                diff_source: "worktree",
+            },
         ],
     },
     Template {
@@ -92,9 +120,30 @@ pub const TEMPLATES: &[Template] = &[
         needs_pr: true,
         live: None,
         steps: &[
-            TemplateStep { name: "审查 · Agent 一", kind: "session", deps: &[], adapter: Some("claude-cli"), prompt: Some(PR_REVIEW), diff_source: "pr" },
-            TemplateStep { name: "审查 · Agent 二", kind: "session", deps: &[], adapter: Some("codex-cli"), prompt: Some(PR_REVIEW), diff_source: "pr" },
-            TemplateStep { name: "汇总结论", kind: "session", deps: &["1", "2"], adapter: None, prompt: Some(PR_REVIEW_SUM), diff_source: "pr" },
+            TemplateStep {
+                name: "审查 · Agent 一",
+                kind: "session",
+                deps: &[],
+                adapter: Some("claude-cli"),
+                prompt: Some(PR_REVIEW),
+                diff_source: "pr",
+            },
+            TemplateStep {
+                name: "审查 · Agent 二",
+                kind: "session",
+                deps: &[],
+                adapter: Some("codex-cli"),
+                prompt: Some(PR_REVIEW),
+                diff_source: "pr",
+            },
+            TemplateStep {
+                name: "汇总结论",
+                kind: "session",
+                deps: &["1", "2"],
+                adapter: None,
+                prompt: Some(PR_REVIEW_SUM),
+                diff_source: "pr",
+            },
         ],
     },
     Template {
@@ -104,9 +153,30 @@ pub const TEMPLATES: &[Template] = &[
         needs_pr: false,
         live: None,
         steps: &[
-            TemplateStep { name: "方案 A", kind: "task", deps: &[], adapter: Some("claude-cli"), prompt: None, diff_source: "none" },
-            TemplateStep { name: "方案 B", kind: "task", deps: &[], adapter: Some("codex-cli"), prompt: None, diff_source: "none" },
-            TemplateStep { name: "人工评审", kind: "gate", deps: &["?1", "?2"], adapter: None, prompt: None, diff_source: "none" },
+            TemplateStep {
+                name: "方案 A",
+                kind: "task",
+                deps: &[],
+                adapter: Some("claude-cli"),
+                prompt: None,
+                diff_source: "none",
+            },
+            TemplateStep {
+                name: "方案 B",
+                kind: "task",
+                deps: &[],
+                adapter: Some("codex-cli"),
+                prompt: None,
+                diff_source: "none",
+            },
+            TemplateStep {
+                name: "人工评审",
+                kind: "gate",
+                deps: &["?1", "?2"],
+                adapter: None,
+                prompt: None,
+                diff_source: "none",
+            },
         ],
     },
     Template {
@@ -207,10 +277,14 @@ fn row_to_wf(row: &rusqlite::Row) -> rusqlite::Result<WfRow> {
 }
 
 fn load_wf(db: &Connection, id: i64) -> Result<WfRow, String> {
-    db.query_row(&format!("SELECT {WF_COLS} FROM workflows WHERE id = ?1"), params![id], row_to_wf)
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("工作流不存在：#{id}"))
+    db.query_row(
+        &format!("SELECT {WF_COLS} FROM workflows WHERE id = ?1"),
+        params![id],
+        row_to_wf,
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("工作流不存在：#{id}"))
 }
 
 #[derive(Clone, Debug)]
@@ -392,7 +466,12 @@ fn record(db: &Connection, wf: &WfRow, kind: &str, level: &str, message: &str) {
     );
 }
 
-fn set_wf_status(db: &Connection, id: i64, status: &str, detail: Option<&str>) -> Result<(), String> {
+fn set_wf_status(
+    db: &Connection,
+    id: i64,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<(), String> {
     if !STATUSES.contains(&status) {
         return Err(format!("非法状态: {status}"));
     }
@@ -410,7 +489,9 @@ fn dep_satisfied(dep: &str, steps: &[StepRow]) -> bool {
         Some(rest) => (true, rest),
         None => (false, dep),
     };
-    let Ok(seq) = seq_text.parse::<i64>() else { return false };
+    let Ok(seq) = seq_text.parse::<i64>() else {
+        return false;
+    };
     steps
         .iter()
         .find(|s| s.seq == seq)
@@ -424,7 +505,9 @@ fn dep_satisfied(dep: &str, steps: &[StepRow]) -> bool {
 /// 硬依赖里有没有已经失败 / 被跳过的（有的话这一步永远跑不了）
 fn dep_broken(dep: &str, steps: &[StepRow]) -> bool {
     let seq_text = dep.strip_prefix('?').unwrap_or(dep);
-    let Ok(seq) = seq_text.parse::<i64>() else { return false };
+    let Ok(seq) = seq_text.parse::<i64>() else {
+        return false;
+    };
     steps
         .iter()
         .find(|s| s.seq == seq)
@@ -440,7 +523,10 @@ fn dep_task_ids(step: &StepRow, steps: &[StepRow]) -> Vec<(i64, i64, String)> {
         .filter(|s| {
             s.kind == "task"
                 && s.task_id.is_some()
-                && step.depends_on.iter().any(|d| d.trim_start_matches('?') == s.seq.to_string())
+                && step
+                    .depends_on
+                    .iter()
+                    .any(|d| d.trim_start_matches('?') == s.seq.to_string())
         })
         .map(|s| (s.seq, s.task_id.unwrap(), s.name.clone()))
         .collect()
@@ -454,7 +540,9 @@ fn dep_task_ids(step: &StepRow, steps: &[StepRow]) -> Vec<(i64, i64, String)> {
 pub async fn tick(state: &Arc<AppState>) {
     let ids: Vec<i64> = {
         let db = state.db.lock().unwrap();
-        let mut stmt = match db.prepare("SELECT id FROM workflows WHERE status IN ('running', 'waiting') ORDER BY id") {
+        let mut stmt = match db
+            .prepare("SELECT id FROM workflows WHERE status IN ('running', 'waiting') ORDER BY id")
+        {
             Ok(stmt) => stmt,
             Err(e) => {
                 eprintln!("[workflow] {e}");
@@ -506,7 +594,13 @@ async fn advance(state: &Arc<AppState>, wf_id: i64) -> Result<(), String> {
                     params![step.id],
                 )
                 .map_err(|e| e.to_string())?;
-                record(&db, &wf, "workflow.step_skipped", "warning", &format!("「{}」的上游失败，跳过", step.name));
+                record(
+                    &db,
+                    &wf,
+                    "workflow.step_skipped",
+                    "warning",
+                    &format!("「{}」的上游失败，跳过", step.name),
+                );
                 changed = true;
                 continue;
             }
@@ -564,11 +658,21 @@ async fn advance_running(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) {
                         wf,
                         "workflow.step_done",
                         "info",
-                        &format!("「{}」完成（{}）", step.name, task.detail.as_deref().unwrap_or("改动就绪")),
+                        &format!(
+                            "「{}」完成（{}）",
+                            step.name,
+                            task.detail.as_deref().unwrap_or("改动就绪")
+                        ),
                     );
                 }
                 "failed" => {
-                    mark_step_failed(state, wf, step, task.failure.as_deref().unwrap_or("任务失败")).await;
+                    mark_step_failed(
+                        state,
+                        wf,
+                        step,
+                        task.failure.as_deref().unwrap_or("任务失败"),
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -602,7 +706,13 @@ async fn advance_running(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) {
                     )
                     .map_err(|e| e.to_string())
                     .unwrap_or(0);
-                    record(&db, wf, "workflow.step_done", "info", &format!("「{}」完成", step.name));
+                    record(
+                        &db,
+                        wf,
+                        "workflow.step_done",
+                        "info",
+                        &format!("「{}」完成", step.name),
+                    );
                 }
                 Some((role, content)) => {
                     let reason = if role == "system" {
@@ -658,9 +768,21 @@ async fn start_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) {
             )
             .map_err(|e| e.to_string())
             .unwrap_or(0);
-            record(&db, wf, "workflow.step_started", "info", &format!("「{}」开始", step.name));
+            record(
+                &db,
+                wf,
+                "workflow.step_started",
+                "info",
+                &format!("「{}」开始", step.name),
+            );
             if step.kind == "gate" {
-                record(&db, wf, "workflow.gate", "warning", &format!("「{}」等你决策", step.name));
+                record(
+                    &db,
+                    wf,
+                    "workflow.gate",
+                    "warning",
+                    &format!("「{}」等你决策", step.name),
+                );
             }
         }
         Err(e) => {
@@ -697,20 +819,27 @@ async fn start_task_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -> R
                 &format!("{} · {}", wf.name, step.name),
                 &wf.repo,
                 number,
-                &format!(
-                    "https://github.com/{}/issues/{number}",
-                    wf.repo
-                ),
+                &format!("https://github.com/{}/issues/{number}", wf.repo),
             )?,
-            (_, Some(instructions)) if !instructions.trim().is_empty() => {
-                tasks::create_manual(&db, &format!("{} · {}", wf.name, step.name), &wf.repo, instructions)?
-            }
+            (_, Some(instructions)) if !instructions.trim().is_empty() => tasks::create_manual(
+                &db,
+                &format!("{} · {}", wf.name, step.name),
+                &wf.repo,
+                instructions,
+            )?,
             _ => return Err("既没有 Issue 也没有需求说明，建不了任务".into()),
         };
         // 并行步骤各自一条分支：`agent/issue-7-w1`、`agent/issue-7-w2`
-        let branch = format!("{}-w{}", task.branch.as_deref().unwrap_or("agent/wf"), step.seq);
-        db.execute("UPDATE tasks SET branch = ?1 WHERE id = ?2", params![branch, task.id])
-            .map_err(|e| e.to_string())?;
+        let branch = format!(
+            "{}-w{}",
+            task.branch.as_deref().unwrap_or("agent/wf"),
+            step.seq
+        );
+        db.execute(
+            "UPDATE tasks SET branch = ?1 WHERE id = ?2",
+            params![branch, task.id],
+        )
+        .map_err(|e| e.to_string())?;
         db.execute(
             "UPDATE workflow_steps SET task_id = ?1 WHERE id = ?2",
             params![task.id, step.id],
@@ -730,7 +859,11 @@ async fn start_task_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -> R
 }
 
 /// 会话步骤：把依赖的产物（diff、审查结论）拼进提示词，开一段会话
-async fn start_session_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -> Result<(), String> {
+async fn start_session_step(
+    state: &Arc<AppState>,
+    wf: &WfRow,
+    step: &StepRow,
+) -> Result<(), String> {
     let adapter = step.conf_str("adapter");
     if adapter.trim().is_empty() {
         return Err("没有指定用哪个 Agent".into());
@@ -738,7 +871,11 @@ async fn start_session_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -
     let prompt = build_session_prompt(state, wf, step).await?;
     let workdir = {
         let dir = step.conf_str("workdir");
-        if dir.trim().is_empty() { None } else { Some(dir) }
+        if dir.trim().is_empty() {
+            None
+        } else {
+            Some(dir)
+        }
     };
     let session = chat::start(
         state,
@@ -759,15 +896,22 @@ async fn start_session_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -
 }
 
 /// 拼 session 步骤的提示词：模板里的占位符换成真实的上下文
-async fn build_session_prompt(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -> Result<String, String> {
-    let mut prompt = step
-        .config["prompt"]
+async fn build_session_prompt(
+    state: &Arc<AppState>,
+    wf: &WfRow,
+    step: &StepRow,
+) -> Result<String, String> {
+    let mut prompt = step.config["prompt"]
         .as_str()
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| "这一步没有提示词".to_string())?
         .to_string();
 
-    let task_desc = match (wf.issue_number, wf.issue_title.as_deref(), wf.instructions.as_deref()) {
+    let task_desc = match (
+        wf.issue_number,
+        wf.issue_title.as_deref(),
+        wf.instructions.as_deref(),
+    ) {
         (Some(number), Some(title), _) => format!("Issue #{number}：{title}"),
         (Some(number), _, _) => format!("Issue #{number}"),
         (_, _, Some(instructions)) if !instructions.trim().is_empty() => {
@@ -777,7 +921,10 @@ async fn build_session_prompt(state: &Arc<AppState>, wf: &WfRow, step: &StepRow)
     };
     let pr = wf.pr_number.map(|n| n.to_string()).unwrap_or_default();
 
-    let steps = { let db = state.db.lock().unwrap(); steps_of(&db, wf.id)? };
+    let steps = {
+        let db = state.db.lock().unwrap();
+        steps_of(&db, wf.id)?
+    };
 
     // {diff}：PR 审查取 PR 的 diff；其它取依赖任务工作树里的改动
     let diff = match step.conf_str("diff_source").as_str() {
@@ -786,7 +933,10 @@ async fn build_session_prompt(state: &Arc<AppState>, wf: &WfRow, step: &StepRow)
                 return Err("这个工作流没有关联 PR".into());
             };
             let token = github::token_of(state)?;
-            let (owner, name) = wf.repo.split_once('/').ok_or("仓库名要是 owner/repo 的样子")?;
+            let (owner, name) = wf
+                .repo
+                .split_once('/')
+                .ok_or("仓库名要是 owner/repo 的样子")?;
             match github::pr_diff(state, &token, owner, name, number).await {
                 Ok(text) if text.trim().is_empty() => "（这个 PR 没有文件改动）".into(),
                 Ok(text) => clip(&text, DIFF_LIMIT),
@@ -796,11 +946,21 @@ async fn build_session_prompt(state: &Arc<AppState>, wf: &WfRow, step: &StepRow)
         "worktree" => {
             // 工作流里所有任务步骤的改动（写变更说明这类步骤不直接依赖任务步骤，但说明要基于改动）
             let mut out = String::new();
-            for step_task in steps.iter().filter(|s| s.kind == "task" && s.task_id.is_some()) {
-                let Some(task_id) = step_task.task_id else { continue };
-                let Ok(task) = tasks::load(&state.db.lock().unwrap(), task_id) else { continue };
+            for step_task in steps
+                .iter()
+                .filter(|s| s.kind == "task" && s.task_id.is_some())
+            {
+                let Some(task_id) = step_task.task_id else {
+                    continue;
+                };
+                let Ok(task) = tasks::load(&state.db.lock().unwrap(), task_id) else {
+                    continue;
+                };
                 let text = worktree_diff(state, &task).await;
-                out.push_str(&format!("## 来自「{}」的改动\n\n{text}\n\n", step_task.name));
+                out.push_str(&format!(
+                    "## 来自「{}」的改动\n\n{text}\n\n",
+                    step_task.name
+                ));
                 if out.chars().count() > DIFF_LIMIT {
                     break;
                 }
@@ -817,10 +977,17 @@ async fn build_session_prompt(state: &Arc<AppState>, wf: &WfRow, step: &StepRow)
     let mut reviews = String::new();
     for dep in steps.iter().filter(|s| {
         s.kind == "session"
-            && step.depends_on.iter().any(|d| d.trim_start_matches('?') == s.seq.to_string())
+            && step
+                .depends_on
+                .iter()
+                .any(|d| d.trim_start_matches('?') == s.seq.to_string())
     }) {
         let text = dep.outcome.as_deref().unwrap_or("（没有产出）");
-        reviews.push_str(&format!("### {} 的意见\n\n{}\n\n", dep.name, clip(text, REVIEW_LIMIT)));
+        reviews.push_str(&format!(
+            "### {} 的意见\n\n{}\n\n",
+            dep.name,
+            clip(text, REVIEW_LIMIT)
+        ));
     }
 
     for (placeholder, value) in [
@@ -849,7 +1016,11 @@ async fn worktree_diff(state: &Arc<AppState>, task: &Task) -> String {
         let patch = pipeline::diff_file(state, task, &entry.path, entry.status == "?")
             .await
             .unwrap_or_else(|_| "（读不了这个文件的改动）".into());
-        out.push_str(&format!("--- {}\n{}\n\n", entry.path, clip(&patch, FILE_DIFF_LIMIT)));
+        out.push_str(&format!(
+            "--- {}\n{}\n\n",
+            entry.path,
+            clip(&patch, FILE_DIFF_LIMIT)
+        ));
         if out.chars().count() > DIFF_LIMIT {
             break;
         }
@@ -940,13 +1111,16 @@ pub async fn create(
     model: Option<String>,
     auto_pr: bool,
     adapters: Vec<String>,
+    models: Vec<String>,
 ) -> Result<WorkflowView, String> {
     let tpl = template_of(template)?;
     if tpl.live.is_some() {
         return Err("这个流程已经直接做在别的页面里，不用建工作流".into());
     }
     let (owner, repo_name) = pipeline::split_repo(repo)?;
-    let instructions = instructions.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let instructions = instructions
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     if tpl.needs_pr && pr_number.is_none_or(|n| n <= 0) {
         return Err("这个模板要处理一个 PR，请填 PR 号".into());
     }
@@ -959,7 +1133,10 @@ pub async fn create(
 
     // Issue 的标题与地址：界面上没有就去拉一次
     let (issue_title, issue_url) = if let Some(number) = issue_number {
-        match (issue_title.filter(|t| !t.trim().is_empty()), issue_url.filter(|u| !u.trim().is_empty())) {
+        match (
+            issue_title.filter(|t| !t.trim().is_empty()),
+            issue_url.filter(|u| !u.trim().is_empty()),
+        ) {
             (Some(title), Some(url)) => (Some(title), Some(url)),
             (title, url) => {
                 let token = github::token_of(state)?;
@@ -989,6 +1166,12 @@ pub async fn create(
                 .filter(|a| !a.is_empty())
                 .or_else(|| ts.adapter.map(Into::into))
                 .unwrap_or_default();
+            // 每一步可以单独指定模型；没填的沿用整个流的
+            let model = models
+                .get(i)
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .or_else(|| model.clone());
             let config = match ts.kind {
                 "task" => json!({
                     "adapter": adapter, "node_id": node, "workdir": workdir.trim(),
@@ -1008,14 +1191,23 @@ pub async fn create(
                     (i + 1) as i64,
                     ts.name,
                     ts.kind,
-                    serde_json::to_string(&ts.deps.iter().map(|d| d.to_string()).collect::<Vec<_>>()).unwrap(),
+                    serde_json::to_string(
+                        &ts.deps.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+                    )
+                    .unwrap(),
                     config.to_string(),
                 ],
             )
             .map_err(|e| e.to_string())?;
         }
         let wf = load_wf(&db, wf_id)?;
-        record(&db, &wf, "workflow.created", "info", "已创建工作流（还没启动）");
+        record(
+            &db,
+            &wf,
+            "workflow.created",
+            "info",
+            "已创建工作流（还没启动）",
+        );
         wf_id
     };
     load_view(&state.db.lock().unwrap(), wf_id)
@@ -1037,6 +1229,7 @@ pub async fn workflow_create(
     model: Option<String>,
     auto_pr: Option<bool>,
     adapters: Option<Vec<String>>,
+    models: Option<Vec<String>>,
 ) -> Result<WorkflowView, String> {
     create(
         state.inner(),
@@ -1052,6 +1245,7 @@ pub async fn workflow_create(
         model,
         auto_pr.unwrap_or(false),
         adapters.unwrap_or_default(),
+        models.unwrap_or_default(),
     )
     .await
 }
@@ -1077,7 +1271,10 @@ pub async fn start(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Strin
 }
 
 #[tauri::command]
-pub async fn workflow_start(state: State<'_, Arc<AppState>>, id: i64) -> Result<WorkflowView, String> {
+pub async fn workflow_start(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<WorkflowView, String> {
     start(state.inner(), id).await
 }
 
@@ -1091,7 +1288,10 @@ pub async fn cancel(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Stri
         }
         wf
     };
-    let steps = { let db = state.db.lock().unwrap(); steps_of(&db, id)? };
+    let steps = {
+        let db = state.db.lock().unwrap();
+        steps_of(&db, id)?
+    };
     for step in steps.iter().filter(|s| s.status == "running") {
         match (step.kind.as_str(), step.task_id, step.session_id) {
             ("task", Some(task_id), _) => {
@@ -1104,7 +1304,10 @@ pub async fn cancel(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Stri
         }
     }
     let db = state.db.lock().unwrap();
-    for step in steps.iter().filter(|s| matches!(s.status.as_str(), "pending" | "running" | "waiting")) {
+    for step in steps
+        .iter()
+        .filter(|s| matches!(s.status.as_str(), "pending" | "running" | "waiting"))
+    {
         let _ = db.execute(
             "UPDATE workflow_steps SET status = 'skipped', detail = '工作流已取消', finished_at = datetime('now') WHERE id = ?1",
             params![step.id],
@@ -1116,12 +1319,20 @@ pub async fn cancel(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Stri
 }
 
 #[tauri::command]
-pub async fn workflow_cancel(state: State<'_, Arc<AppState>>, id: i64) -> Result<WorkflowView, String> {
+pub async fn workflow_cancel(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<WorkflowView, String> {
     cancel(state.inner(), id).await
 }
 
 /// 人工评审：在候选方案里选定一个（它的任务不动，其余保持原样）
-pub async fn gate(state: &Arc<AppState>, workflow_id: i64, step_id: i64, chosen_task_id: i64) -> Result<WorkflowView, String> {
+pub async fn gate(
+    state: &Arc<AppState>,
+    workflow_id: i64,
+    step_id: i64,
+    chosen_task_id: i64,
+) -> Result<WorkflowView, String> {
     let (wf, steps) = {
         let db = state.db.lock().unwrap();
         let wf = load_wf(&db, workflow_id)?;
@@ -1142,7 +1353,10 @@ pub async fn gate(state: &Arc<AppState>, workflow_id: i64, step_id: i64, chosen_
         return Err("这一步现在不用决策".into());
     }
     let candidates = dep_task_ids(step, &steps);
-    let Some((_, _, chosen_title)) = candidates.iter().find(|(_, task_id, _)| *task_id == chosen_task_id) else {
+    let Some((_, _, chosen_title)) = candidates
+        .iter()
+        .find(|(_, task_id, _)| *task_id == chosen_task_id)
+    else {
         return Err("选的任务不在这一步的候选里".into());
     };
     let chosen_title = chosen_title.clone();
@@ -1187,7 +1401,10 @@ pub async fn retry(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Strin
         if wf.status != "failed" {
             return Err("只有失败的工作流能重跑".into());
         }
-        for step in steps_of(&db, id)?.iter().filter(|s| matches!(s.status.as_str(), "failed" | "skipped")) {
+        for step in steps_of(&db, id)?
+            .iter()
+            .filter(|s| matches!(s.status.as_str(), "failed" | "skipped"))
+        {
             db.execute(
                 "UPDATE workflow_steps SET status = 'pending', task_id = NULL, session_id = NULL,
                         outcome = NULL, detail = NULL, failure = NULL, started_at = NULL, finished_at = NULL
@@ -1204,7 +1421,10 @@ pub async fn retry(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, Strin
 }
 
 #[tauri::command]
-pub async fn workflow_retry(state: State<'_, Arc<AppState>>, id: i64) -> Result<WorkflowView, String> {
+pub async fn workflow_retry(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<WorkflowView, String> {
     retry(state.inner(), id).await
 }
 
@@ -1247,7 +1467,7 @@ mod tests {
     use super::*;
     use crate::secrets::SecretStore;
     use crate::testutil::{
-        fake_script, read_request, respond, setup_repo, test_state, Collect, Req, TestState,
+        Collect, Req, TestState, fake_script, read_request, respond, setup_repo, test_state,
     };
     use autoagents_core::runner::BinaryResolver;
     use autoagents_core::service::{Service, ServiceOptions};
@@ -1263,15 +1483,23 @@ mod tests {
     async fn start_github() -> FakeGithub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let fake = FakeGithub { addr, calls: Arc::default() };
+        let fake = FakeGithub {
+            addr,
+            calls: Arc::default(),
+        };
         let calls = Arc::clone(&fake.calls);
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let calls = Arc::clone(&calls);
                 tokio::spawn(async move {
                     let Req { method, path, .. } = read_request(&mut stream).await;
-                    calls.lock().unwrap().push((method.clone(), path.clone(), String::new()));
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone(), String::new()));
                     macro_rules! json {
                         ($text:expr) => {
                             respond(&mut stream, "200 OK", "application/json", $text)
@@ -1340,7 +1568,10 @@ exit 7"#;
             .map(|(name, script)| (name.to_string(), fake_script(name, script)))
             .collect();
         let resolve: BinaryResolver = Arc::new(move |name: &str| map.get(name).cloned());
-        Service::new(ServiceOptions { resolve: Some(resolve), ..Default::default() })
+        Service::new(ServiceOptions {
+            resolve: Some(resolve),
+            ..Default::default()
+        })
     }
 
     /// 反复推引擎，直到工作流落到想要的状态（或超时）
@@ -1348,7 +1579,10 @@ exit 7"#;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
         loop {
             tick(state).await;
-            let wf = { let db = state.db.lock().unwrap(); load_view(&db, id).unwrap() };
+            let wf = {
+                let db = state.db.lock().unwrap();
+                load_view(&db, id).unwrap()
+            };
             if want.contains(&wf.status.as_str()) {
                 return wf;
             }
@@ -1356,7 +1590,10 @@ exit 7"#;
                 std::time::Instant::now() < deadline,
                 "工作流一直停在 {}（{:?}）",
                 wf.status,
-                wf.steps.iter().map(|s| (s.name.as_str(), s.status.as_str(), s.failure.as_deref())).collect::<Vec<_>>(),
+                wf.steps
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.status.as_str(), s.failure.as_deref()))
+                    .collect::<Vec<_>>(),
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -1384,6 +1621,7 @@ exit 7"#;
         instructions: Option<&str>,
         workdir: &std::path::Path,
         adapters: Vec<String>,
+        models: Option<Vec<String>>,
     ) -> WorkflowView {
         create(
             state,
@@ -1399,6 +1637,7 @@ exit 7"#;
             None,
             false,
             adapters,
+            models.unwrap_or_default(),
         )
         .await
         .unwrap()
@@ -1436,7 +1675,18 @@ exit 7"#;
             ("codex-cli", &codex_writer_agent("greet_b.txt")),
         ])
         .await;
-        let wf = make(&ts.state, "race", "o/r", Some(7), None, None, &workdir, vec![]).await;
+        let wf = make(
+            &ts.state,
+            "race",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            &workdir,
+            vec![],
+            None,
+        )
+        .await;
         assert_eq!(wf.steps.len(), 3, "{wf:?}");
         let wf = start(&ts.state, wf.id).await.unwrap();
         assert_eq!(wf.status, "running");
@@ -1471,8 +1721,16 @@ exit 7"#;
         assert_eq!(worktrees.len(), 2, "{worktrees:?}");
         assert!(worktrees[0].ends_with("agent-issue-7-w1"), "{worktrees:?}");
         assert!(worktrees[1].ends_with("agent-issue-7-w2"), "{worktrees:?}");
-        assert!(std::path::Path::new(&worktrees[0]).join("greet_a.txt").exists());
-        assert!(std::path::Path::new(&worktrees[1]).join("greet_b.txt").exists());
+        assert!(
+            std::path::Path::new(&worktrees[0])
+                .join("greet_a.txt")
+                .exists()
+        );
+        assert!(
+            std::path::Path::new(&worktrees[1])
+                .join("greet_b.txt")
+                .exists()
+        );
 
         // 人工评审：选定方案 A 之后整个工作流完成
         let gate_step = wf.steps.iter().find(|s| s.kind == "gate").unwrap();
@@ -1491,11 +1749,25 @@ exit 7"#;
     async fn issue_fix_chain_carries_context_between_steps() {
         let (_gh, ts, workdir) = rig(vec![
             ("claude-cli", &writer_agent("greet.txt")),
-            ("codex-cli", &codex_talker_agent("问题：测试没加。总评：可以接受。")),
+            (
+                "codex-cli",
+                &codex_talker_agent("问题：测试没加。总评：可以接受。"),
+            ),
             ("grok-cli", &talker_agent("# 变更说明\\n\\n加了一句问候。")),
         ])
         .await;
-        let wf = make(&ts.state, "issue-fix", "o/r", Some(7), None, None, &workdir, vec![]).await;
+        let wf = make(
+            &ts.state,
+            "issue-fix",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            &workdir,
+            vec![],
+            None,
+        )
+        .await;
         let wf = start(&ts.state, wf.id).await.unwrap();
         let wf = wait_wf(&ts.state, wf.id, &["done"]).await;
         assert!(wf.steps.iter().all(|s| s.status == "done"), "{wf:?}");
@@ -1504,22 +1776,30 @@ exit 7"#;
         let counts: (i64, i64) = {
             let db = ts.state.db.lock().unwrap();
             (
-                db.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap(),
-                db.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap(),
+                db.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+                    .unwrap(),
+                db.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                    .unwrap(),
             )
         };
         assert_eq!(counts, (1, 3), "{counts:?}");
 
         // 审查一步拿到的提示词里有上游的 diff 与需求背景
         let review_prompt = prompt_of(&ts.state, wf.steps[1].session_id.unwrap());
-        assert!(review_prompt.contains("Issue #7：加一句问候"), "{review_prompt}");
+        assert!(
+            review_prompt.contains("Issue #7：加一句问候"),
+            "{review_prompt}"
+        );
         assert!(review_prompt.contains("+hello"), "{review_prompt}");
         // 写说明一步拿到审查的结论
         let notes_prompt = prompt_of(&ts.state, wf.steps[2].session_id.unwrap());
         assert!(notes_prompt.contains("测试没加"), "{notes_prompt}");
         assert!(notes_prompt.contains("+hello"), "{notes_prompt}");
         // 最后一步的产出就是变更说明
-        assert!(wf.steps[2].outcome.as_deref().unwrap().contains("变更说明"), "{wf:?}");
+        assert!(
+            wf.steps[2].outcome.as_deref().unwrap().contains("变更说明"),
+            "{wf:?}"
+        );
 
         // 顺序对：审查是在修复完成之后才开始的
         let fix_done = event_id(&ts.state, "「分析修复」完成").unwrap();
@@ -1535,12 +1815,27 @@ exit 7"#;
             ("grok-cli", &talker_agent("说明。")),
         ])
         .await;
-        let wf = make(&ts.state, "issue-fix", "o/r", Some(7), None, None, &workdir, vec![]).await;
+        let wf = make(
+            &ts.state,
+            "issue-fix",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            &workdir,
+            vec![],
+            None,
+        )
+        .await;
         let wf = start(&ts.state, wf.id).await.unwrap();
         let wf = wait_wf(&ts.state, wf.id, &["failed"]).await;
 
         assert_eq!(wf.steps[0].status, "failed", "{wf:?}");
-        assert!(wf.steps[0].failure.as_deref().unwrap().contains("完成"), "{}", wf.steps[0].failure.as_deref().unwrap_or(""));
+        assert!(
+            wf.steps[0].failure.as_deref().unwrap().contains("完成"),
+            "{}",
+            wf.steps[0].failure.as_deref().unwrap_or("")
+        );
         assert_eq!(wf.steps[1].status, "skipped");
         assert_eq!(wf.steps[1].detail.as_deref(), Some("上游失败，跳过"));
         assert_eq!(wf.steps[2].status, "skipped", "硬依赖断掉的步骤要级联跳过");
@@ -1551,9 +1846,19 @@ exit 7"#;
         assert_eq!(wf.status, "running");
         let wf = wait_wf(&ts.state, wf.id, &["failed"]).await;
         assert_eq!(wf.steps[0].status, "failed");
-        assert_ne!(wf.steps[0].task_id.unwrap(), first_task, "重跑要建新任务，不复活旧的");
+        assert_ne!(
+            wf.steps[0].task_id.unwrap(),
+            first_task,
+            "重跑要建新任务，不复活旧的"
+        );
         assert_eq!(wf.steps[1].status, "skipped", "{wf:?}");
-        let tasks: i64 = ts.state.db.lock().unwrap().query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+        let tasks: i64 = ts
+            .state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(tasks, 2, "旧任务留在任务页，重跑建了新任务");
     }
 
@@ -1564,7 +1869,18 @@ exit 7"#;
             ("codex-cli", BROKEN_AGENT),
         ])
         .await;
-        let wf = make(&ts.state, "race", "o/r", Some(7), None, None, &workdir, vec![]).await;
+        let wf = make(
+            &ts.state,
+            "race",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            &workdir,
+            vec![],
+            None,
+        )
+        .await;
         let wf = start(&ts.state, wf.id).await.unwrap();
         // 方案 B 失败了，评审门照样打开（软依赖）
         let wf = wait_wf(&ts.state, wf.id, &["waiting"]).await;
@@ -1595,6 +1911,7 @@ exit 7"#;
             &workdir,
             // 汇总结论这步模板里不指定 Agent，由创建时选
             vec!["claude-cli".into(), "codex-cli".into(), "grok-cli".into()],
+            None,
         )
         .await;
         let wf = start(&ts.state, wf.id).await.unwrap();
@@ -1622,7 +1939,18 @@ exit 7"#;
             ("grok", &talker_agent("说明。")),
         ])
         .await;
-        let wf = make(&ts.state, "issue-fix", "o/r", Some(7), None, None, &workdir, vec![]).await;
+        let wf = make(
+            &ts.state,
+            "issue-fix",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            &workdir,
+            vec![],
+            None,
+        )
+        .await;
         let wf = start(&ts.state, wf.id).await.unwrap();
 
         // 等第一步的会话真的登记下来（chat::start 返回之后）再取消，
@@ -1664,7 +1992,10 @@ exit 7"#;
             if task.status != "running" {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "取消之后任务还停在 running");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "取消之后任务还停在 running"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
@@ -1682,15 +2013,31 @@ exit 7"#;
         let gh = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let Req { method, path, .. } = read_request(&mut stream).await;
                     let route = path.split('?').next().unwrap_or("").to_string();
                     match (method.as_str(), route.as_str()) {
                         ("GET", "/repos/me/greet") => {
-                            respond(&mut stream, "200 OK", "application/json", r#"{"default_branch": "main"}"#).await
+                            respond(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                r#"{"default_branch": "main"}"#,
+                            )
+                            .await
                         }
-                        _ => respond(&mut stream, "200 OK", "application/json", r#"{"login": "demo", "id": 1}"#).await,
+                        _ => {
+                            respond(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                r#"{"login": "demo", "id": 1}"#,
+                            )
+                            .await
+                        }
                     }
                 });
             }
@@ -1703,20 +2050,47 @@ exit 7"#;
             std::fs::create_dir_all(&remote).unwrap();
             let git = |dir: &std::path::Path, args: &[&str]| {
                 std::process::Command::new("git")
-                    .arg("-C").arg(dir).args(["-c", "user.name=demo", "-c", "user.email=demo@demo"])
-                    .args(args).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap()
+                    .arg("-C")
+                    .arg(dir)
+                    .args(["-c", "user.name=demo", "-c", "user.email=demo@demo"])
+                    .args(args)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap()
             };
-            assert!(git(&remote, &["init", "--bare", "-b", "main"]).status.success());
+            assert!(
+                git(&remote, &["init", "--bare", "-b", "main"])
+                    .status
+                    .success()
+            );
             let seed = root.join("seed");
             std::fs::create_dir_all(&seed).unwrap();
             assert!(git(&seed, &["init", "-b", "main"]).status.success());
             std::fs::write(seed.join("README.md"), "# greet\n\n竞争模式的演示仓库。\n").unwrap();
             assert!(git(&seed, &["add", "-A"]).status.success());
             assert!(git(&seed, &["commit", "-m", "init"]).status.success());
-            assert!(git(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-            assert!(git(&seed, &["push", "-q", "origin", "main"]).status.success());
+            assert!(
+                git(
+                    &seed,
+                    &["remote", "add", "origin", remote.to_str().unwrap()]
+                )
+                .status
+                .success()
+            );
+            assert!(
+                git(&seed, &["push", "-q", "origin", "main"])
+                    .status
+                    .success()
+            );
             std::fs::create_dir_all(workdir.parent().unwrap()).unwrap();
-            assert!(git(&workdir.parent().unwrap(), &["clone", "-q", remote.to_str().unwrap(), "greet"]).status.success());
+            assert!(
+                git(
+                    &workdir.parent().unwrap(),
+                    &["clone", "-q", remote.to_str().unwrap(), "greet"]
+                )
+                .status
+                .success()
+            );
         }
 
         // 包装脚本：给无头模式注入「允许写文件」的开关（只作用于这个演示，不改全局配置）
@@ -1724,10 +2098,22 @@ exit 7"#;
         std::fs::create_dir_all(&bin).unwrap();
         let claude_bin = which("claude");
         let codex_bin = which("codex");
-        std::fs::write(bin.join("claude"), format!(
-            "#!/bin/sh\nexec {} --permission-mode acceptEdits \"$@\"\n", claude_bin)).unwrap();
-        std::fs::write(bin.join("codex"), format!(
-            "#!/bin/sh\nexec {} -c sandbox_mode='workspace-write' \"$@\"\n", codex_bin)).unwrap();
+        std::fs::write(
+            bin.join("claude"),
+            format!(
+                "#!/bin/sh\nexec {} --permission-mode acceptEdits \"$@\"\n",
+                claude_bin
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            bin.join("codex"),
+            format!(
+                "#!/bin/sh\nexec {} -c sandbox_mode='workspace-write' \"$@\"\n",
+                codex_bin
+            ),
+        )
+        .unwrap();
         for f in [bin.join("claude"), bin.join("codex")] {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1739,7 +2125,11 @@ exit 7"#;
             ("codex-cli".into(), bin.join("codex")),
         ]);
         let resolve: BinaryResolver = Arc::new(move |name: &str| map.get(name).cloned());
-        let service = Service::new(ServiceOptions { name: Some("race-demo".into()), resolve: Some(resolve), ..Default::default() });
+        let service = Service::new(ServiceOptions {
+            name: Some("race-demo".into()),
+            resolve: Some(resolve),
+            ..Default::default()
+        });
         let state = crate::AppState::new(
             crate::db::init(&root.join("state.db")).unwrap(),
             service,
@@ -1752,7 +2142,9 @@ exit 7"#;
 
         if phase == "choose" {
             let chosen: i64 = std::env::var("AUTOAGENTS_RACE_DEMO_CHOSEN")
-                .expect("评审阶段要给 AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号>").parse().expect("任务号要是数字");
+                .expect("评审阶段要给 AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号>")
+                .parse()
+                .expect("任务号要是数字");
             let db = state.db.lock().unwrap();
             let gate_row: Option<(i64, i64)> = db.query_row(
                 "SELECT w.id, s.id FROM workflows w JOIN workflow_steps s ON s.workflow_id = w.id AND s.kind = 'gate'
@@ -1762,8 +2154,15 @@ exit 7"#;
             let (wf_id, gate_id) = match gate_row {
                 Some(pair) => pair,
                 None => {
-                    let wf_id: i64 = db.query_row("SELECT id FROM workflows ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
-                        .optional().unwrap().expect("没有工作流可评审");
+                    let wf_id: i64 = db
+                        .query_row(
+                            "SELECT id FROM workflows ORDER BY id DESC LIMIT 1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap()
+                        .expect("没有工作流可评审");
                     let wf = load_view(&db, wf_id).unwrap();
                     println!("工作流 #{} 已经是 {}，不用再评审", wf.id, wf.status);
                     return;
@@ -1774,8 +2173,16 @@ exit 7"#;
             println!("=== 评审完成 ===");
             println!("工作流 #{} 状态：{}", wf.id, wf.status);
             for s in &wf.steps {
-                println!("  [{}] {} —— {}{}", s.seq, s.name, s.status,
-                    s.detail.as_deref().map(|d| format!("（{d}）")).unwrap_or_default());
+                println!(
+                    "  [{}] {} —— {}{}",
+                    s.seq,
+                    s.name,
+                    s.status,
+                    s.detail
+                        .as_deref()
+                        .map(|d| format!("（{d}）"))
+                        .unwrap_or_default()
+                );
             }
             return;
         }
@@ -1783,7 +2190,13 @@ exit 7"#;
         // 第一阶段：建流（只建一次）、启动、推进到评审门
         let existing: Option<i64> = {
             let db = state.db.lock().unwrap();
-            db.query_row("SELECT id FROM workflows ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).optional().unwrap()
+            db.query_row(
+                "SELECT id FROM workflows ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
         };
         let wf = match existing {
             Some(id) => { let db = state.db.lock().unwrap(); load_view(&db, id).unwrap() }
@@ -1791,13 +2204,18 @@ exit 7"#;
                 &state, "race", "me/greet", None, None, None, None,
                 Some("给这个仓库写一个 greet.sh：打印一句问候语（文案和实现自选），加上可执行权限；再写一个 GREET-README.md 说明怎么用。不要提交。".into()),
                 "", workdir.to_str().unwrap(), Some("glm-5.3-flash".into()), false, vec![],
+                vec![],
             ).await.unwrap(),
         };
         if wf.status == "pending" {
             start(&state, wf.id).await.unwrap();
         }
         println!("=== 竞争模式开始 ===");
-        println!("仓库：{}（假远端 {}，不出网）", workdir.display(), remote.display());
+        println!(
+            "仓库：{}（假远端 {}，不出网）",
+            workdir.display(),
+            remote.display()
+        );
         println!("两个 Agent 并行开工（glm-5.3-flash），每 500ms 推一次引擎……");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -1816,30 +2234,60 @@ exit 7"#;
                             params![sid], |r| r.get::<_, String>(0),
                         ).optional().unwrap()
                     });
-                    println!("\n[方案 {}] {} · 任务 #{} · 分支 {}", s.name, s.adapter.as_deref().unwrap_or("?"), task.id, task.branch.as_deref().unwrap_or("?"));
+                    println!(
+                        "\n[方案 {}] {} · 任务 #{} · 分支 {}",
+                        s.name,
+                        s.adapter.as_deref().unwrap_or("?"),
+                        task.id,
+                        task.branch.as_deref().unwrap_or("?")
+                    );
                     println!("  工作树：{}", task.worktree.as_deref().unwrap_or("?"));
-                    println!("  Agent 回复：{}", reply.as_deref().map(|t| clip(t, 300)).unwrap_or_else(|| "（无）".into()));
+                    println!(
+                        "  Agent 回复：{}",
+                        reply
+                            .as_deref()
+                            .map(|t| clip(t, 300))
+                            .unwrap_or_else(|| "（无）".into())
+                    );
                     let wt = task.worktree.clone().unwrap_or_default();
-                    let out = std::process::Command::new("git").arg("-C").arg(&wt)
-                        .args(["status", "--short"]).output().unwrap();
+                    let out = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&wt)
+                        .args(["status", "--short"])
+                        .output()
+                        .unwrap();
                     println!("  改动：{}", String::from_utf8_lossy(&out.stdout).trim());
                 }
-                println!("\n→ 你来当裁判：AUTOAGENTS_RACE_DEMO=choose AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号> \\");
+                println!(
+                    "\n→ 你来当裁判：AUTOAGENTS_RACE_DEMO=choose AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号> \\"
+                );
                 println!("  cargo test -p autoagents --lib race_demo -- --ignored --nocapture");
                 return;
             }
             if wf.status == "failed" {
-                println!("工作流失败了：{:?}", wf.steps.iter().map(|s| (s.name.as_str(), s.status.as_str(), s.failure.as_deref())).collect::<Vec<_>>());
+                println!(
+                    "工作流失败了：{:?}",
+                    wf.steps
+                        .iter()
+                        .map(|s| (s.name.as_str(), s.status.as_str(), s.failure.as_deref()))
+                        .collect::<Vec<_>>()
+                );
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "10 分钟还没跑到评审门");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "10 分钟还没跑到评审门"
+            );
         }
     }
 
     /// PATH 上的真实可执行文件
     fn which(name: &str) -> String {
-        let out = std::process::Command::new("sh").arg("-c").arg(format!("command -v {name}"))
-            .output().expect("找可执行文件");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {name}"))
+            .output()
+            .expect("找可执行文件");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -1847,30 +2295,101 @@ exit 7"#;
     async fn create_validates_the_template_requirements() {
         let (_gh, ts, workdir) = rig(vec![("claude-cli", &writer_agent("greet.txt"))]).await;
         // 发布守护不用建工作流
-        let e = create(&ts.state, "publish-guard", "o/r", None, None, None, None, None, "", workdir.to_str().unwrap(), None, false, vec![])
-            .await
-            .unwrap_err();
+        let e = create(
+            &ts.state,
+            "publish-guard",
+            "o/r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            workdir.to_str().unwrap(),
+            None,
+            false,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(e.contains("不用建工作流"), "{e}");
         // PR 审查必须给 PR 号
-        let e = create(&ts.state, "pr-review", "o/r", None, None, None, None, None, "", workdir.to_str().unwrap(), None, false, vec![])
-            .await
-            .unwrap_err();
+        let e = create(
+            &ts.state,
+            "pr-review",
+            "o/r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            workdir.to_str().unwrap(),
+            None,
+            false,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(e.contains("PR"), "{e}");
         // 既没有 Issue 也没有说明
-        let e = create(&ts.state, "race", "o/r", None, None, None, None, None, "", workdir.to_str().unwrap(), None, false, vec![])
-            .await
-            .unwrap_err();
+        let e = create(
+            &ts.state,
+            "race",
+            "o/r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            workdir.to_str().unwrap(),
+            None,
+            false,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(e.contains("Issue 号") || e.contains("需求说明"), "{e}");
         // 没给仓库位置
-        let e = create(&ts.state, "race", "o/r", Some(7), None, None, None, None, "", "", None, false, vec![])
-            .await
-            .unwrap_err();
+        let e = create(
+            &ts.state,
+            "race",
+            "o/r",
+            Some(7),
+            None,
+            None,
+            None,
+            None,
+            "",
+            "",
+            None,
+            false,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(e.contains("位置"), "{e}");
         // 界面上带了 Issue 信息时不再去拉接口
         let wf = create(
-            &ts.state, "issue-fix", "o/r", Some(7),
-            Some("加一句问候".into()), Some("https://github.test/o/r/issues/7".into()),
-            None, None, "", workdir.to_str().unwrap(), None, false, vec![],
+            &ts.state,
+            "issue-fix",
+            "o/r",
+            Some(7),
+            Some("加一句问候".into()),
+            Some("https://github.test/o/r/issues/7".into()),
+            None,
+            None,
+            "",
+            workdir.to_str().unwrap(),
+            None,
+            false,
+            vec![],
+            vec![],
         )
         .await
         .unwrap();
@@ -1878,6 +2397,47 @@ exit 7"#;
         assert_eq!(wf.steps.len(), 3);
         // 模板清单给界面的形状
         let templates = workflow_templates();
-        assert_eq!(templates.iter().find(|t| t.id == "race").unwrap().steps.len(), 3);
+        assert_eq!(
+            templates
+                .iter()
+                .find(|t| t.id == "race")
+                .unwrap()
+                .steps
+                .len(),
+            3
+        );
+
+        // 每一步可以单独指定模型：没填的沿用整个流的
+        let workdir = std::env::temp_dir().join(format!("aa-wf-models-{}", std::process::id()));
+        std::fs::create_dir_all(&workdir).unwrap();
+        let wf = create(
+            &ts.state,
+            "issue-fix",
+            "o/r",
+            Some(7),
+            Some("加一句问候".into()),
+            Some("https://github.test/o/r/issues/7".into()),
+            None,
+            None,
+            "",
+            workdir.to_str().unwrap(),
+            Some("glm-5.3".into()),
+            false,
+            vec!["claude-cli".into(), "claude-cli".into(), "codex-cli".into()],
+            vec!["opus".into(), String::new(), "gpt-5".into()],
+        )
+        .await
+        .unwrap();
+        let models: Vec<Option<String>> = wf.steps.iter().map(|s| s.model.clone()).collect();
+        assert_eq!(
+            models,
+            vec![
+                Some("opus".into()),
+                Some("glm-5.3".into()),
+                Some("gpt-5".into())
+            ],
+            "第一步用自己指定的，第二步空着沿用全局的，第三步用自己指定的"
+        );
+        let _ = std::fs::remove_dir_all(&workdir);
     }
 }

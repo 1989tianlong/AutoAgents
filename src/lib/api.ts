@@ -314,6 +314,8 @@ export const workflowCreate = (p: {
   autoPr?: boolean;
   /** 按步骤顺序覆盖每一步用哪个 Agent */
   adapters?: string[];
+  /** 按步骤顺序覆盖每一步用的模型（空的沿用 model） */
+  models?: string[];
 }) => invoke<Workflow>("workflow_create", p);
 
 export const workflowStart = (id: number) => invoke<Workflow>("workflow_start", { id });
@@ -341,6 +343,7 @@ export const automationRuleCreate = (p: {
   label?: string | null;
   template?: string | null;
   adapters?: string[];
+  models?: string[];
   model?: string | null;
   autoPr?: boolean;
   comment?: boolean;

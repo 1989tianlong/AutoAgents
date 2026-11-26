@@ -33,6 +33,8 @@ struct RuleConfig {
     template: String,
     /// 各步骤用的 Agent（与模板步骤一一对应；空则用模板默认）
     adapters: Vec<String>,
+    /// 各步骤用的模型（与模板步骤一一对应；空则用整个流的）
+    models: Vec<String>,
     model: Option<String>,
     /// 任务步骤做完直接提交开 PR（验收就变成看 PR）
     auto_pr: bool,
@@ -104,6 +106,7 @@ pub struct RuleView {
     label: String,
     template: String,
     adapters: Vec<String>,
+    models: Vec<String>,
     model: Option<String>,
     auto_pr: bool,
     comment: bool,
@@ -129,6 +132,7 @@ fn rule_view(db: &Connection, rule: &Rule) -> RuleView {
         label: rule.config.label.clone(),
         template: rule.config.template.clone(),
         adapters: rule.config.adapters.clone(),
+        models: rule.config.models.clone(),
         model: rule.config.model.clone(),
         auto_pr: rule.config.auto_pr,
         comment: rule.config.comment,
@@ -212,6 +216,7 @@ pub fn automation_rule_create(
     label: Option<String>,
     template: Option<String>,
     adapters: Option<Vec<String>>,
+    models: Option<Vec<String>>,
     model: Option<String>,
     auto_pr: Option<bool>,
     comment: Option<bool>,
@@ -227,6 +232,7 @@ pub fn automation_rule_create(
             label,
             template,
             adapters,
+            models,
             model,
             auto_pr,
             comment,
@@ -244,6 +250,7 @@ struct Params {
     label: Option<String>,
     template: Option<String>,
     adapters: Option<Vec<String>>,
+    models: Option<Vec<String>>,
     model: Option<String>,
     auto_pr: Option<bool>,
     comment: Option<bool>,
@@ -265,6 +272,12 @@ fn create_rule(state: &Arc<AppState>, p: Params) -> Result<RuleView, String> {
             .unwrap_or_default()
             .into_iter()
             .map(|a| a.trim().to_string())
+            .collect(),
+        models: p
+            .models
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.trim().to_string())
             .collect(),
         model: p.model.filter(|m| !m.trim().is_empty()),
         auto_pr: p.auto_pr.unwrap_or(false),
@@ -547,6 +560,7 @@ async fn trigger_issues(state: &Arc<AppState>, token: &str, rule: &Rule) -> Resu
                 model,
                 rule.config.auto_pr,
                 rule.config.adapters.clone(),
+                rule.config.models.clone(),
             )
             .await
             .map(|wf| wf.id),
@@ -590,6 +604,7 @@ async fn trigger_prs(state: &Arc<AppState>, token: &str, rule: &Rule) -> Result<
                 model,
                 false,
                 rule.config.adapters.clone(),
+                rule.config.models.clone(),
             )
             .await
             .map(|wf| wf.id),
@@ -889,6 +904,7 @@ printf '%s\n' '{{"type":"task_complete"}}'"#
         create_rule(
             state,
             Params {
+                models: None,
                 name: "盯着 o/r".into(),
                 kind: kind.into(),
                 repo: "o/r".into(),
@@ -907,6 +923,7 @@ printf '%s\n' '{{"type":"task_complete"}}'"#
 
     fn param(name: &str, label: Option<&str>, workdir: Option<&str>) -> Params {
         Params {
+            models: None,
             name: name.into(),
             kind: "issue-label".into(),
             repo: "o/r".into(),
@@ -1173,6 +1190,7 @@ printf '%s\n' '{{"type":"task_complete"}}'"#
             create_rule(
                 &ts.state,
                 Params {
+                    models: None,
                     kind: "magic".into(),
                     ..param("坏类型", Some("x"), None)
                 }
