@@ -269,7 +269,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "autoagents"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "autoagents-core",
  "base64 0.22.1",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-node"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "autoagents-core",
  "base64 0.22.1",
