@@ -462,7 +462,7 @@ function RuleCard({ rule }: { rule: AutomationRule }) {
             <p className="mt-1 text-xs text-slate-500">Agents：{rule.adapters.filter(Boolean).join(" / ") || "模板默认"}</p>
           )}
           {rule.models.filter(Boolean).length > 0 && (
-            <p className="mt-1 text-xs text-slate-500">各步模型：{rule.models.map((m, i) => m || "默认").join(" / ")}</p>
+            <p className="mt-1 text-xs text-slate-500">各步模型：{rule.models.map((m) => m || "默认").join(" / ")}</p>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
