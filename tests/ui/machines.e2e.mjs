@@ -203,7 +203,7 @@ await page.getByRole("button", { name: /^全部/ }).click();
 await page.getByText("开始一轮：fix the bug").waitFor();
 await page.locator("div.gap-3.px-4", { hasText: "开始一轮：fix the bug" }).getByRole("button", { name: "查看 →" }).click();
 await page.getByText("fix the bug").first().waitFor();
-check("点「查看」跳到对应会话", page.url().includes("#/sessions") && (await page.locator(".bg-slate-800.rounded-2xl", { hasText: "已修复" }).count()) === 1);
+check("点「查看」跳到对应会话", page.url().includes("#/sessions") && await waitFor(async () => (await page.locator(".bg-slate-800.rounded-2xl", { hasText: "已修复" }).count()) === 1));
 
 console.log("\n[10] 仪表盘：真实数字");
 await goto("#/", "仪表盘");
