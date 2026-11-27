@@ -227,6 +227,16 @@ const MOCK = () => {
       ],
       custom: [],
     },
+    "codex-cli": {
+      adapter: "codex-cli",
+      source: "~/.codex/config.toml → model_catalog_json",
+      default: "gpt-5.3-codex",
+      options: [
+        { value: "gpt-5.3-codex", label: "GPT-5.3-Codex", detail: "catalog" },
+        { value: "o4-mini", label: "o4-mini", detail: "catalog" },
+      ],
+      custom: [],
+    },
     "grok-cli": {
       adapter: "grok-cli",
       source: "~/.grok/config.toml",

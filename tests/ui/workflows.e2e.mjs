@@ -74,7 +74,19 @@ check("每步的 Agent 按模板建议填好", await page.evaluate(() => {
   const sel = document.querySelectorAll("main select");
   return [...sel].some((s) => s.value === "claude-cli");
 }));
-// 第一步单独指定模型（另两步留空，沿用全局）
+// 每一步的模型下拉按这一步的 Agent 加载那台机器的可用清单
+await page.getByTestId("step-model-方案 A").click();
+const glmOption = dialog().getByRole("button", { name: /GLM-5\.3 · Z\.AI Coding Plan/ });
+check("第一步（claude-cli）的下拉加载了可用模型清单", await waitFor(async () => (await glmOption.count()) === 1));
+// 下拉会被对话框的滚动区裁住，像 sessions 套件那样直接派发 click
+await glmOption.dispatchEvent("click");
+check("从清单里选中后输入框显示模型名",
+  (await page.getByTestId("step-model-方案 A").inputValue()) === "GLM-5.3 · Z.AI Coding Plan");
+await page.getByTestId("step-model-方案 B").click();
+const codexOption = dialog().getByRole("button", { name: /GPT-5\.3-Codex/ });
+check("第二步（codex-cli）的下拉跟着换成 codex 的清单", await waitFor(async () => (await codexOption.count()) === 1));
+await codexOption.dispatchEvent("click");
+// 也能手填清单之外的模型（网关接入的自定义模型），第三步留空沿用全局
 await page.getByTestId("step-model-方案 A").fill("opus-plan");
 await dialog().getByRole("button", { name: "创建" }).click();
 await waitFor(async () => (await dialog().count()) === 0);
@@ -86,11 +98,13 @@ check("建流的参数带上了每步的 Agent", createArgs?.template === "race"
   && createArgs?.repo === "octo/demo" && createArgs?.issueNumber === 7
   && createArgs?.adapters?.[0] === "claude-cli" && createArgs?.adapters?.[1] === "codex-cli");
 check("建流的参数带上了每步单独指定的模型", createArgs?.models?.[0] === "opus-plan"
-  && createArgs?.models?.[1] === "" && createArgs?.models?.[2] === "");
+  && createArgs?.models?.[1] === "gpt-5.3-codex" && createArgs?.models?.[2] === "");
 check("步骤落在它单独指定的模型上", await waitFor(() => page.evaluate(() => {
   const wf = window.__mock.state.workflows.find((w) => w.template === "race");
-  return wf?.steps?.[0]?.model === "opus-plan" && wf?.steps?.[1]?.model == null;
+  return wf?.steps?.[0]?.model === "opus-plan" && wf?.steps?.[1]?.model === "gpt-5.3-codex";
 })));
+check("手填的模型记住了，下次出现在这个 Agent 的下拉里", await waitFor(() =>
+  page.evaluate(() => window.__mock.state.remembered.includes("claude-cli|opus-plan"))));
 
 console.log("\n[2] 启动并推进：并行两路，评审门等人");
 await wfCard("竞争模式").getByRole("button", { name: "启动" }).click();

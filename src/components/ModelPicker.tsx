@@ -10,6 +10,10 @@ interface Props {
   /** 选中的模型 ID；空串表示沿用默认 */
   value: string;
   onChange: (model: string) => void;
+  /** 加在外层宽度上的类名（默认 max-w-md；嵌在窄行里时可换成 flex-1 之类） */
+  className?: string;
+  /** 透传给输入框的 testid */
+  testid?: string;
 }
 
 /** 输入框里显示的文字：清单里的模型显示名称，自定义模型显示 ID 本身 */
@@ -28,7 +32,7 @@ function matches(option: ModelOption, keyword: string): boolean {
  * 模型选择：可以输入关键字在清单里搜索，也可以直接填写清单之外的模型 ID
  * （经由网关接入的自定义模型），按回车或失焦即生效。
  */
-export default function ModelPicker({ options, custom, defaultModel, value, onChange }: Props) {
+export default function ModelPicker({ options, custom, defaultModel, value, onChange, className, testid }: Props) {
   const all = [
     ...options,
     ...custom
@@ -83,10 +87,11 @@ export default function ModelPicker({ options, custom, defaultModel, value, onCh
   };
 
   return (
-    <div className="relative w-full max-w-md">
+    <div className={`relative w-full ${className ?? "max-w-md"}`}>
       <input
         ref={inputRef}
         value={text}
+        data-testid={testid}
         onChange={(e) => {
           edit(e.currentTarget.value);
           setOpen(true);

@@ -1,14 +1,17 @@
 import { Fragment, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import ModelPicker from "../components/ModelPicker";
 import { Badge, Button, Card, Empty, Modal, PageHeader, inputClass } from "../components/ui";
 import {
+  agentModels,
   automationRuleCreate,
   automationRuleDelete,
   automationRuleSetEnabled,
   automationRules,
   automationScan,
   machinesList,
+  modelRemember,
   workflowCancel,
   workflowCreate,
   workflowGate,
@@ -215,6 +218,42 @@ const RULE_TEMPLATE: Record<string, string> = {
   "ci-fix": "自动修检查",
 };
 
+/**
+ * 每一步单独用的模型：按这一步选的 Agent 和机器加载可用模型清单
+ * （清单在哪台机器上执行就读哪台机器的配置），也能直接手填清单之外的。
+ */
+function StepModelField({
+  adapter,
+  node,
+  value,
+  onChange,
+  testid,
+}: {
+  adapter: string;
+  node: string;
+  value: string;
+  onChange: (model: string) => void;
+  testid: string;
+}) {
+  const models = useQuery({
+    queryKey: ["agentModels", adapter, node],
+    queryFn: () => agentModels(adapter, node),
+    staleTime: 60_000,
+    enabled: adapter !== "",
+  });
+  return (
+    <ModelPicker
+      options={models.data?.options ?? []}
+      custom={models.data?.custom ?? []}
+      defaultModel={models.data?.default ?? null}
+      value={value}
+      onChange={onChange}
+      className="min-w-0 flex-1"
+      testid={testid}
+    />
+  );
+}
+
 function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onClose: () => void }) {
   const qc = useQueryClient();
   const [kind, setKind] = useState("issue-label");
@@ -266,8 +305,14 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
         nodeId: kind === "pr-check-failed" ? null : node,
         workdir: kind === "pr-check-failed" ? null : workdir.trim() || null,
       });
-      qc.invalidateQueries({ queryKey: ["rules"] });
-      // 建完立刻看一眼 GitHub，别等下一轮
+        // 手填的每步模型记下来，下次出现在这个 Agent 的下拉里（清单里已有的会被滤掉）
+        for (const s of template?.steps ?? []) {
+          const m = (models[s.name] ?? "").trim();
+          const a = (adapters[s.name] ?? s.adapter ?? "").trim();
+          if (m && a) void modelRemember(a, m).catch(() => {});
+        }
+        qc.invalidateQueries({ queryKey: ["rules"] });
+        // 建完立刻看一眼 GitHub，别等下一轮
       await automationScan();
       qc.invalidateQueries({ queryKey: ["workflows"] });
       onClose();
@@ -386,40 +431,36 @@ function RuleDialog({ templates, onClose }: { templates: WorkflowTemplate[]; onC
               )}
             </div>
             <div>
-              <span className="text-xs text-slate-400">每一步用哪个 Agent</span>
-              <div className="mt-1.5 grid grid-cols-2 gap-2">
+              <span className="text-xs text-slate-400">每一步用哪个 Agent（模型的下拉按这一步的 Agent 加载那台机器上的可用清单）</span>
+              <div className="mt-1.5 space-y-2">
                 {template?.steps.map((s) => (
-              <label key={s.name} className="flex items-center gap-2 text-xs">
-                <span className="w-24 shrink-0 truncate text-slate-300">{s.name}</span>
-                {s.kind === "gate" ? (
-                  <span className="text-slate-500">人工操作</span>
-                ) : (
-                  <>
-                    <select
-                      value={adapters[s.name] ?? s.adapter ?? ""}
-                      onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
-                      className={inputClass}
-                      title="这一步用哪个 Agent"
-                    >
-                      {CHAT_ADAPTERS.map((a) => (
-                        <option key={a} value={a}>{a}</option>
-                      ))}
-                    </select>
-                    <input
-                      value={models[s.name] ?? ""}
-                      onChange={(e) => {
-                        const value = e.currentTarget.value;
-                        setModels((prev) => ({ ...prev, [s.name]: value }));
-                      }}
-                      placeholder="默认模型"
-                      className={`${inputClass} w-24`}
-                      title="这一步单独用的模型；空则沿用整个流的模型"
-                      data-testid={`step-model-${s.name}`}
-                    />
-                  </>
-                )}
-              </label>
-            ))}
+                  <div key={s.name} className="flex items-center gap-2 text-xs">
+                    <span className="w-24 shrink-0 truncate text-slate-300">{s.name}</span>
+                    {s.kind === "gate" ? (
+                      <span className="text-slate-500">人工操作</span>
+                    ) : (
+                      <>
+                        <select
+                          value={adapters[s.name] ?? s.adapter ?? ""}
+                          onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
+                          className={`${inputClass} w-32 shrink-0`}
+                          title="这一步用哪个 Agent"
+                        >
+                          {CHAT_ADAPTERS.map((a) => (
+                            <option key={a} value={a}>{a}</option>
+                          ))}
+                        </select>
+                        <StepModelField
+                          adapter={adapters[s.name] ?? s.adapter ?? ""}
+                          node={node}
+                          value={models[s.name] ?? ""}
+                          onChange={(m) => setModels((prev) => ({ ...prev, [s.name]: m }))}
+                          testid={`step-model-${s.name}`}
+                        />
+                      </>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
           </>
@@ -534,6 +575,12 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
         adapters: template?.steps.map((s) => adapters[s.name] ?? "") ?? [],
         models: template?.steps.map((s) => models[s.name] ?? "") ?? [],
       });
+      // 手填的每步模型记下来，下次出现在这个 Agent 的下拉里（清单里已有的会被滤掉）
+      for (const s of template?.steps ?? []) {
+        const m = (models[s.name] ?? "").trim();
+        const a = (adapters[s.name] ?? s.adapter ?? "").trim();
+        if (m && a) void modelRemember(a, m).catch(() => {});
+      }
       qc.invalidateQueries({ queryKey: ["workflows"] });
       onClose();
     } catch (e) {
@@ -626,10 +673,10 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
           </label>
         </div>
         <div>
-          <span className="text-xs text-slate-400">每一步用哪个 Agent</span>
-          <div className="mt-1.5 grid grid-cols-2 gap-2">
+          <span className="text-xs text-slate-400">每一步用哪个 Agent（模型的下拉按这一步的 Agent 加载那台机器上的可用清单）</span>
+          <div className="mt-1.5 space-y-2">
             {template?.steps.map((s) => (
-              <label key={s.name} className="flex items-center gap-2 text-xs">
+              <div key={s.name} className="flex items-center gap-2 text-xs">
                 <span className="w-24 shrink-0 truncate text-slate-300">{s.name}</span>
                 {s.kind === "gate" ? (
                   <span className="text-slate-500">人工操作</span>
@@ -638,27 +685,23 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
                     <select
                       value={adapters[s.name] ?? s.adapter ?? ""}
                       onChange={(e) => setAdapters((prev) => ({ ...prev, [s.name]: e.currentTarget.value }))}
-                      className={inputClass}
+                      className={`${inputClass} w-32 shrink-0`}
                       title="这一步用哪个 Agent"
                     >
                       {CHAT_ADAPTERS.map((a) => (
                         <option key={a} value={a}>{a}</option>
                       ))}
                     </select>
-                    <input
+                    <StepModelField
+                      adapter={adapters[s.name] ?? s.adapter ?? ""}
+                      node={node}
                       value={models[s.name] ?? ""}
-                      onChange={(e) => {
-                        const value = e.currentTarget.value;
-                        setModels((prev) => ({ ...prev, [s.name]: value }));
-                      }}
-                      placeholder="默认模型"
-                      className={`${inputClass} w-24`}
-                      title="这一步单独用的模型；空则沿用整个流的模型"
-                      data-testid={`step-model-${s.name}`}
+                      onChange={(m) => setModels((prev) => ({ ...prev, [s.name]: m }))}
+                      testid={`step-model-${s.name}`}
                     />
                   </>
                 )}
-              </label>
+              </div>
             ))}
           </div>
         </div>
