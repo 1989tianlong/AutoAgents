@@ -88,6 +88,13 @@ const IcPulse = (p: IconProps) => (
   </svg>
 );
 
+const IcCoin = (p: IconProps) => (
+  <svg {...base} {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M9 8h4.5a2.5 2.5 0 0 1 0 5H9m0 0h5M10.5 6v2m0 8v2" />
+  </svg>
+);
+
 const IcSliders = (p: IconProps) => (
   <svg {...base} {...p}>
     <path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3" />
@@ -105,6 +112,7 @@ const NAV = [
   { to: "/github", label: "GitHub", Icon: IcGithub },
   { to: "/deploy", label: "部署", Icon: IcRocket },
   { to: "/sessions", label: "会话", Icon: IcTerminal },
+  { to: "/usage", label: "用量", Icon: IcCoin },
   { to: "/activity", label: "活动", Icon: IcPulse },
   { to: "/settings", label: "设置", Icon: IcSliders },
 ];

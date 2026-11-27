@@ -14,6 +14,8 @@ pub fn init(path: &Path) -> Result<Connection, String> {
             issue_number INTEGER,
             issue_url    TEXT,
             agent_id     TEXT,
+            -- 工作流的任务步骤建的：指回工作流（按规则 / 工作流汇总花费用）
+            workflow_id  INTEGER,
             status       TEXT NOT NULL DEFAULT 'pending',
             branch       TEXT,
             created_at   TEXT DEFAULT (datetime('now')),
@@ -236,6 +238,7 @@ pub fn init(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE tasks ADD COLUMN head_sha TEXT",
         "ALTER TABLE tasks ADD COLUMN failure TEXT",
         "ALTER TABLE tasks ADD COLUMN auto_pr INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN workflow_id INTEGER",
         "ALTER TABLE tasks ADD COLUMN checks TEXT",
         "ALTER TABLE tasks ADD COLUMN instructions TEXT",
         "ALTER TABLE deploy_targets ADD COLUMN auto_pr INTEGER NOT NULL DEFAULT 0",

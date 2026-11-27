@@ -1283,6 +1283,20 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
     let repo = {
         let db = state.db.lock().unwrap();
         let link = event_link(target.id);
+        // 每日预算到了：修复任务也不自动建（自动化先歇着，事件里说清楚）
+        if let Some((spent, budget)) = crate::usage::over_budget(&db) {
+            events::record(
+                &db,
+                "usage.budget",
+                "warning",
+                &target.name,
+                &format!(
+                    "生产部署出了问题，但今天的 Agent 花费 ${spent:.2} 已到每日预算 ${budget:.2}，不自动建修复任务；预算可以在「用量」页改：{reason}"
+                ),
+                Some(&link),
+            );
+            return None;
+        }
         if !target.auto_fix {
             events::record(
                 &db,

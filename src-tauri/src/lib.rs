@@ -247,6 +247,7 @@ pub fn run() {
             events::events_clear,
             // 用量与成本
             usage::usage_summary,
+            usage::usage_budget_set,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

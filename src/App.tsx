@@ -11,6 +11,7 @@ import GitHub from "./pages/GitHub";
 import Deploy from "./pages/Deploy";
 import Sessions from "./pages/Sessions";
 import Activity from "./pages/Activity";
+import Usage from "./pages/Usage";
 import Settings from "./pages/Settings";
 
 export default function App() {
@@ -29,6 +30,7 @@ export default function App() {
             <Route path="/workflows" element={<Workflows />} />
             <Route path="/github" element={<GitHub />} />
             <Route path="/deploy" element={<Deploy />} />
+            <Route path="/usage" element={<Usage />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/activity" element={<Activity />} />
             <Route path="/settings" element={<Settings />} />

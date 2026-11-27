@@ -836,8 +836,8 @@ async fn start_task_step(state: &Arc<AppState>, wf: &WfRow, step: &StepRow) -> R
             step.seq
         );
         db.execute(
-            "UPDATE tasks SET branch = ?1 WHERE id = ?2",
-            params![branch, task.id],
+            "UPDATE tasks SET branch = ?1, workflow_id = ?2 WHERE id = ?3",
+            params![branch, wf.id, task.id],
         )
         .map_err(|e| e.to_string())?;
         db.execute(

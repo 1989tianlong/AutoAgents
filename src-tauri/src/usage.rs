@@ -48,6 +48,65 @@ pub struct UsageSummary {
     pub by_machine: Vec<UsageBucket>,
     /// 花得最多的几个会话
     pub top_sessions: Vec<UsageBucket>,
+    /// 按仓库：手动任务、工作流、守护修复的花费都归到它的仓库上
+    pub by_repo: Vec<UsageBucket>,
+    /// 按自动化规则：规则触发的工作流（经 rule_runs 指回）里各步骤的花费
+    pub by_rule: Vec<UsageBucket>,
+    /// 今天（本地日）的花费
+    pub today_cost_usd: f64,
+    /// 每日预算（美元）；None 表示没设
+    pub daily_budget_usd: Option<f64>,
+}
+
+/// 每日预算存在 settings 里的键（美元，小数点数字；空 / 0 表示不限）
+const BUDGET_KEY: &str = "usage_daily_budget";
+
+/// 读每日预算
+pub fn budget_of(db: &Connection) -> Option<f64> {
+    db.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![BUDGET_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.trim().parse::<f64>().ok())
+    .filter(|v| *v > 0.0)
+}
+
+/// 写每日预算（0 或解析不了会被拒）
+pub fn set_budget(db: &Connection, budget: f64) -> Result<(), String> {
+    if !(budget.is_finite() && budget > 0.0) {
+        return Err("预算要是大于 0 的数字（美元）".into());
+    }
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![BUDGET_KEY, format!("{budget:.4}")],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 今天（本地日）的全部 Agent 花费
+pub fn today_cost(db: &Connection) -> f64 {
+    db.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(m.cost_usd), 0) {ASSISTANT}
+             AND date(m.created_at, 'localtime') = date('now', 'localtime')"
+        ),
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0.0)
+}
+
+/// 超预算了吗：返回 (已花, 预算)。没设预算或还没超就是 None。
+/// 预算管的是这台 AutoAgents 今天**全部** Agent 花费——手动发起的会话不拦，
+/// 拦的是自动化（规则触发、守护修复）不再自动开工。
+pub fn over_budget(db: &Connection) -> Option<(f64, f64)> {
+    let budget = budget_of(db)?;
+    let spent = today_cost(db);
+    (spent >= budget).then_some((spent, budget))
 }
 
 /// 只统计 Agent 的回答：用户消息与系统提示没有用量
@@ -141,6 +200,30 @@ fn summary(db: &Connection, days: u32) -> Result<UsageSummary, String> {
     for bucket in &mut by_machine {
         bucket.name = machine_name(db, &bucket.name);
     }
+    let by_repo = buckets(
+        db,
+        &format!(
+            "SELECT COALESCE(t.repo, '（没有关联仓库）'), {BUCKET_COLS}
+             FROM messages m JOIN sessions s ON s.id = m.session_id
+             LEFT JOIN tasks t ON t.session_id = s.id
+             WHERE m.role = 'assistant' GROUP BY t.repo ORDER BY 3 DESC LIMIT 20"
+        ),
+        &|row| row.get(0),
+    )?;
+    let by_rule = buckets(
+        db,
+        &format!(
+            "SELECT r.name, {BUCKET_COLS}
+             FROM messages m
+             JOIN sessions s ON s.id = m.session_id
+             JOIN tasks t ON t.session_id = s.id AND t.workflow_id IS NOT NULL
+             JOIN workflows w ON w.id = t.workflow_id
+             JOIN rule_runs rr ON rr.workflow_id = w.id
+             JOIN rules r ON r.id = rr.rule_id
+             WHERE m.role = 'assistant' GROUP BY r.id ORDER BY 3 DESC LIMIT 20"
+        ),
+        &|row| row.get(0),
+    )?;
     let top_sessions = buckets(
         db,
         &format!(
@@ -162,6 +245,10 @@ fn summary(db: &Connection, days: u32) -> Result<UsageSummary, String> {
         by_agent,
         by_machine,
         top_sessions,
+        by_repo,
+        by_rule,
+        today_cost_usd: today_cost(db),
+        daily_budget_usd: budget_of(db),
     })
 }
 
@@ -223,10 +310,156 @@ pub fn usage_summary(
     summary(&db, days.unwrap_or(14))
 }
 
+/// 设每日预算（美元）。超了之后自动化（规则触发、守护修复）不再自动开工，只记事件
+#[tauri::command]
+pub fn usage_budget_set(state: State<'_, Arc<AppState>>, budget: f64) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    set_budget(&db, budget)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::automation;
+    use crate::secrets::SecretStore;
     use crate::testutil::{fake_agent, test_state, TestState};
+
+
+    /// 直接往库里塞一条有花费的助手消息（今天，本地时区）
+    fn seed_cost(db: &Connection, cost: f64, repo: Option<&str>, workflow: Option<i64>) {
+        db.execute(
+            "INSERT INTO sessions (adapter, title, node_id) VALUES ('claude-cli', 'seed', 'local')",
+            [],
+        )
+        .unwrap();
+        let session = db.last_insert_rowid();
+        match (repo, workflow) {
+            (Some(repo), Some(wf)) => {
+                db.execute(
+                    "INSERT INTO tasks (title, source, repo, session_id, workflow_id, status)
+                     VALUES ('seed', 'manual', ?1, ?2, ?3, 'done')",
+                    params![repo, session, wf],
+                )
+                .unwrap();
+            }
+            (Some(repo), None) => {
+                db.execute(
+                    "INSERT INTO tasks (title, source, repo, session_id, status)
+                     VALUES ('seed', 'manual', ?1, ?2, 'done')",
+                    params![repo, session],
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+        db.execute(
+            "INSERT INTO messages (session_id, role, content, cost_usd, input_tokens, output_tokens, created_at)
+             VALUES (?1, 'assistant', 'ok', ?2, 10, 5, datetime('now', 'localtime'))",
+            params![session, cost],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn breakdowns_by_repo_and_rule() {
+        let ts = test_state(fake_agent("true").1);
+        let db = ts.state.db.lock().unwrap();
+        // 规则 → 工作流 → 任务 → 会话 的链路，外加一条不关联任务的花费
+        db.execute(
+            "INSERT INTO rules (name, kind, repo, config) VALUES ('盯标签', 'issue-label', 'octo/demo', '{}')",
+            [],
+        )
+        .unwrap();
+        let rule = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO workflows (name, template, repo, status) VALUES ('修 Issue · octo/demo', 'issue-fix', 'octo/demo', 'done')",
+            [],
+        )
+        .unwrap();
+        let wf = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO rule_runs (rule_id, key, workflow_id) VALUES (?1, 'issue:7', ?2)",
+            params![rule, wf],
+        )
+        .unwrap();
+        seed_cost(&db, 0.06, Some("octo/demo"), Some(wf));
+        seed_cost(&db, 0.02, Some("octo/other"), None);
+        seed_cost(&db, 0.01, None, None);
+
+        let summary = summary(&db, 14).unwrap();
+        assert_eq!(summary.by_repo[0].name, "octo/demo");
+        assert!((summary.by_repo[0].cost_usd - 0.06).abs() < 1e-9);
+        assert!(
+            summary
+                .by_repo
+                .iter()
+                .any(|b| b.name == "octo/other" && (b.cost_usd - 0.02).abs() < 1e-9)
+        );
+        assert!(summary.by_repo.iter().any(|b| b.name.contains("没有关联仓库")));
+        assert_eq!(summary.by_rule.len(), 1, "{:?}", summary.by_rule);
+        assert_eq!(summary.by_rule[0].name, "盯标签");
+        assert!((summary.by_rule[0].cost_usd - 0.06).abs() < 1e-9);
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn budget_gates_automation() {
+        let ts = test_state(fake_agent("true").1);
+        let state = ts.state.clone();
+        {
+            let db = state.db.lock().unwrap();
+            assert!(over_budget(&db).is_none(), "没设预算不拦");
+            set_budget(&db, 0.05).unwrap();
+            assert!(over_budget(&db).is_none(), "还没花钱，不算超");
+            seed_cost(&db, 0.06, None, None);
+            db.execute(
+                "INSERT INTO rules (name, kind, repo, config) VALUES ('盯标签', 'issue-label', 'octo/demo', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        ts.secrets.set("github_pat", "t").unwrap();
+        // 超了：这轮一个规则都不触发，只记一条事件
+        assert_eq!(automation::tick(&state).await, 0);
+        {
+            let db = state.db.lock().unwrap();
+            let mut stmt = db
+                .prepare("SELECT level, message FROM events WHERE kind = 'usage.budget'")
+                .unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].0, "warning");
+            assert!(
+                rows[0].1.contains("$0.06") && rows[0].1.contains("$0.05"),
+                "{}",
+                rows[0].1
+            );
+        }
+        // 再 tick 一遍：事件一天只记一条，不刷屏
+        assert_eq!(automation::tick(&state).await, 0);
+        let db = state.db.lock().unwrap();
+        let n: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'usage.budget'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn over_budget_verdict() {
+        let ts = test_state(fake_agent("true").1);
+        let db = ts.state.db.lock().unwrap();
+        set_budget(&db, 1.0).unwrap();
+        seed_cost(&db, 1.5, Some("octo/demo"), None);
+        assert_eq!(over_budget(&db), Some((1.5, 1.0)));
+    }
 
     const OK: &str = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' '{"type":"result","is_error":false,"result":"hello","total_cost_usd":0.02,"usage":{"input_tokens":5,"output_tokens":2}}'"#;
 

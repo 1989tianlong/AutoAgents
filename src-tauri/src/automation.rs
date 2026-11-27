@@ -386,6 +386,33 @@ pub async fn tick(state: &Arc<AppState>) -> usize {
     let Ok(token) = github::token_of(state) else {
         return 0; // 还没连 GitHub：没有可盯的
     };
+    // 每日预算：超了的话自动化先歇着（手动发起的会话与任务不拦）。一天只记一条，免得刷屏。
+    // 先把锁还了再进 if：if let 条件里的临时锁会活到块尾，块内再拿就死锁
+    let budget_hit = crate::usage::over_budget(&state.db.lock().unwrap());
+    if let Some((spent, budget)) = budget_hit {
+        let db = state.db.lock().unwrap();
+        let already = db
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'usage.budget' \
+                 AND date(ts, 'localtime') = date('now', 'localtime')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        if already == 0 {
+            events::record(
+                &db,
+                "usage.budget",
+                "warning",
+                "用量",
+                &format!(
+                    "今天的 Agent 花费 ${spent:.2} 已经到了每日预算 ${budget:.2}：自动化规则暂停触发，手动发起的不拦；预算可以在「用量」页改"
+                ),
+                Some("#/usage"),
+            );
+        }
+        return 0;
+    }
     let rules = match load_rules(&state.db.lock().unwrap(), true) {
         Ok(rules) => rules,
         Err(_) => return 0,

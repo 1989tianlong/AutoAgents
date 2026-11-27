@@ -69,6 +69,7 @@ const KIND_LABEL: Record<string, string> = {
   "deploy.guard": "守护",
   "deploy.repair": "建修复任务",
   "deploy.auto": "自动部署 / 回滚",
+  "usage.budget": "预算",
   "agent.launch": "桌面 Agent",
   "agent.quit": "桌面 Agent",
 };

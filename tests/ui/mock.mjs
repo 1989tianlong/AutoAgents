@@ -28,6 +28,8 @@ const MOCK = () => {
     tasks: [],
     /** 本机桌面 Agent 的运行状态（desktop_states 用） */
     desktop: [{ path: "/Applications/ZCode.app", running: false }],
+    /** 用量页：每日预算（null = 未设置）与今日花费 */
+    usage: { budget: null, today: 0.05 },
     taskDiffs: {},
     taskPatches: {},
     /** 为 true 时，下一次刷新把审查中的任务标成已合并 */
@@ -361,14 +363,26 @@ const MOCK = () => {
     usage_summary: () => ({
       turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15, avgDurationMs: 4200,
       last24hCostUsd: 0.05, last24hTurns: 2,
+      todayCostUsd: state.usage.today,
+      dailyBudgetUsd: state.usage.budget,
       byDay: [
         { day: "2026-11-23", turns: 1, costUsd: 0.04, tokens: 100 },
         { day: "2026-11-24", turns: 2, costUsd: 0.05, tokens: 215 },
       ],
       byAgent: [{ name: "claude-cli", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 }],
       byMachine: [{ name: "本机", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 }],
+      byRepo: [
+        { name: "octo/demo", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 },
+        { name: "（没有关联仓库）", turns: 1, costUsd: 0.01, inputTokens: 20, outputTokens: 3 },
+      ],
+      byRule: [{ name: "demo 的 bug 自动修", turns: 2, costUsd: 0.06, inputTokens: 200, outputTokens: 10 }],
       topSessions: [{ name: "hello", turns: 3, costUsd: 0.09, inputTokens: 300, outputTokens: 15 }],
     }),
+    usage_budget_set: ({ budget }) => {
+      if (!(budget > 0)) throw new Error("预算要是大于 0 的数字（美元）");
+      state.usage.budget = budget;
+      return null;
+    },
     github_status: () => state.ghUser,
     github_connect: () => {
       state.ghUser = { login: "octo", name: "Octo Cat", avatarUrl: null };

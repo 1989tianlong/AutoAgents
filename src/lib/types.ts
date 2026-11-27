@@ -376,6 +376,11 @@ export interface UsageSummary {
   byAgent: UsageBucket[];
   byMachine: UsageBucket[];
   topSessions: UsageBucket[];
+  byRepo: UsageBucket[];
+  byRule: UsageBucket[];
+  todayCostUsd: number;
+  /** 每日预算（美元）；null 表示没设 */
+  dailyBudgetUsd: number | null;
 }
 
 // ---------- 部署 ----------

@@ -206,6 +206,9 @@ export const eventsClear = (keep = 0) => invoke<number>("events_clear", { keep }
 /** 用量汇总：总计、最近几天、按 Agent / 机器 / 会话（不同 Agent 口径不同，费用与 token 分开看） */
 export const usageSummary = (days = 14) => invoke<UsageSummary>("usage_summary", { days });
 
+/** 设每日预算（美元）：超了之后自动化不再自动开工 */
+export const usageBudgetSet = (budget: number) => invoke<void>("usage_budget_set", { budget });
+
 // ---------- 部署 ----------
 
 /** 两家平台的连接状态（会拿保存的令牌各验证一次） */
