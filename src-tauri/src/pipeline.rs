@@ -1662,8 +1662,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         );
 
         // Agent 没改任何文件
-        let talker =
-            r#"printf '%s\n' '{"type":"result","is_error":false,"result":"我觉得不需要改。"}'"#;
+        let talker = r#"printf '%s\n' '{"type":"result","is_error":false,"result":"我觉得不需要改。"}'; sleep 0.3"#;
         let idle = service_for(fake_script("claude", talker), None);
         let TestState {
             state: state2,
