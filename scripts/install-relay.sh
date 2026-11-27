@@ -28,7 +28,6 @@ if [ "${VERSION}" = "latest" ] && [ "${BASE}" = "https://github.com/${REPO}/rele
   dir="https://github.com/${REPO}/releases/latest/download"
 fi
 NAME="autoagents-relay"
-LABEL="com.tianlong.autoagents.relay"
 
 say() { printf '%s\n' "$*"; }
 die() { printf '\n安装失败：%s\n\n' "$*" >&2; exit 1; }
@@ -50,9 +49,21 @@ while [ $# -gt 0 ]; do
   case "${1}" in
     --service) mode=service ;;
     --run) mode=run ;;
-    --public) public="${2:-}"; shift ;;
-    --port) port="${2:-}"; shift ;;
-    --token) token="${2:-}"; shift ;;
+    --public)
+      [ $# -ge 2 ] || die "--public 需要一个地址参数"
+      public="${2}"
+      shift
+      ;;
+    --port)
+      [ $# -ge 2 ] || die "--port 需要一个数字参数"
+      port="${2}"
+      shift
+      ;;
+    --token)
+      [ $# -ge 2 ] || die "--token 需要一个令牌参数"
+      token="${2}"
+      shift
+      ;;
     --help|-h)
       say "用法：curl -fsSL <本脚本> | sh -s -- [--service | --run] [--public wss://…:端口] [--port 端口] [--token 令牌]"
       exit 0
@@ -63,6 +74,12 @@ while [ $# -gt 0 ]; do
 done
 case "${port}" in
   ''|*[!0-9]*) die "端口应当是数字：${port}" ;;
+esac
+if [ "$(printf '%s' "${public}${token}" | wc -l | tr -d ' ')" -ne 0 ]; then
+  die "参数不能包含换行符"
+fi
+case "${public}${token}" in
+  *"$(printf '\r')"*) die "参数不能包含回车符" ;;
 esac
 
 # ---------- 认出平台 ----------
@@ -120,7 +137,6 @@ if [ "${mode}" = service ]; then
   [ "$(id -u)" = 0 ] || die "--service 需要 root：在命令前加 sudo"
   command -v systemctl >/dev/null 2>&1 || die "这台机器上没有 systemd，去掉 --service 再试"
   bin="/usr/local/bin/${NAME}"
-  data="/var/lib/autoagents-relay"
   mkdir -p /usr/local/bin
   tar -xzf "${work}/${asset}" -C "${work}" "${NAME}"
   chmod 0755 "${work}/${NAME}"
@@ -149,18 +165,33 @@ if [ -z "${public}" ]; then
     *) public="wss://${detected}:${port}" ;;
   esac
 fi
-args="--listen 0.0.0.0:${port} --public ${public}"
-[ -n "${token}" ] && args="${args} --token ${token}"
+# 转义 systemd unit 值（防止 % / $ / " / \ 注入）
+sd_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g' -e 's/\$/\$\$/g'
+}
 
 case "${mode}" in
   run)
     say ""
     say "中继在前台运行，按 Ctrl+C 停止。"
-    exec "${bin}" ${args} </dev/null
+    if [ -n "${token}" ]; then
+      exec "${bin}" --listen "0.0.0.0:${port}" --public "${public}" --token "${token}" </dev/null
+    else
+      exec "${bin}" --listen "0.0.0.0:${port}" --public "${public}" </dev/null
+    fi
     ;;
   service)
     # DynamicUser：不用专门建用户；StateDirectory 负责建数据目录并给它权限
     unit="/etc/systemd/system/${NAME}.service"
+    pub_esc="$(sd_escape "${public}")"
+    exec_line="\"${bin}\" --listen 0.0.0.0:${port} --public \"${pub_esc}\" --data-dir /var/lib/autoagents-relay"
+    if [ -n "${token}" ]; then
+      # 令牌单独落盘 0600，避免 0644 的 systemd unit 泄漏给本机其他用户
+      mkdir -p /var/lib/autoagents-relay
+      umask 077
+      printf '%s' "${token}" > /var/lib/autoagents-relay/token
+      chmod 0600 /var/lib/autoagents-relay/token
+    fi
     cat > "${unit}" <<UNIT
 [Unit]
 Description=AutoAgents relay
@@ -170,7 +201,7 @@ Wants=network-online.target
 [Service]
 DynamicUser=yes
 StateDirectory=autoagents-relay
-ExecStart=${bin} ${args} --data-dir /var/lib/autoagents-relay
+ExecStart=${exec_line}
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes
@@ -187,19 +218,21 @@ UNIT
     say "已安装为系统服务并启动：${unit}"
     ;;
   install)
+    display_args="--listen 0.0.0.0:${port} --public '${public}'"
+    [ -n "${token}" ] && display_args="${display_args} --token '${token}'"
     say ""
     say "已安装到 ${bin}。"
     say ""
     say "启动（保持这个终端开着；或放进 tmux / screen）："
     say ""
-    say "  ${bin} ${args}"
+    say "  ${bin} ${display_args}"
     say ""
     say "要开机自启，在 Linux 上可以注册成用户服务："
     say ""
     say "  mkdir -p ~/.config/systemd/user"
     say "  cat > ~/.config/systemd/user/${NAME}.service <<'UNIT'"
     say "  [Service]"
-    say "  ExecStart=${bin} ${args}"
+    say "  ExecStart=${bin} ${display_args}"
     say "  Restart=always"
     say "  [Install]"
     say "  WantedBy=default.target"

@@ -218,6 +218,10 @@ pub fn build_command(spec: &TurnSpec) -> Command {
 /// 之后再次按这个 pid 找进程组一定是安全的。
 #[cfg(unix)]
 pub fn signal_group(pid: u32) {
+    // 禁止 pid <= 1：kill(0) 会杀自身进程组，kill(-1) 会杀全系统所有可发信号进程
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return;
+    }
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
@@ -226,6 +230,9 @@ pub fn signal_group(pid: u32) {
 /// Windows：按进程树结束（`taskkill /T`）。
 #[cfg(windows)]
 pub fn signal_group(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
@@ -236,20 +243,8 @@ pub fn signal_group(pid: u32) {
 /// 结束子进程连同它拉起的所有子进程。
 /// Unix 上子进程是独立进程组的组长，整组结束；Windows 上按进程树结束。
 pub fn kill_process_group(child: &mut CommandChild) {
-    #[cfg(unix)]
     if let Some(pid) = child.id() {
-        // 负 pid 表示整个进程组
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        signal_group(pid);
     }
     let _ = child.start_kill();
 }
@@ -392,10 +387,10 @@ fn parse_codex(v: &Value, st: &mut TurnState, out: &mut Vec<TurnEvent>) {
         }
         "task_complete" => {
             st.finished = true;
-            if st.final_text.is_empty() {
-                if let Some(text) = v["last_agent_message"].as_str() {
-                    out.extend(st.push_text(text));
-                }
+            if st.final_text.is_empty()
+                && let Some(text) = v["last_agent_message"].as_str()
+            {
+                out.extend(st.push_text(text));
             }
         }
         "item.started" | "item.updated" | "item.completed" => {
@@ -406,10 +401,8 @@ fn parse_codex(v: &Value, st: &mut TurnState, out: &mut Vec<TurnEvent>) {
                     // 当前版本按整条给出；若某版本提供 text_delta 则走增量
                     if let Some(delta) = item["text_delta"].as_str() {
                         out.push(st.push_delta(delta));
-                    } else if done {
-                        if let Some(text) = item["text"].as_str() {
-                            out.extend(st.push_text(text));
-                        }
+                    } else if done && let Some(text) = item["text"].as_str() {
+                        out.extend(st.push_text(text));
                     }
                 }
                 "reasoning" if done => out.push(TurnEvent::Notice(format!(
@@ -575,7 +568,12 @@ mod tests {
         assert_eq!(deltas(&out), ["1\n", "2"]);
         assert!(matches!(&out[0], TurnEvent::Session(id) if id == "s1"));
         // 思考提示只出现一次
-        assert_eq!(out.iter().filter(|e| matches!(e, TurnEvent::Notice(_))).count(), 1);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, TurnEvent::Notice(_)))
+                .count(),
+            1
+        );
     }
 
     /// 限流重试要提示出来：默认模型额度耗尽时 CLI 会静默重试十来分钟
@@ -583,10 +581,14 @@ mod tests {
     fn claude_api_retry_is_surfaced() {
         let (st, out) = run(
             "claude-cli",
-            &[r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":60000,"error_status":429,"error":"rate_limit"}"#],
+            &[
+                r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":60000,"error_status":429,"error":"rate_limit"}"#,
+            ],
         );
         assert!(!st.finished);
-        assert!(matches!(&out[0], TurnEvent::Notice(t) if t == "请求被拒（429 rate_limit），60 秒后重试 1/10…"));
+        assert!(
+            matches!(&out[0], TurnEvent::Notice(t) if t == "请求被拒（429 rate_limit），60 秒后重试 1/10…")
+        );
     }
 
     /// grok 与 claude 同构，走同一解析器
@@ -606,7 +608,12 @@ mod tests {
         assert_eq!(st.cost_usd, Some(0.03));
         // 逐字流式下，工具调用提示只由 content_block_start 给出一次
         assert_eq!(deltas(&out), ["done"]);
-        assert_eq!(out.iter().filter(|e| matches!(e, TurnEvent::Notice(_))).count(), 1);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, TurnEvent::Notice(_)))
+                .count(),
+            1
+        );
     }
 
     /// codex 没有增量：整条消息既落库也实时推送；item 级 error 只是非致命告警
@@ -650,9 +657,10 @@ mod tests {
         assert_eq!((st.input_tokens, st.output_tokens), (Some(101), Some(6)));
         assert_eq!(deltas(&out), ["Hi"]);
         // message_end 里的完整文本不再重复推送，只补上没有增量的部分
-        assert!(out
-            .iter()
-            .any(|e| matches!(e, TurnEvent::Notice(t) if t == "调用工具 bash")));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, TurnEvent::Notice(t) if t == "调用工具 bash"))
+        );
     }
 
     /// 只有轮级错误才是致命的
@@ -664,7 +672,10 @@ mod tests {
         );
         assert!(matches!(&out[0], TurnEvent::Failed(m) if m == "boom"));
 
-        let (_, out) = run("codex-cli", &[r#"{"type":"turn.failed","error":{"message":"no auth"}}"#]);
+        let (_, out) = run(
+            "codex-cli",
+            &[r#"{"type":"turn.failed","error":{"message":"no auth"}}"#],
+        );
         assert!(matches!(&out[0], TurnEvent::Failed(m) if m == "no auth"));
 
         let (_, out) = run("pi", &[r#"{"type":"error","message":"bad model"}"#]);
@@ -714,7 +725,16 @@ mod tests {
         );
         assert_eq!(
             args(&build_command(&spec("codex-cli", Some("m"), Some("t1")))),
-            ["exec", "resume", "--json", "--skip-git-repo-check", "-m", "m", "t1", "hi"]
+            [
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "-m",
+                "m",
+                "t1",
+                "hi"
+            ]
         );
 
         let grok = build_command(&spec("grok-cli", Some("m"), Some("g1")));
@@ -738,7 +758,16 @@ mod tests {
 
         assert_eq!(
             args(&build_command(&spec("pi", Some("p/m"), Some("p1")))),
-            ["-p", "hi", "--mode", "json", "--model", "p/m", "--session", "p1"]
+            [
+                "-p",
+                "hi",
+                "--mode",
+                "json",
+                "--model",
+                "p/m",
+                "--session",
+                "p1"
+            ]
         );
 
         // 所有 Agent 都在指定工作目录下运行，并补齐 PATH

@@ -20,16 +20,19 @@ use crate::machine;
 use crate::models;
 use crate::runner::{self, TurnEvent, TurnParams};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// git 命令的超时：推送大仓库、拉取慢镜像时可能较慢
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// git 输出最大保留字节数（防 OOM）
+const GIT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 /// `fs.ls` 最多返回的目录数
 const LS_LIMIT: usize = 500;
@@ -53,21 +56,38 @@ pub struct ServiceOptions {
 
 pub struct Service {
     opts: ServiceOptions,
+    /// 是否配置了目录白名单（一旦配置即 fail-closed：即使目录均不可访问也不得放开全盘）
+    restricted: bool,
     allowed_roots: Vec<PathBuf>,
-    turns: Mutex<HashMap<String, runner::TurnHandle>>,
+    turns: Mutex<HashMap<String, (u64, runner::TurnHandle)>>,
+    turn_seq: AtomicU64,
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        discovery::home_dir()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        discovery::home_dir().join(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 impl Service {
     pub fn new(opts: ServiceOptions) -> Arc<Self> {
+        let restricted = !opts.allowed_roots.is_empty();
         let allowed_roots = opts
             .allowed_roots
             .iter()
-            .filter_map(|root| root.canonicalize().ok())
+            .filter_map(|root| expand_tilde(root).canonicalize().ok())
             .collect();
         Arc::new(Self {
             opts,
+            restricted,
             allowed_roots,
             turns: Mutex::new(HashMap::new()),
+            turn_seq: AtomicU64::new(1),
         })
     }
 
@@ -78,19 +98,23 @@ impl Service {
 
     /// 目录是否在允许范围内（规范化之后比较，`..` 与符号链接绕不过去）
     fn check_path(&self, path: &Path) -> Result<PathBuf, String> {
-        let canonical = path
+        let canonical = expand_tilde(path)
             .canonicalize()
             .map_err(|e| format!("无法访问 {}：{e}", path.display()))?;
-        if self.allowed_roots.is_empty()
-            || self.allowed_roots.iter().any(|root| canonical.starts_with(root))
+        if !self.restricted
+            || self
+                .allowed_roots
+                .iter()
+                .any(|root| canonical.starts_with(root))
         {
             Ok(canonical)
         } else {
-            Err(format!(
-                "{} 不在这台机器允许的目录范围内",
-                path.display()
-            ))
+            Err(format!("{} 不在这台机器允许的目录范围内", path.display()))
         }
+    }
+
+    fn is_within_roots(&self, path: &Path) -> bool {
+        !self.restricted || self.allowed_roots.iter().any(|root| path.starts_with(root))
     }
 
     /// 执行一个请求。`events` 用来推送 `turn.start` 之后的对话过程；
@@ -117,7 +141,7 @@ impl Service {
             "models.list" => to_value(models::load_models(text("adapter")?).await?),
             "fs.ls" => {
                 let path = self.check_path(Path::new(text("path")?))?;
-                ls(&path)
+                ls(&path, |p| self.is_within_roots(p))
             }
             "git.run" => {
                 let workdir = self.check_path(Path::new(text("workdir")?))?;
@@ -125,7 +149,11 @@ impl Service {
                     .as_array()
                     .ok_or("args 应当是字符串数组")?
                     .iter()
-                    .map(|a| a.as_str().map(str::to_string).ok_or("args 应当是字符串数组"))
+                    .map(|a| {
+                        a.as_str()
+                            .map(str::to_string)
+                            .ok_or("args 应当是字符串数组")
+                    })
                     .collect::<Result<_, _>>()?;
                 to_value(git(&workdir, &args).await?)
             }
@@ -157,10 +185,27 @@ impl Service {
         if !adapters::is_supported(&params.adapter) {
             return Err(format!("「{}」的会话适配尚未实现", params.adapter));
         }
+        if let Some(model) = params.model.as_deref()
+            && (model.starts_with('-')
+                || model.contains('\0')
+                || model.chars().any(char::is_control))
+        {
+            return Err("模型名格式不合法".into());
+        }
+        if let Some(resume) = params.resume.as_deref()
+            && (resume.starts_with('-')
+                || resume.contains('\0')
+                || resume.contains("..")
+                || resume.contains('/')
+                || resume.contains('\\')
+                || resume.chars().any(char::is_control))
+        {
+            return Err("外部会话标识格式不合法".into());
+        }
         // 先校验再启动：目录按这台机器的规则展开（`~` 指这里的主目录），
         // 再看它是否落在允许范围内。启动之后失败就只能以失败事件告知了。
         let workdir = runner::resolve_workdir(params.workdir.as_deref())?;
-        if !self.allowed_roots.is_empty() {
+        if self.restricted {
             self.check_path(&workdir)?;
         }
         let id = params.turn_id.clone();
@@ -183,14 +228,22 @@ impl Service {
                 Some(resolve) => runner::start_with(params, resolve.clone()),
                 None => runner::start(params),
             };
-            turns.insert(id.clone(), output.handle.clone());
+            let seq = self.turn_seq.fetch_add(1, Ordering::Relaxed);
+            turns.insert(id.clone(), (seq, output.handle.clone()));
             let service = Arc::clone(self);
             let turn_id = id.clone();
             tokio::spawn(async move {
                 let mut events_rx = output.events;
                 let mut stopped = false;
+                let remove_own = |svc: &Service| {
+                    let mut map = svc.turns.lock().unwrap();
+                    if map.get(&turn_id).is_some_and(|(s, _)| *s == seq) {
+                        map.remove(&turn_id);
+                    }
+                };
                 while let Some(event) = events_rx.recv().await {
-                    let ended = matches!(event, TurnEvent::Finished { .. } | TurnEvent::Failed { .. });
+                    let ended =
+                        matches!(event, TurnEvent::Finished { .. } | TurnEvent::Failed { .. });
                     if !stopped && events.send(event).await.is_err() {
                         // 调用方已经离开（连接断开）：不让 Agent 在这台机器上无人看管地跑下去
                         stopped = true;
@@ -198,10 +251,10 @@ impl Service {
                     }
                     // 终态一出手就不算运行中了：控制端紧接着发下一轮时，这一轮不能还占着会话号
                     if ended {
-                        service.turns.lock().unwrap().remove(&turn_id);
+                        remove_own(&service);
                     }
                 }
-                service.turns.lock().unwrap().remove(&turn_id);
+                remove_own(&service);
             });
         }
         Ok(json!({ "turnId": id }))
@@ -210,7 +263,7 @@ impl Service {
     /// 停止一轮对话；返回它是否在运行
     pub fn stop_turn(&self, turn_id: &str) -> bool {
         match self.turns.lock().unwrap().get(turn_id) {
-            Some(handle) => {
+            Some((_, handle)) => {
                 handle.stop();
                 true
             }
@@ -220,7 +273,13 @@ impl Service {
 
     /// 停止所有正在运行的对话（agentd 退出前调用）
     pub fn stop_all(&self) {
-        let handles: Vec<_> = self.turns.lock().unwrap().values().cloned().collect();
+        let handles: Vec<_> = self
+            .turns
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(_, h)| h.clone())
+            .collect();
         for handle in handles {
             handle.stop();
         }
@@ -239,9 +298,9 @@ struct DirEntry {
     git: bool,
 }
 
-/// 列出目录下的子目录（不含隐藏目录），目录优先按名字排序
-fn ls(path: &Path) -> Result<Value, String> {
-    let entries = std::fs::read_dir(path)
+/// 列出目录下的子目录（不含隐藏目录），按名字排序
+fn ls(path: &Path, allow_parent: impl Fn(&Path) -> bool) -> Result<Value, String> {
+    let mut entries = std::fs::read_dir(path)
         .map_err(|e| format!("无法读取 {}：{e}", path.display()))?
         .flatten()
         .filter_map(|entry| {
@@ -254,11 +313,21 @@ fn ls(path: &Path) -> Result<Value, String> {
                 name,
             })
         })
-        .take(LS_LIMIT)
         .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    entries.truncate(LS_LIMIT);
+    let parent = path
+        .parent()
+        .filter(|p| allow_parent(p))
+        .map(|p| p.to_string_lossy().into_owned());
     Ok(json!({
         "path": path.to_string_lossy(),
-        "parent": path.parent().map(|p| p.to_string_lossy().into_owned()),
+        "parent": parent,
         "entries": entries,
     }))
 }
@@ -278,30 +347,170 @@ impl GitOutput {
     }
 }
 
-/// 在 `workdir` 下执行 `git <args>`
-pub async fn git(workdir: &Path, args: &[String]) -> Result<GitOutput, String> {
+/// 允许通过 `git.run` 调用的子命令白名单
+const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "branch",
+    "clone",
+    "commit",
+    "config",
+    "diff",
+    "fetch",
+    "init",
+    "log",
+    "ls-remote",
+    "push",
+    "remote",
+    "rev-list",
+    "rev-parse",
+    "show",
+    "status",
+    "worktree",
+];
+
+fn validate_git_args(workdir: &Path, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("git 参数不能为空".into());
     }
-    let output = tokio::time::timeout(
-        GIT_TIMEOUT,
-        tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .args(args)
-            .env("PATH", discovery::child_path())
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await;
+    for arg in args {
+        if arg.contains('\0') {
+            return Err("git 参数包含非法字符".into());
+        }
+        if arg.starts_with("ext::") {
+            return Err("禁止使用 ext:: 协议".into());
+        }
+    }
+    // 子命令之前仅允许白名单内的提交身份配置：-c user.name=... / -c user.email=...
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') {
+        if args[i] == "-c" {
+            let Some(kv) = args.get(i + 1) else {
+                return Err("git -c 缺少配置项".into());
+            };
+            let allowed_kv = kv.starts_with("user.name=")
+                || kv.starts_with("user.email=")
+                || kv == "core.quotepath=false";
+            if !allowed_kv {
+                return Err(format!("禁止通过 git -c 覆盖配置：{kv}"));
+            }
+            i += 2;
+        } else {
+            return Err(format!("禁止传递 git 全局参数：{}", args[i]));
+        }
+    }
+    let Some(sub) = args.get(i).map(String::as_str) else {
+        return Err("缺少 git 子命令".into());
+    };
+    if !ALLOWED_GIT_SUBCOMMANDS.contains(&sub) {
+        return Err(format!("不允许执行的 git 子命令：{sub}"));
+    }
+    let rest = &args[i + 1..];
+    if sub == "config" {
+        if rest.first().map(String::as_str) != Some("--get") {
+            return Err("git config 仅允许只读 --get 查询".into());
+        }
+        return Ok(());
+    }
+    // 禁止可触发外部命令执行的选项（`--` 之后为路径或位置参数）
+    let mut after_sep = false;
+    let mut no_index = false;
+    for arg in rest {
+        if arg == "--" {
+            after_sep = true;
+            continue;
+        }
+        if !after_sep {
+            if arg == "--no-index" {
+                no_index = true;
+            }
+            let lower = arg.to_ascii_lowercase();
+            let forbidden = matches!(
+                lower.as_str(),
+                "-c" | "--config"
+                    | "--upload-pack"
+                    | "--receive-pack"
+                    | "--exec"
+                    | "--ext-diff"
+                    | "--git-dir"
+                    | "--work-tree"
+                    | "--exec-path"
+                    | "--config-env"
+            ) || lower.starts_with("--config=")
+                || lower.starts_with("--upload-pack=")
+                || lower.starts_with("--receive-pack=")
+                || lower.starts_with("--exec=")
+                || lower.starts_with("--git-dir=")
+                || lower.starts_with("--work-tree=")
+                || lower.starts_with("--exec-path=");
+            if forbidden {
+                return Err(format!("禁止传递危险的 git 参数：{arg}"));
+            }
+        }
+    }
+    // `diff --no-index` 会绕过 `-C`，必须把所有目标文件严格限制在 workdir 内
+    if sub == "diff" && no_index {
+        let canonical_dir = workdir
+            .canonicalize()
+            .map_err(|e| format!("无法访问 {}：{e}", workdir.display()))?;
+        let mut sep = false;
+        for arg in rest {
+            if !sep {
+                if arg == "--" {
+                    sep = true;
+                }
+                continue;
+            }
+            if arg == "/dev/null" {
+                continue;
+            }
+            let target = Path::new(arg);
+            let joined = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                canonical_dir.join(target)
+            };
+            let canonical_target = joined
+                .canonicalize()
+                .map_err(|e| format!("无法访问目标文件 {arg}：{e}"))?;
+            if !canonical_target.starts_with(&canonical_dir) {
+                return Err(format!("禁止读取工作目录之外的文件：{arg}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clip_bytes(bytes: &[u8]) -> String {
+    if bytes.len() <= GIT_OUTPUT_LIMIT {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        let mut s = String::from_utf8_lossy(&bytes[..GIT_OUTPUT_LIMIT]).into_owned();
+        s.push_str("\n…（输出超过限制，已截断）");
+        s
+    }
+}
+
+/// 在 `workdir` 下执行 `git <args>`
+pub async fn git(workdir: &Path, args: &[String]) -> Result<GitOutput, String> {
+    validate_git_args(workdir, args)?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(workdir)
+        .args(args)
+        .env("PATH", discovery::child_path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await;
     match output {
         Err(_) => Err(format!("git 执行超时（{} 秒）", GIT_TIMEOUT.as_secs())),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err("这台机器上没有安装 git".into()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("这台机器上没有安装 git".into())
+        }
         Ok(Err(e)) => Err(format!("启动 git 失败：{e}")),
         Ok(Ok(out)) => Ok(GitOutput {
             code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: clip_bytes(&out.stdout),
+            stderr: clip_bytes(&out.stderr),
         }),
     }
 }
@@ -323,9 +532,7 @@ mod tests {
     async fn call(service: &Arc<Service>, method: &str, params: Value) -> Result<Value, String> {
         let (tx, mut rx) = mpsc::channel(16);
         // 事件通道不能在请求返回前被丢掉，否则正在运行的对话会被当成「调用方已离开」
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
         service.call(method, &params, tx).await
     }
 
@@ -345,8 +552,17 @@ mod tests {
     async fn unknown_method_and_missing_params() {
         let s = service(None, vec![]);
         assert!(call(&s, "nope", json!({})).await.is_err());
-        assert!(call(&s, "fs.ls", json!({})).await.unwrap_err().contains("path"));
-        assert!(call(&s, "models.list", json!({ "adapter": "zcode" })).await.is_err());
+        assert!(
+            call(&s, "fs.ls", json!({}))
+                .await
+                .unwrap_err()
+                .contains("path")
+        );
+        assert!(
+            call(&s, "models.list", json!({ "adapter": "zcode" }))
+                .await
+                .is_err()
+        );
     }
 
     /// 允许范围：符号链接与 `..` 都绕不过去
@@ -359,10 +575,14 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         let s = service(None, vec![inside.clone()]);
         assert!(call(&s, "fs.ls", json!({ "path": inside })).await.is_ok());
-        let err = call(&s, "fs.ls", json!({ "path": outside })).await.unwrap_err();
+        let err = call(&s, "fs.ls", json!({ "path": outside }))
+            .await
+            .unwrap_err();
         assert!(err.contains("允许的目录范围"), "{err}");
         let sneaky = inside.join("../outside");
-        let err = call(&s, "fs.ls", json!({ "path": sneaky })).await.unwrap_err();
+        let err = call(&s, "fs.ls", json!({ "path": sneaky }))
+            .await
+            .unwrap_err();
         assert!(err.contains("允许的目录范围"), "{err}");
         // macOS 的临时目录本身是 /private 的符号链接，规范化后仍要落在范围内
         assert!(s.allowed_roots[0].is_absolute());
@@ -376,10 +596,17 @@ mod tests {
         std::fs::create_dir(dir.path().join(".hidden")).unwrap();
         std::fs::write(dir.path().join("file.txt"), "x").unwrap();
         let s = service(None, vec![]);
-        let v = call(&s, "fs.ls", json!({ "path": dir.path() })).await.unwrap();
-        let entries = v["entries"].as_array().unwrap_or_else(|| panic!("意外的返回：{v}"));
+        let v = call(&s, "fs.ls", json!({ "path": dir.path() }))
+            .await
+            .unwrap();
+        let entries = v["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("意外的返回：{v}"));
         assert_eq!(entries.len(), 2, "只列目录，不含隐藏目录与文件");
-        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"project") && names.contains(&"plain"));
         let project = entries.iter().find(|e| e["name"] == "project").unwrap();
         assert_eq!(project["git"], true);
@@ -406,7 +633,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(top["code"], 0);
-        assert!(top["stdout"].as_str().unwrap().trim().ends_with(dir.path().file_name().unwrap().to_str().unwrap()));
+        assert!(
+            top["stdout"]
+                .as_str()
+                .unwrap()
+                .trim()
+                .ends_with(dir.path().file_name().unwrap().to_str().unwrap())
+        );
         // 不在仓库里：返回非零退出码和 stderr，而不是报错
         let parent = dir.path().parent().unwrap();
         let out = call(
@@ -417,7 +650,11 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(out["code"], 0);
-        assert!(call(&s, "git.run", json!({ "workdir": dir.path(), "args": [] })).await.is_err());
+        assert!(
+            call(&s, "git.run", json!({ "workdir": dir.path(), "args": [] }))
+                .await
+                .is_err()
+        );
     }
 
     /// 完整走一遍：启动 → 收到事件 → 以 Finished 结束；重复的 turnId 被拒绝
@@ -432,7 +669,8 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let bin2 = bin.clone();
         let s = Service::new(ServiceOptions {
             resolve: Some(Arc::new(move |_: &str| Some(bin2.clone())) as BinaryResolver),
@@ -444,16 +682,39 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
         assert_eq!(started["turnId"], "42");
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
-            events.push(serde_json::to_value(&event).unwrap()["type"].as_str().unwrap().to_string());
+            events.push(
+                serde_json::to_value(&event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
         // result 里的文本在本例中没有 assistant 消息承载，按整条增量带回
         assert_eq!(events, ["turn.session", "turn.delta", "turn.finished"]);
 
         // 参数校验
         let (tx, _rx) = mpsc::channel(8);
-        assert!(s.call("turn.start", &json!({ "turnId": "1", "adapter": "claude-cli", "prompt": "  " }), tx).await.unwrap_err().contains("不能为空"));
+        assert!(
+            s.call(
+                "turn.start",
+                &json!({ "turnId": "1", "adapter": "claude-cli", "prompt": "  " }),
+                tx
+            )
+            .await
+            .unwrap_err()
+            .contains("不能为空")
+        );
         let (tx, _rx) = mpsc::channel(8);
-        assert!(s.call("turn.start", &json!({ "turnId": "1", "adapter": "zcode", "prompt": "hi" }), tx).await.unwrap_err().contains("适配"));
+        assert!(
+            s.call(
+                "turn.start",
+                &json!({ "turnId": "1", "adapter": "zcode", "prompt": "hi" }),
+                tx
+            )
+            .await
+            .unwrap_err()
+            .contains("适配")
+        );
         assert_eq!(s.running_turns(), 0);
     }
 
@@ -463,7 +724,8 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let bin2 = bin.clone();
         let s = Service::new(ServiceOptions {
             resolve: Some(Arc::new(move |_: &str| Some(bin2.clone())) as BinaryResolver),
@@ -488,7 +750,8 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let bin2 = bin.clone();
         let s = Service::new(ServiceOptions {
             resolve: Some(Arc::new(move |_: &str| Some(bin2.clone())) as BinaryResolver),
@@ -498,11 +761,12 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
         let (tx, mut rx) = mpsc::channel(64);
         s.call("turn.start", &params, tx).await.unwrap();
         let (tx, _keep) = mpsc::channel(8);
-        assert!(s
-            .call("turn.start", &params, tx)
-            .await
-            .unwrap_err()
-            .contains("还在运行"));
+        assert!(
+            s.call("turn.start", &params, tx)
+                .await
+                .unwrap_err()
+                .contains("还在运行")
+        );
         assert_eq!(s.running_turns(), 1);
         assert!(s.stop_turn("7"));
         assert!(!s.stop_turn("nope"));
@@ -525,7 +789,8 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let bin2 = bin.clone();
         let s = Service::new(ServiceOptions {
             resolve: Some(Arc::new(move |_: &str| Some(bin2.clone())) as BinaryResolver),
@@ -533,15 +798,24 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"s9"}' '{"type":"r
             ..Default::default()
         });
         let (tx, _keep) = mpsc::channel(64);
-        s.call("turn.start", &json!({ "turnId": "a", "adapter": "claude-cli", "prompt": "hi" }), tx)
-            .await
-            .unwrap();
+        s.call(
+            "turn.start",
+            &json!({ "turnId": "a", "adapter": "claude-cli", "prompt": "hi" }),
+            tx,
+        )
+        .await
+        .unwrap();
         let (tx, _keep2) = mpsc::channel(64);
-        assert!(s
-            .call("turn.start", &json!({ "turnId": "b", "adapter": "claude-cli", "prompt": "hi" }), tx)
+        assert!(
+            s.call(
+                "turn.start",
+                &json!({ "turnId": "b", "adapter": "claude-cli", "prompt": "hi" }),
+                tx
+            )
             .await
             .unwrap_err()
-            .contains("上限"));
+            .contains("上限")
+        );
         s.stop_all();
     }
 }

@@ -21,8 +21,9 @@ mod testutil;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::Manager;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// 全局应用状态：SQLite 连接、本机的机器侧服务、运行中的对话、远程机器、凭据存储。
 pub struct AppState {
@@ -41,6 +42,10 @@ pub struct AppState {
     pub remote: Arc<remote::RemoteManager>,
     /// 本机的机器信息：第一次取到后沿用
     pub local_info: Mutex<Option<autoagents_core::machine::MachineInfo>>,
+    /// 共享 HTTP 客户端（复用 TCP / TLS 连接池）
+    pub http: reqwest::Client,
+    /// 健康检查专用 HTTP 客户端（短超时、限制重定向次数）
+    pub health_http: reqwest::Client,
     /// GitHub API 的地址（测试里指向本地的假服务器）
     pub gh_api: Mutex<String>,
     /// Vercel / Cloudflare API 的地址（测试里指向本地的假服务器）
@@ -50,6 +55,12 @@ pub struct AppState {
     pub deploy: deploy::Deployer,
     /// 任务流水线的运行时状态（正在收尾的任务）
     pub pipeline: pipeline::Pipeline,
+    /// 工作流引擎的运行时状态（按工作流 ID 串行推进，避免轮询并发重复启动）
+    pub workflow: workflow::WorkflowEngine,
+    /// 自动化规则扫描互斥锁（防止手动扫描与定时轮询并发重复评论）
+    pub automation_lock: tokio::sync::Mutex<()>,
+    /// 应用退出时的统一关闭信号（优雅停止后台轮询循环）
+    pub shutdown: watch::Sender<bool>,
     /// 任务流水线挂在会话上的钩子
     pub turn_hooks: Mutex<chat::TurnHooks>,
 }
@@ -64,6 +75,18 @@ impl AppState {
         secrets: Arc<dyn secrets::SecretStore>,
     ) -> Arc<Self> {
         let (events, events_rx) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(false);
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent(concat!("AutoAgents/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("构建共享 HTTP 客户端");
+        let health_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent(concat!("AutoAgents/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("构建健康检查 HTTP 客户端");
         let db = Arc::new(Mutex::new(db));
         let remote = remote::RemoteManager::new(
             Arc::clone(&db),
@@ -80,11 +103,16 @@ impl AppState {
             secrets,
             remote: Arc::new(remote),
             local_info: Mutex::new(None),
+            http,
+            health_http,
             gh_api: Mutex::new(github::DEFAULT_API.to_string()),
             vercel_api: Mutex::new(deploy::VERCEL_API.to_string()),
             cf_api: Mutex::new(deploy::CF_API.to_string()),
             deploy: deploy::Deployer::default(),
             pipeline: pipeline::Pipeline::default(),
+            workflow: workflow::WorkflowEngine::default(),
+            automation_lock: tokio::sync::Mutex::new(()),
+            shutdown,
             turn_hooks: Mutex::new(chat::TurnHooks::default()),
         });
         chat::dispatch(state.clone(), events_rx);
@@ -227,7 +255,6 @@ pub fn run() {
             machines_list,
             node_metrics,
             node_ls,
-            node_git,
             remote::relay_get,
             remote::relay_set,
             remote::relay_clear,
@@ -248,12 +275,19 @@ pub fn run() {
             // 用量与成本
             usage::usage_summary,
             usage::usage_budget_set,
+            usage::usage_budget_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    let _ = state.shutdown.send(true);
+                    state.remote.stop_all();
+                    state.service.stop_all();
+                }
+                return;
+            }
             // macOS：关掉全部窗口后进程仍在运行，点击 Dock 图标时默认什么也不会发生。
             // 这里把主窗口重新打开（还在的话就显示出来），省得只能重启应用。
             #[cfg(target_os = "macos")]
@@ -285,4 +319,4 @@ pub fn run() {
         });
 }
 
-use nodes::{agents_all, machines_list, node_git, node_ls, node_metrics};
+use nodes::{agents_all, machines_list, node_ls, node_metrics};

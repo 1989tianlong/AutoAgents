@@ -10,12 +10,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
 
 /// 进程异常退出时，附在提示里的 stderr 长度上限（字符数）
 const STDERR_TAIL_CHARS: usize = 600;
+/// 单行 stdout / stderr 读取上限（防失控子进程无换行输出打爆内存）
+const MAX_STDOUT_LINE: u64 = 16 * 1024 * 1024;
+const MAX_STDERR_LINE: u64 = 64 * 1024;
 
 /// 进程自行退出（保存会话、关闭拉起的子进程）的等待时间，超过就连同进程组一起结束
 const EXIT_GRACE: Duration = Duration::from_secs(5);
@@ -108,12 +111,34 @@ impl TurnEvent {
     /// 换一个对话标识（节点侧给各连接的对话加前缀，避免不同控制端撞号）
     pub fn map_turn_id(self, map: impl FnOnce(String) -> String) -> Self {
         match self {
-            TurnEvent::Session { turn_id, r#ref } => TurnEvent::Session { turn_id: map(turn_id), r#ref },
-            TurnEvent::Delta { turn_id, text } => TurnEvent::Delta { turn_id: map(turn_id), text },
-            TurnEvent::Notice { turn_id, text } => TurnEvent::Notice { turn_id: map(turn_id), text },
-            TurnEvent::Failed { turn_id, message } => TurnEvent::Failed { turn_id: map(turn_id), message },
-            TurnEvent::System { turn_id, message } => TurnEvent::System { turn_id: map(turn_id), message },
-            TurnEvent::Finished { turn_id, text, cost_usd, input_tokens, output_tokens, incomplete } => TurnEvent::Finished {
+            TurnEvent::Session { turn_id, r#ref } => TurnEvent::Session {
+                turn_id: map(turn_id),
+                r#ref,
+            },
+            TurnEvent::Delta { turn_id, text } => TurnEvent::Delta {
+                turn_id: map(turn_id),
+                text,
+            },
+            TurnEvent::Notice { turn_id, text } => TurnEvent::Notice {
+                turn_id: map(turn_id),
+                text,
+            },
+            TurnEvent::Failed { turn_id, message } => TurnEvent::Failed {
+                turn_id: map(turn_id),
+                message,
+            },
+            TurnEvent::System { turn_id, message } => TurnEvent::System {
+                turn_id: map(turn_id),
+                message,
+            },
+            TurnEvent::Finished {
+                turn_id,
+                text,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                incomplete,
+            } => TurnEvent::Finished {
                 turn_id: map(turn_id),
                 text,
                 cost_usd,
@@ -285,6 +310,13 @@ async fn run(
         resume: params.resume.as_deref(),
         workdir: &workdir,
     };
+    // 提前订阅停止信号并检查：避免早于 spawn 到达的 stop() 既拉起进程又漏掉唤醒
+    let mut stop_signal = proc.stop_signal.subscribe();
+    if proc.is_cancelled() {
+        emit(&tx, &proc, failed(&id, "已停止".into())).await;
+        return;
+    }
+
     let child = match adapters::build_command(&spec).spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -302,22 +334,25 @@ async fn run(
     let mut child = child;
     let stderr = child.stderr.take();
     let stdout = child.stdout.take();
-    let mut stop_signal = proc.stop_signal.subscribe();
     *proc.child.lock().unwrap() = Some(child);
     if proc.is_cancelled() {
         TurnHandle { proc: proc.clone() }.kill();
     }
 
-    // 持续排空 stderr（写满缓冲区会阻塞子进程），并保留尾部用于异常诊断
+    // 持续排空 stderr（写满缓冲区会阻塞子进程），并保留尾部用于异常诊断（限制单行字节数防 OOM）
     let stderr_tail = Arc::new(Mutex::new(String::new()));
-    if let Some(stderr) = stderr {
+    let stderr_task = stderr.map(|stderr| {
         let tail = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::new();
             loop {
                 buf.clear();
-                match reader.read_until(b'\n', &mut buf).await {
+                match (&mut reader)
+                    .take(MAX_STDERR_LINE)
+                    .read_until(b'\n', &mut buf)
+                    .await
+                {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
                         let mut tail = tail.lock().unwrap();
@@ -333,23 +368,30 @@ async fn run(
                     }
                 }
             }
-        });
-    }
+        })
+    });
 
     let mut st = TurnState::default();
     let mut failure: Option<String> = None;
     if let Some(stdout) = stdout {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let line = tokio::select! {
-                line = lines.next_line() => line,
+        let mut reader = BufReader::new(stdout);
+        let mut raw_line = Vec::new();
+        while !proc.is_cancelled() {
+            raw_line.clear();
+            let mut limited = (&mut reader).take(MAX_STDOUT_LINE);
+            let read = tokio::select! {
+                res = limited.read_until(b'\n', &mut raw_line) => res,
                 // 被停止：立即收尾。漏网的子进程可能还占着输出管道，等它关闭没有意义
                 _ = stop_signal.changed() => break,
             };
-            let Ok(Some(line)) = line else {
+            let Ok(n) = read else {
                 break;
             };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            if n == 0 {
+                break;
+            }
+            let line = String::from_utf8_lossy(&raw_line);
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                 continue;
             };
             let mut events = Vec::new();
@@ -390,10 +432,8 @@ async fn run(
     let cancelled = proc.is_cancelled();
     // 读取输出的一方先一步拿到了进程（输出先断、停止请求随后才到）：这里负责结束它。
     // 不给它自行退出的宽限：用户要的是现在就停，Agent 多跑一秒都可能多改一个文件
-    if cancelled {
-        if let Some(running) = child.take() {
-            terminate(running).await;
-        }
+    if cancelled && let Some(running) = child.take() {
+        terminate(running).await;
     }
 
     if let Some(message) = failure {
@@ -402,6 +442,10 @@ async fn run(
         return;
     }
     if st.final_text.is_empty() {
+        // 等一下 stderr 排空（最多 200ms），避免进程快退时丢掉真实报错诊断
+        if !cancelled && let Some(handle) = stderr_task {
+            let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        }
         // 流式 Agent（claude / grok / pi）的完整文本要到终态才给：中途停止时，
         // 把已经流出来的部分留作本轮结果
         let mut message = if cancelled {
@@ -411,7 +455,17 @@ async fn run(
         };
         let stderr = stderr_tail.lock().unwrap().clone();
         if !cancelled && !stderr.is_empty() {
-            message.push_str(&format!("：{}", adapters::clip(&stderr, 300)));
+            // 取尾部最后一行非空报错，避免截断在头部残行
+            let tail_line = stderr
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let shown = adapters::clip(tail_line, 300);
+            if !shown.is_empty() {
+                message.push_str(&format!("：{shown}"));
+            }
         }
         if cancelled && !st.streamed.is_empty() {
             if !emit(
@@ -455,15 +509,23 @@ async fn run(
         incomplete,
     };
     if !st.finished && !cancelled {
-        // 没等到终态输出就断了：看进程是怎么退的，异常退出时提醒输出可能不完整
+        // 没等到终态输出就断了：看进程是怎么退的，同时继续监听停止信号，避免 60 秒卡住 stop()
         let mut child = child;
         let mut status = None;
-        if let Some(running) = child.as_mut() {
-            match tokio::time::timeout(EXIT_WAIT, running.wait()).await {
-                Ok(exit) => status = exit.ok(),
-                Err(_) => {
-                    // 关了输出却迟迟不退出：连同所有子进程一起结束
-                    terminate(child.take().expect("进程仍在")).await;
+        if child.is_some() {
+            let timed_or_stopped = tokio::select! {
+                res = tokio::time::timeout(EXIT_WAIT, async {
+                    child.as_mut().expect("进程仍在").wait().await
+                }) => res.ok(),
+                _ = stop_signal.changed() => None,
+            };
+            match timed_or_stopped {
+                Some(exit) => status = exit.ok(),
+                None => {
+                    // 超时或收到停止请求：连同所有子进程一起结束
+                    if let Some(running) = child.take() {
+                        terminate(running).await;
+                    }
                 }
             }
         }
@@ -499,7 +561,10 @@ fn reap(child: Option<Child>) {
         return;
     };
     tokio::spawn(async move {
-        if tokio::time::timeout(EXIT_GRACE, child.wait()).await.is_err() {
+        if tokio::time::timeout(EXIT_GRACE, child.wait())
+            .await
+            .is_err()
+        {
             terminate(child).await;
         }
     });
@@ -600,7 +665,10 @@ sleep 3 &
                 message: "已停止".into()
             }
         );
-        assert!(output.events.recv().await.is_none(), "Failed 之后不应再有事件");
+        assert!(
+            output.events.recv().await.is_none(),
+            "Failed 之后不应再有事件"
+        );
     }
 
     /// 被停止时已经产出的部分文本照样带回
@@ -625,12 +693,18 @@ sleep 60
         );
         output.handle.stop();
         let last = terminal(&mut output.events).await;
-        let TurnEvent::Finished { text, incomplete, .. } = last else {
+        let TurnEvent::Finished {
+            text, incomplete, ..
+        } = last
+        else {
             panic!("应当以 Finished 收尾：{last:?}");
         };
         assert_eq!(text, "部分");
         assert!(incomplete, "被停止的输出要标注为不完整");
-        assert!(output.events.recv().await.is_none(), "Finished 之后不应再有事件");
+        assert!(
+            output.events.recv().await.is_none(),
+            "Finished 之后不应再有事件"
+        );
     }
 
     /// 反复启动后立刻停止：每次都要在 3 秒内收尾，且不留下子进程
@@ -657,10 +731,7 @@ sleep 60
                 .await
                 .expect("停止后应当很快收尾")
                 .expect("终态事件之后通道才会关闭");
-            if matches!(
-                event,
-                TurnEvent::Failed { .. } | TurnEvent::Finished { .. }
-            ) {
+            if matches!(event, TurnEvent::Failed { .. } | TurnEvent::Finished { .. }) {
                 return event;
             }
         }
@@ -720,7 +791,8 @@ sleep 60
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, format!("#!/bin/sh\n{script}")).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // tempdir 离开作用域就会被删，脚本要留到测试结束
         std::mem::forget(dir);
         bin

@@ -2,7 +2,7 @@
 //! 「活动」页与仪表盘从这里读。
 
 use crate::AppState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
@@ -120,7 +120,8 @@ pub fn events_clear(state: State<'_, Arc<AppState>>, keep: Option<i64>) -> Resul
     let db = state.db.lock().unwrap();
     let keep = keep.unwrap_or(0).max(0);
     let removed = if keep == 0 {
-        db.execute("DELETE FROM events", []).map_err(|e| e.to_string())?
+        db.execute("DELETE FROM events", [])
+            .map_err(|e| e.to_string())?
     } else {
         let threshold: Option<i64> = db
             .query_row(
@@ -132,7 +133,7 @@ pub fn events_clear(state: State<'_, Arc<AppState>>, keep: Option<i64>) -> Resul
             .map_err(|e| e.to_string())?;
         match threshold {
             Some(id) => db
-                .execute("DELETE FROM events WHERE id < ?1", params![id])
+                .execute("DELETE FROM events WHERE id <= ?1", params![id])
                 .map_err(|e| e.to_string())?,
             None => 0,
         }

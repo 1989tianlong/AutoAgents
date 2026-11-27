@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openSafeUrl as openUrl } from "../lib/url";
 import {
   agentModels,
   agentsAll,
@@ -262,13 +262,14 @@ function TaskDetail({ id }: { id: number }) {
   useEffect(() => {
     if (status === "changes" || status === "failed") {
       qc.invalidateQueries({ queryKey: ["taskDiff", id] });
+      qc.invalidateQueries({ queryKey: ["taskDiffFile", id] });
     }
   }, [status, qc, id]);
   // 没点具体文件时看第一个
   const current = file ?? diff.data?.entries[0]?.path ?? null;
   const untracked = diff.data?.entries.find((entry) => entry.path === current)?.status === "?";
   const patch = useQuery({
-    queryKey: ["taskDiffFile", id, current],
+    queryKey: ["taskDiffFile", id, current, untracked, diff.dataUpdatedAt],
     queryFn: () => taskDiffFile(id, current!, untracked),
     enabled: !!current && !!diff.data,
   });
@@ -661,6 +662,7 @@ function StartDialog({ task, onClose, onDone }: { task: Task; onClose: () => voi
   const models = useQuery({
     queryKey: ["agentModels", adapter, node],
     queryFn: () => agentModels(adapter, node),
+    enabled: adapter !== "",
     staleTime: 60_000,
   });
   const ssh = repos.data?.find((r) => r.fullName === task.repo)?.sshUrl ?? null;

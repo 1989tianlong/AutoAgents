@@ -114,12 +114,41 @@ pub struct PrState {
     pub failure: usize,
 }
 
-fn http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("AutoAgents/0.1")
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+/// 单个文本响应（PR diff / CI 日志）最大读取字节数（4 MiB，防 OOM）
+const TEXT_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// 校验 GitHub API URL 路径段（owner / repo / commit），阻断 `../`、`?`、`#` 注入
+fn validate_gh_seg(seg: &str, what: &str) -> Result<(), String> {
+    let s = seg.trim();
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains('/')
+        || s.contains('\\')
+        || s.contains('?')
+        || s.contains('#')
+        || s.contains('\0')
+        || s.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("{what}格式不合法：{seg}"));
+    }
+    Ok(())
+}
+
+async fn read_text_limited(mut resp: reqwest::Response, limit: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?
+    {
+        let remain = limit.saturating_sub(buf.len());
+        if remain == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..chunk.len().min(remain)]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 async fn gh_get(state: &AppState, token: &str, path: &str) -> Result<Value, String> {
@@ -134,12 +163,14 @@ async fn gh_call(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    let mut request = http()?
+    let url = format!("{}{path}", state.gh_api.lock().unwrap());
+    let mut request = state
+        .http
         .request(
             method
                 .parse()
                 .map_err(|_| format!("HTTP 方法不对：{method}"))?,
-            format!("{}{path}", state.gh_api.lock().unwrap()),
+            url,
         )
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
@@ -182,8 +213,10 @@ async fn gh_text(
     path: &str,
     accept: &str,
 ) -> Result<String, String> {
-    let resp = http()?
-        .get(format!("{}{path}", state.gh_api.lock().unwrap()))
+    let url = format!("{}{path}", state.gh_api.lock().unwrap());
+    let resp = state
+        .http
+        .get(url)
         .bearer_auth(token)
         .header("Accept", accept)
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -193,7 +226,7 @@ async fn gh_text(
     if !resp.status().is_success() {
         return Err(format!("GitHub API 错误（{}）", resp.status().as_u16()));
     }
-    resp.text().await.map_err(|e| format!("读取响应失败: {e}"))
+    read_text_limited(resp, TEXT_BODY_LIMIT).await
 }
 
 /// PR 的完整 diff（unified diff 文本）
@@ -204,6 +237,8 @@ pub async fn pr_diff(
     repo: &str,
     number: i64,
 ) -> Result<String, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     gh_text(
         state,
         token,
@@ -329,6 +364,8 @@ pub async fn issues_list(
     repo: &str,
     query: &str,
 ) -> Result<Vec<GhIssue>, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     let v = gh_get(
         state,
         token,
@@ -383,6 +420,8 @@ pub async fn prs_list(
     repo: &str,
     query: &str,
 ) -> Result<Vec<GhPr>, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     let v = gh_get(
         state,
         token,
@@ -424,6 +463,8 @@ pub async fn issue(
     repo: &str,
     number: i64,
 ) -> Result<GhIssue, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     let v = gh_get(
         state,
         token,
@@ -443,6 +484,7 @@ pub async fn issue(
 }
 
 /// 创建 PR。这个分支上已经有 PR 的话直接返回那一个（重试、重复点击都安全）
+#[allow(clippy::too_many_arguments)]
 pub async fn create_pr(
     state: &AppState,
     token: &str,
@@ -453,6 +495,8 @@ pub async fn create_pr(
     base: &str,
     body: &str,
 ) -> Result<GhPr, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     let created = gh_call(
         state,
         token,
@@ -491,6 +535,8 @@ pub async fn default_branch(
     owner: &str,
     repo: &str,
 ) -> Result<String, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
     let v = gh_get(state, token, &format!("/repos/{owner}/{repo}")).await?;
     let branch = s(&v, "default_branch");
     if branch.is_empty() {
@@ -673,13 +719,15 @@ pub async fn failed_check_logs(
     repo: &str,
     commit: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    validate_gh_seg(owner, "仓库所有者")?;
+    validate_gh_seg(repo, "仓库名")?;
+    validate_gh_seg(commit, "提交 SHA")?;
     let runs = gh_get(
         state,
         token,
         &format!("/repos/{owner}/{repo}/commits/{commit}/check-runs?per_page=100"),
     )
     .await?;
-    let client = http()?;
     let mut logs = Vec::new();
     for run in runs["check_runs"].as_array().into_iter().flatten() {
         let failed = run["conclusion"]
@@ -695,11 +743,13 @@ pub async fn failed_check_logs(
             .next()
             .and_then(|id| id.parse::<i64>().ok());
         let Some(job) = job else { continue };
-        let resp = client
-            .get(format!(
-                "{}/repos/{owner}/{repo}/actions/jobs/{job}/logs",
-                state.gh_api.lock().unwrap()
-            ))
+        let url = format!(
+            "{}/repos/{owner}/{repo}/actions/jobs/{job}/logs",
+            state.gh_api.lock().unwrap()
+        );
+        let resp = state
+            .http
+            .get(url)
             .bearer_auth(token)
             .send()
             .await
@@ -707,10 +757,7 @@ pub async fn failed_check_logs(
         if !resp.status().is_success() {
             continue;
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("读取检查 {name} 的日志失败：{e}"))?;
+        let text = read_text_limited(resp, TEXT_BODY_LIMIT).await?;
         logs.push((name, clip_tail(&text, LOG_TAIL_CHARS)));
     }
     Ok(logs)

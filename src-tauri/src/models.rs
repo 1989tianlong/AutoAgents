@@ -1,9 +1,9 @@
 //! 模型清单：Tauri 命令层。清单在哪台机器上执行就读哪台机器的配置，
 //! 控制端只负责记住用户手动填写过的模型。
 
-use autoagents_core::models::{self as core, ModelList};
-use crate::nodes;
 use crate::AppState;
+use crate::nodes;
+use autoagents_core::models::{self as core, ModelList};
 use rusqlite::params;
 use std::sync::Arc;
 use tauri::State;
@@ -19,8 +19,16 @@ pub async fn agent_models(
     let mut list: ModelList = if nodes::is_local(&node) {
         core::load_models(&adapter).await?
     } else {
-        serde_json::from_value(nodes::call(&state, &node, "models.list", &serde_json::json!({ "adapter": adapter })).await?)
-            .map_err(|e| format!("解析模型清单失败：{e}"))?
+        serde_json::from_value(
+            nodes::call(
+                &state,
+                &node,
+                "models.list",
+                &serde_json::json!({ "adapter": adapter }),
+            )
+            .await?,
+        )
+        .map_err(|e| format!("解析模型清单失败：{e}"))?
     };
     let custom = {
         let db = state.db.lock().unwrap();

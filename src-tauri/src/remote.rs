@@ -13,19 +13,19 @@ use autoagents_core::machine::MachineInfo;
 use autoagents_core::net::{self, Fingerprint};
 use autoagents_core::relay::{self, NodeSummary, RelayWatcher};
 use autoagents_core::secure::{self, Psk};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rusqlite::{params, Connection, OptionalExtension};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::AppState;
 use crate::events;
 use crate::secrets::{self, SecretStore};
-use crate::AppState;
 
 const SETTINGS_RELAY_ADDR: &str = "relay_addr";
 const SETTINGS_RELAY_FP: &str = "relay_fingerprint";
@@ -233,7 +233,10 @@ fn upsert_node(
     config: &NodeConfig,
     info: Option<&MachineInfo>,
 ) -> Result<(), String> {
-    let info = info.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?;
+    let info = info
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| e.to_string())?;
     db.execute(
         "INSERT INTO nodes (id, name, relay_url, addr, fingerprint, info) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET
@@ -288,11 +291,14 @@ pub fn parse_relay_input(text: &str) -> ParsedRelay {
     parsed
 }
 
+pub type ParsedNodeInput = (String, Option<Fingerprint>, String, Option<String>, String);
+
 /// 节点的直连连接串（`agentd pair` 打印的那一行）：
 /// `autoagents://node?addr=wss://…&fp=…&id=…&name=…&pair=…`
-pub fn parse_node_input(text: &str) -> Result<(String, Option<Fingerprint>, String, Option<String>, String), String> {
+pub fn parse_node_input(text: &str) -> Result<ParsedNodeInput, String> {
     let text = text.trim();
-    let missing = |what: &str| format!("连接串里缺少{what}，请把 agentd pair 打印的那一行原样粘贴进来");
+    let missing =
+        |what: &str| format!("连接串里缺少{what}，请把 agentd pair 打印的那一行原样粘贴进来");
     let query = text
         .strip_prefix("autoagents://node?")
         .ok_or_else(|| "不是节点的连接串（应以 autoagents://node? 开头）".to_string())?;
@@ -369,8 +375,8 @@ fn secrets_get(store: &dyn SecretStore, account: &str) -> Result<Option<String>,
 
 /// 中继的接入参数；没配置时给出明确提示
 fn relay_params(db: &Connection, secrets: &dyn SecretStore) -> Result<RelayParams, String> {
-    let addr = setting(db, SETTINGS_RELAY_ADDR)
-        .ok_or("还没有设置中继：到「机器」页粘贴中继的连接串")?;
+    let addr =
+        setting(db, SETTINGS_RELAY_ADDR).ok_or("还没有设置中继：到「机器」页粘贴中继的连接串")?;
     let fingerprint = setting(db, SETTINGS_RELAY_FP).unwrap_or_default();
     // 没填指纹时按正常 CA 校验（中继放在正规证书的反向代理后面）
     let pin = if fingerprint.is_empty() {
@@ -575,8 +581,7 @@ impl Supervisor {
                     let attempt = async {
                         let hub_id = hub_id(self.secrets.as_ref())?;
                         let psk = self.paired_key(&remote)?;
-                        connect(self.db.clone(), self.secrets.clone(), &remote, psk, &hub_id)
-                            .await
+                        connect(self.db.clone(), self.secrets.clone(), &remote, psk, &hub_id).await
                     };
                     attempt.await
                 }
@@ -696,14 +701,14 @@ impl Supervisor {
 
     /// 连上之后：取机器信息与本机 Agent 清单，更新往返耗时
     async fn on_online(&self, remote: &Remote, link: &HubLink) {
-        if let Ok(info) = link.call("sys.info", json!({})).await {
-            if let Ok(info) = serde_json::from_value::<MachineInfo>(info) {
-                let config = remote.cfg.lock().unwrap().clone();
-                let db = self.db.lock().unwrap();
-                let _ = upsert_node(&db, &remote.id, &config, Some(&info));
-                drop(db);
-                *remote.info.lock().unwrap() = Some(info);
-            }
+        if let Ok(info) = link.call("sys.info", json!({})).await
+            && let Ok(info) = serde_json::from_value::<MachineInfo>(info)
+        {
+            let config = remote.cfg.lock().unwrap().clone();
+            let db = self.db.lock().unwrap();
+            let _ = upsert_node(&db, &remote.id, &config, Some(&info));
+            drop(db);
+            *remote.info.lock().unwrap() = Some(info);
         }
         if let Ok(list) = link.call("agents.list", json!({})).await {
             *remote.agents.lock().unwrap() = serde_json::from_value(list).unwrap_or_default();
@@ -822,10 +827,10 @@ impl RemoteManager {
                 .insert(remote.id.clone(), Arc::clone(&remote));
             tauri::async_runtime::spawn(self.supervisor.clone().run(remote, None));
         }
-        if self.relay_configured() {
-            if let Err(e) = self.start_watcher() {
-                eprintln!("[remote] 跟踪中继在线节点失败：{e}");
-            }
+        if self.relay_configured()
+            && let Err(e) = self.start_watcher()
+        {
+            eprintln!("[remote] 跟踪中继在线节点失败：{e}");
         }
     }
 
@@ -973,7 +978,9 @@ impl RemoteManager {
     ) -> Result<RelayView, String> {
         let addr = addr.trim().trim_end_matches('/').to_string();
         if !(addr.starts_with("wss://") || addr.starts_with("ws://")) {
-            return Err("中继地址应以 wss:// 开头（放在反向代理后面、由代理加密时也可以是 ws://）".into());
+            return Err(
+                "中继地址应以 wss:// 开头（放在反向代理后面、由代理加密时也可以是 ws://）".into(),
+            );
         }
         // 没给指纹就沿用原来的；给了（哪怕是空的，表示改用正规证书）就按给的来
         let pin = match fingerprint.as_deref().map(str::trim) {
@@ -998,7 +1005,14 @@ impl RemoteManager {
         self.start_watcher()?;
         {
             let db = self.db.lock().unwrap();
-            events::record(&db, "relay.configured", "info", "中继", &format!("已设置中继 {addr}"), Some("#/machines"));
+            events::record(
+                &db,
+                "relay.configured",
+                "info",
+                "中继",
+                &format!("已设置中继 {addr}"),
+                Some("#/machines"),
+            );
         }
         self.reconnect_all();
         relay_view(&self.db.lock().unwrap(), self.secrets.as_ref())
@@ -1021,17 +1035,35 @@ impl RemoteManager {
 
     pub fn set_install_script(&self, url: &str) -> Result<(), String> {
         let url = url.trim();
-        if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err("安装脚本地址应以 http:// 或 https:// 开头".into());
+        if !url.is_empty() {
+            let allow_http =
+                url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost");
+            if !(url.starts_with("https://") || allow_http) {
+                return Err("安装脚本地址必须使用 https://（仅本机调试允许 http://）".into());
+            }
         }
         let db = self.db.lock().unwrap();
         set_setting(&db, SETTINGS_INSTALL_SCRIPT, url)
     }
 
-    /// 所有机器立刻按当前配置重连
+    /// 退出应用时停止中继监听与所有已连接机器的会话
+    pub fn stop_all(&self) {
+        if let Some(watcher) = self.watcher.lock().unwrap().take() {
+            watcher.stop();
+        }
+        let remotes: Vec<Arc<Remote>> = self.nodes.lock().unwrap().values().cloned().collect();
+        for remote in remotes {
+            if let Some(link) = remote.link.lock().unwrap().take() {
+                link.close();
+            }
+        }
+    }
+
+    /// 所有机器立刻按当前配置重连（先释放 nodes 锁，避免与 connect_now 内部自死锁）
     fn reconnect_all(&self) {
-        for remote in self.nodes.lock().unwrap().values() {
-            let _ = self.connect_now(&remote.id);
+        let ids: Vec<String> = self.nodes.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            let _ = self.connect_now(&id);
         }
     }
 
@@ -1086,7 +1118,7 @@ impl RemoteManager {
     pub fn connect_now(&self, node_id: &str) -> Result<(), String> {
         let remote = self.get(node_id)?;
         remote.link.lock().unwrap().take();
-        let _ = remote.kick.send_modify(|n| *n += 1);
+        remote.kick.send_modify(|n| *n += 1);
         Ok(())
     }
 
@@ -1133,7 +1165,9 @@ impl RemoteManager {
         let invites = load_invites(&db);
         let kept: Vec<Invite> = invites
             .iter()
-            .filter(|invite| code != Some(invite.code.as_str()) && name != Some(invite.name.as_str()))
+            .filter(|invite| {
+                code != Some(invite.code.as_str()) && name != Some(invite.name.as_str())
+            })
             .cloned()
             .collect();
         if kept.len() != invites.len() {
@@ -1145,7 +1179,11 @@ impl RemoteManager {
     fn drop_expired_invites(&self) -> Result<(), String> {
         let db = self.db.lock().unwrap();
         let invites = load_invites(&db);
-        let kept: Vec<Invite> = invites.iter().filter(|invite| !invite.expired()).cloned().collect();
+        let kept: Vec<Invite> = invites
+            .iter()
+            .filter(|invite| !invite.expired())
+            .cloned()
+            .collect();
         if kept.len() != invites.len() {
             save_invites(&db, &kept)?;
         }
@@ -1191,7 +1229,11 @@ impl RemoteManager {
         if let Some(pin) = pin {
             command.push_str(&format!(" --fp {}", shell_quote(&pin.to_string())));
         }
-        for dir in allow.iter().map(|dir| dir.trim()).filter(|dir| !dir.is_empty()) {
+        for dir in allow
+            .iter()
+            .map(|dir| dir.trim())
+            .filter(|dir| !dir.is_empty())
+        {
             command.push_str(&format!(" --allow {}", shell_quote(dir)));
         }
         Ok(InstallCommand {
@@ -1271,8 +1313,10 @@ impl RemoteManager {
         )
         .await?;
         // 节点已经换好密钥，这边必须存下来，否则再也连不上
-        self.secrets
-            .set(&secrets::node_psk_account(node_id), &URL_SAFE_NO_PAD.encode(psk))?;
+        self.secrets.set(
+            &secrets::node_psk_account(node_id),
+            &URL_SAFE_NO_PAD.encode(psk),
+        )?;
         let info: Option<MachineInfo> = link
             .call("sys.info", json!({}))
             .await
@@ -1333,12 +1377,13 @@ impl RemoteManager {
             .ok_or_else(|| self.offline_reason(node_id))?;
         let code = secure::pairing_code();
         link.call("pair.allow", json!({ "code": code })).await?;
+        let node_name = self.get(node_id)?.name();
         let db = self.db.lock().unwrap();
         events::record(
             &db,
             "node.authorize",
             "info",
-            &self.get(node_id)?.name(),
+            &node_name,
             "已为另一台设备开放配对（10 分钟内有效）",
             Some("#/machines"),
         );
@@ -1349,9 +1394,6 @@ impl RemoteManager {
 // ---------------------------------------------------------------------------
 // 请求转发
 // ---------------------------------------------------------------------------
-
-/// 机器侧 git 命令的输出
-pub type GitOut = autoagents_core::service::GitOutput;
 
 /// 不同请求的等待时间
 pub fn timeout_for(method: &str) -> Duration {
@@ -1378,8 +1420,7 @@ pub async fn call(
         .remote
         .link(node_id)
         .ok_or_else(|| state.remote.offline_reason(node_id))?;
-    link.call_timeout(method, params, timeout_for(method))
-        .await
+    link.call_timeout(method, params, timeout_for(method)).await
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -1423,9 +1464,7 @@ pub fn set_relay(
             .ok()
             .flatten()
     });
-    state
-        .remote
-        .configure_relay(addr, token, fingerprint)
+    state.remote.configure_relay(addr, token, fingerprint)
 }
 
 #[tauri::command]
@@ -1535,7 +1574,7 @@ pub fn node_connect_now(state: State<'_, Arc<AppState>>, node_id: String) -> Res
 mod tests {
     use super::*;
     use crate::chat;
-    use crate::testutil::{fake_script, service_for, test_state, TestState};
+    use crate::testutil::{TestState, fake_script, service_for, test_state};
     use autoagents_core::link::{self, NodeAuth, NodeState};
     use autoagents_core::net::Identity;
     use autoagents_core::service::Service;
@@ -1559,7 +1598,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("wss://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (tx, rx) = watch::channel(Vec::new());
-        let relay: Arc<autoagents_core::relay::TlsRelay> = autoagents_core::relay::Relay::new(TOKEN, tx);
+        let relay: Arc<autoagents_core::relay::TlsRelay> =
+            autoagents_core::relay::Relay::new(TOKEN, tx);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -1584,7 +1624,12 @@ mod tests {
         auth: Arc<NodeState>,
         service: Arc<Service>,
     ) -> tokio::task::JoinHandle<()> {
-        let (url, fp, node_id, name) = (url.to_string(), fp.clone(), node_id.to_string(), name.to_string());
+        let (url, fp, node_id, name) = (
+            url.to_string(),
+            fp.clone(),
+            node_id.to_string(),
+            name.to_string(),
+        );
         tokio::spawn(async move {
             let (incoming, mut rx) = mpsc::unbounded_channel::<String>();
             let control = relay::node_control(&url, Some(&fp), TOKEN, &node_id, &name, {
@@ -1629,20 +1674,23 @@ mod tests {
     /// 等中继把这台机器列出来（它的控制连接是异步建立的）
     async fn wait_listed(state: &Arc<AppState>, id: &str) {
         wait_until("中继列出机器", || {
-            state
-                .remote
-                .relay_status()
-                .is_ok_and(|status| status.connected && status.online.iter().any(|n| n.summary.node_id == id))
+            state.remote.relay_status().is_ok_and(|status| {
+                status.connected && status.online.iter().any(|n| n.summary.node_id == id)
+            })
         })
         .await;
     }
 
     async fn wait_online(state: &Arc<AppState>, id: &str) -> NodeView {
-        wait_until("机器上线", || state.remote.view(id).is_ok_and(|view| view.online)).await;
+        wait_until("机器上线", || {
+            state.remote.view(id).is_ok_and(|view| view.online)
+        })
+        .await;
         state.remote.view(id).unwrap()
     }
 
-    const OK: &str = r#"printf '%s\n' '{"type":"result","is_error":false,"result":"远程机器上的回答"}'"#;
+    const OK: &str =
+        r#"printf '%s\n' '{"type":"result","is_error":false,"result":"远程机器上的回答"}'"#;
 
     /// 粘贴中继的连接串 → 生成安装命令 → 机器执行后连上中继、自动配对 →
     /// 请求转发 → 在远程机器上跑一轮对话
@@ -1651,22 +1699,46 @@ mod tests {
         let (url, fp, _online) = start_relay().await;
         let service = fake_agent(OK);
         let auth = NodeState::new("node-1".into(), HashMap::new(), None);
-        let machine = node(&url, &fp, "node-1", "home-pc", Arc::clone(&auth), Arc::clone(&service));
-        let TestState { state, secrets, nodes: collector, .. } = state(Arc::clone(&service));
+        let machine = node(
+            &url,
+            &fp,
+            "node-1",
+            "home-pc",
+            Arc::clone(&auth),
+            Arc::clone(&service),
+        );
+        let TestState {
+            state,
+            secrets,
+            nodes: collector,
+            ..
+        } = state(Arc::clone(&service));
 
         // 没配中继时给不出安装命令
-        assert!(state.remote.install_command("home-pc", &[]).unwrap_err().contains("还没有设置中继"));
+        assert!(
+            state
+                .remote
+                .install_command("home-pc", &[])
+                .unwrap_err()
+                .contains("还没有设置中继")
+        );
         assert!(state.remote.offline_reason("node-1").contains("不在线"));
 
         // 粘贴中继的连接串
         let connect = format!("autoagents://relay?addr={url}&token={TOKEN}&fp={fp}");
         let view = set_relay(&state, Some(&connect), None, None, None).unwrap();
-        assert_eq!((view.addr.as_str(), view.fingerprint.as_str()), (url.as_str(), fp.to_string().as_str()));
+        assert_eq!(
+            (view.addr.as_str(), view.fingerprint.as_str()),
+            (url.as_str(), fp.to_string().as_str())
+        );
         assert!(view.configured && view.has_token);
         assert!(!view.install_script.is_empty());
 
         // 安装命令带着配对码、中继地址与令牌、允许访问的目录
-        let command = state.remote.install_command("home-pc", &["/home/me".into()]).unwrap();
+        let command = state
+            .remote
+            .install_command("home-pc", &["/home/me".into()])
+            .unwrap();
         assert!(command.command.contains("install --name 'home-pc'"));
         assert!(command.command.contains(&format!("--relay '{url}'")));
         assert!(command.command.contains(&format!("--fp '{}'", fp)));
@@ -1693,32 +1765,63 @@ mod tests {
             assert!(!status.online[0].paired);
         }
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        assert!(state.remote.views().is_empty(), "机器没有开放配对时不该配上");
+        assert!(
+            state.remote.views().is_empty(),
+            "机器没有开放配对时不该配上"
+        );
 
         // 机器执行了安装命令、开始等配对：控制端自动配上
         auth.allow_pairing(&command.code);
         let online = wait_online(&state, "node-1").await;
         assert_eq!(online.info.as_ref().unwrap().name, "home-pc");
         assert!(online.status.rtt_ms.is_some());
-        assert!(state.remote.relay_status().unwrap().pending.is_empty(), "用掉的邀请要清掉");
+        assert!(
+            state.remote.relay_status().unwrap().pending.is_empty(),
+            "用掉的邀请要清掉"
+        );
 
         // 长期密钥存好了，之后凭它重连
-        let stored = secrets.get(&secrets::node_psk_account("node-1")).unwrap().unwrap();
+        let stored = secrets
+            .get(&secrets::node_psk_account("node-1"))
+            .unwrap()
+            .unwrap();
         assert!(decode_psk(&stored).is_some());
         assert_eq!(auth.paired_count(), 1);
         assert!(!auth.is_pairing_open(), "配对码只能用一次");
         // 同一台机器不能重复添加
-        assert!(state.remote.pair("node-1", &command.code, None, None).await.unwrap_err().contains("已经添加过"));
+        assert!(
+            state
+                .remote
+                .pair("node-1", &command.code, None, None)
+                .await
+                .unwrap_err()
+                .contains("已经添加过")
+        );
 
         // 请求转发
         let info = call(&state, "node-1", "sys.info", json!({})).await.unwrap();
         assert_eq!(info["name"], "home-pc");
-        assert!(call(&state, "node-1", "nope", json!({})).await.unwrap_err().contains("不支持请求"));
-        assert!(call(&state, "ghost", "sys.info", json!({})).await.unwrap_err().contains("不在线"));
+        assert!(
+            call(&state, "node-1", "nope", json!({}))
+                .await
+                .unwrap_err()
+                .contains("不支持请求")
+        );
+        assert!(
+            call(&state, "ghost", "sys.info", json!({}))
+                .await
+                .unwrap_err()
+                .contains("不在线")
+        );
 
         // 在远程机器上跑一轮对话
-        let id = chat::start(&state, Some("node-1"), "claude-cli", None, None, "hi").await.unwrap();
-        wait_until("远程对话结束", || !state.live.lock().unwrap().contains_key(&id)).await;
+        let id = chat::start(&state, Some("node-1"), "claude-cli", None, None, "hi")
+            .await
+            .unwrap();
+        wait_until("远程对话结束", || {
+            !state.live.lock().unwrap().contains_key(&id)
+        })
+        .await;
         {
             let db = state.db.lock().unwrap();
             let (role, content): (String, String) = db
@@ -1728,11 +1831,17 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!((role.as_str(), content.as_str()), ("assistant", "远程机器上的回答"));
+            assert_eq!(
+                (role.as_str(), content.as_str()),
+                ("assistant", "远程机器上的回答")
+            );
         }
         // 状态变化都通知到了界面
         let events = collector.0.lock().unwrap();
-        assert!(events.iter().any(|e| e.id == "node-1" && e.online), "{events:?}");
+        assert!(
+            events.iter().any(|e| e.id == "node-1" && e.online),
+            "{events:?}"
+        );
         assert!(events.iter().all(|e| e.name == "home-pc"));
         drop(events);
         machine.abort();
@@ -1746,60 +1855,120 @@ mod tests {
         let service = fake_agent("sleep 30");
         let auth = NodeState::new("node-1".into(), HashMap::new(), None);
         auth.allow_pairing("ABCD-EFGH-JKLM-NPQR");
-        let machine = node(&url, &fp, "node-1", "home-pc", Arc::clone(&auth), Arc::clone(&service));
+        let machine = node(
+            &url,
+            &fp,
+            "node-1",
+            "home-pc",
+            Arc::clone(&auth),
+            Arc::clone(&service),
+        );
         let TestState { state, .. } = state(Arc::clone(&service));
-        state.remote.configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string())).unwrap();
+        state
+            .remote
+            .configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string()))
+            .unwrap();
         wait_listed(&state, "node-1").await;
         // 手动配对：返回时已经是可用状态
-        let paired = state.remote.pair("node-1", "ABCD-EFGH-JKLM-NPQR", None, None).await.unwrap();
+        let paired = state
+            .remote
+            .pair("node-1", "ABCD-EFGH-JKLM-NPQR", None, None)
+            .await
+            .unwrap();
         assert!(paired.online, "{paired:?}");
         assert_eq!(paired.status.error, None);
 
         // 在线时立即重连：正在跑的对话随旧连接结束，随后回到在线
-        let id = chat::start(&state, Some("node-1"), "claude-cli", None, None, "slow").await.unwrap();
-        wait_until("对话在远程机器上启动", || service.running_turns() == 1).await;
+        let id = chat::start(&state, Some("node-1"), "claude-cli", None, None, "slow")
+            .await
+            .unwrap();
+        wait_until("对话在远程机器上启动", || {
+            service.running_turns() == 1
+        })
+        .await;
         state.remote.connect_now("node-1").unwrap();
         assert!(state.remote.link("node-1").is_none(), "旧连接先让位");
-        wait_until("重连后对话以失败收尾", || !state.live.lock().unwrap().contains_key(&id)).await;
-        wait_until("旧连接上的对话被停掉", || service.running_turns() == 0).await;
+        wait_until("重连后对话以失败收尾", || {
+            !state.live.lock().unwrap().contains_key(&id)
+        })
+        .await;
+        wait_until("旧连接上的对话被停掉", || {
+            service.running_turns() == 0
+        })
+        .await;
         // 主动重连时「在线」这个标记并不会先清掉，光看它说明不了新连接已经建好：等新连接到手
-        wait_until("新连接建立起来", || state.remote.link("node-1").is_some()).await;
+        wait_until("新连接建立起来", || {
+            state.remote.link("node-1").is_some()
+        })
+        .await;
         let again = wait_online(&state, "node-1").await;
         assert!(again.status.error.is_none(), "{again:?}");
 
         // 机器下线：它上面正在运行的对话以失败收尾，原因留在状态里
-        let slow = chat::start(&state, Some("node-1"), "claude-cli", None, None, "slow").await.unwrap();
-        wait_until("对话在远程机器上启动", || service.running_turns() == 1).await;
+        let slow = chat::start(&state, Some("node-1"), "claude-cli", None, None, "slow")
+            .await
+            .unwrap();
+        wait_until("对话在远程机器上启动", || {
+            service.running_turns() == 1
+        })
+        .await;
         machine.abort();
         wait_offline(&state, "node-1").await;
         let view = state.remote.view("node-1").unwrap();
         assert!(view.status.error.is_some(), "{view:?}");
         assert!(view.status.last_seen_ms.is_some());
-        wait_until("会话以失败收尾", || !state.live.lock().unwrap().contains_key(&slow)).await;
-        let db = state.db.lock().unwrap();
-        let (role, content): (String, String) = db
-            .query_row(
-                "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-                params![slow],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(role, "system");
-        assert!(content.contains("连接断开"), "{content}");
-        drop(db);
+        wait_until("会话以失败收尾", || {
+            !state.live.lock().unwrap().contains_key(&slow)
+        })
+        .await;
+        {
+            let db = state.db.lock().unwrap();
+            let (role, content): (String, String) = db
+                .query_row(
+                    "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![slow],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(role, "system");
+            assert!(content.contains("连接断开"), "{content}");
+        }
         // 离线的机器上发不了消息，且不会留下用户消息
-        assert!(chat::send(&state, slow, "again").await.unwrap_err().contains("不在线"));
-        assert!(state.remote.authorize("node-1").await.unwrap_err().contains("不在线"));
+        assert!(
+            chat::send(&state, slow, "again")
+                .await
+                .unwrap_err()
+                .contains("不在线")
+        );
+        assert!(
+            state
+                .remote
+                .authorize("node-1")
+                .await
+                .unwrap_err()
+                .contains("不在线")
+        );
         let count: i64 = state
             .db
             .lock()
             .unwrap()
-            .query_row("SELECT count(*) FROM messages WHERE session_id = ?1", params![slow], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1",
+                params![slow],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2, "离线时的消息不该落库");
 
         // 机器回来后自动重连
-        let machine = node(&url, &fp, "node-1", "home-pc", Arc::clone(&auth), Arc::clone(&service));
+        let machine = node(
+            &url,
+            &fp,
+            "node-1",
+            "home-pc",
+            Arc::clone(&auth),
+            Arc::clone(&service),
+        );
         wait_online(&state, "node-1").await;
         machine.abort();
     }
@@ -1811,11 +1980,30 @@ mod tests {
         let service = fake_agent(OK);
         let auth = NodeState::new("node-1".into(), HashMap::new(), None);
         auth.allow_pairing("ABCD-EFGH-JKLM-NPQR");
-        let machine = node(&url, &fp, "node-1", "home-pc", Arc::clone(&auth), Arc::clone(&service));
-        let TestState { state, secrets, nodes: collector, .. } = state(Arc::clone(&service));
-        state.remote.configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string())).unwrap();
+        let machine = node(
+            &url,
+            &fp,
+            "node-1",
+            "home-pc",
+            Arc::clone(&auth),
+            Arc::clone(&service),
+        );
+        let TestState {
+            state,
+            secrets,
+            nodes: collector,
+            ..
+        } = state(Arc::clone(&service));
+        state
+            .remote
+            .configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string()))
+            .unwrap();
         wait_listed(&state, "node-1").await;
-        state.remote.pair("node-1", "ABCD-EFGH-JKLM-NPQR", None, None).await.unwrap();
+        state
+            .remote
+            .pair("node-1", "ABCD-EFGH-JKLM-NPQR", None, None)
+            .await
+            .unwrap();
         wait_online(&state, "node-1").await;
 
         // 重命名
@@ -1830,21 +2018,56 @@ mod tests {
         // 移除
         collector.0.lock().unwrap().clear();
         state.remote.remove("node-1").unwrap();
-        assert!(secrets.get(&secrets::node_psk_account("node-1")).unwrap().is_none());
+        assert!(
+            secrets
+                .get(&secrets::node_psk_account("node-1"))
+                .unwrap()
+                .is_none()
+        );
         assert!(state.remote.views().is_empty());
         assert!(state.remote.link("node-1").is_none());
         {
             let db = state.db.lock().unwrap();
-            let count: i64 = db.query_row("SELECT count(*) FROM nodes", [], |row| row.get(0)).unwrap();
+            let count: i64 = db
+                .query_row("SELECT count(*) FROM nodes", [], |row| row.get(0))
+                .unwrap();
             assert_eq!(count, 0);
             let kinds: Vec<String> = {
                 let mut stmt = db.prepare("SELECT kind FROM events ORDER BY id").unwrap();
-                stmt.query_map([], |row| row.get(0)).unwrap().flatten().collect()
+                stmt.query_map([], |row| row.get(0))
+                    .unwrap()
+                    .flatten()
+                    .collect()
             };
-            assert_eq!(kinds, ["relay.configured", "node.paired", "node.online", "node.authorize", "node.removed"]);
+            assert_eq!(
+                kinds,
+                [
+                    "relay.configured",
+                    "node.paired",
+                    "node.online",
+                    "node.authorize",
+                    "node.removed"
+                ]
+            );
         }
-        assert_eq!(collector.0.lock().unwrap().last().unwrap().message.as_deref(), Some("已移除"));
-        assert!(state.remote.remove("node-1").unwrap_err().contains("没有添加过"));
+        assert_eq!(
+            collector
+                .0
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .message
+                .as_deref(),
+            Some("已移除")
+        );
+        assert!(
+            state
+                .remote
+                .remove("node-1")
+                .unwrap_err()
+                .contains("没有添加过")
+        );
         machine.abort();
     }
 
@@ -1854,9 +2077,19 @@ mod tests {
         let (url, fp, _online) = start_relay().await;
         let service = fake_agent(OK);
         let auth = NodeState::new("node-1".into(), HashMap::new(), None);
-        let machine = node(&url, &fp, "node-1", "home-pc", Arc::clone(&auth), Arc::clone(&service));
+        let machine = node(
+            &url,
+            &fp,
+            "node-1",
+            "home-pc",
+            Arc::clone(&auth),
+            Arc::clone(&service),
+        );
         let TestState { state, .. } = state(Arc::clone(&service));
-        state.remote.configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string())).unwrap();
+        state
+            .remote
+            .configure_relay(url.clone(), Some(TOKEN.into()), Some(fp.to_string()))
+            .unwrap();
         state.remote.install_command("server", &[]).unwrap();
         // 早该过期的邀请
         {
@@ -1871,7 +2104,10 @@ mod tests {
             save_invites(&db, &invites).unwrap();
         }
         wait_until("中继连上并列出机器", || {
-            state.remote.relay_status().is_ok_and(|s| s.connected && s.online.len() == 1)
+            state
+                .remote
+                .relay_status()
+                .is_ok_and(|s| s.connected && s.online.len() == 1)
         })
         .await;
         let status = state.remote.relay_status().unwrap();
@@ -1880,7 +2116,11 @@ mod tests {
         assert!(!status.online[0].paired);
         // 名字对不上的邀请不会触发自动配对
         assert!(state.remote.views().is_empty());
-        let names: Vec<&str> = status.pending.iter().map(|invite| invite.name.as_str()).collect();
+        let names: Vec<&str> = status
+            .pending
+            .iter()
+            .map(|invite| invite.name.as_str())
+            .collect();
         assert_eq!(names, ["server"]);
         machine.abort();
     }
@@ -1896,41 +2136,92 @@ mod tests {
                 fingerprint: Some("sha256:00".into())
             }
         );
-        assert_eq!(parse_relay_input(" wss://relay.example.com "), ParsedRelay { addr: Some("wss://relay.example.com".into()), ..Default::default() });
+        assert_eq!(
+            parse_relay_input(" wss://relay.example.com "),
+            ParsedRelay {
+                addr: Some("wss://relay.example.com".into()),
+                ..Default::default()
+            }
+        );
         assert_eq!(parse_relay_input(""), ParsedRelay::default());
 
         let full = format!("sha256:{}", "ab".repeat(32));
-        let text = format!("autoagents://node?addr=wss://5.6.7.8:7100&fp={full}&id=node-9&name=home%20mac&pair=ABCD-EFGH-JKLM-NPQR");
+        let text = format!(
+            "autoagents://node?addr=wss://5.6.7.8:7100&fp={full}&id=node-9&name=home%20mac&pair=ABCD-EFGH-JKLM-NPQR"
+        );
         let (addr, pin, id, name, code) = parse_node_input(&text).unwrap();
         assert_eq!(addr, "wss://5.6.7.8:7100");
         assert_eq!(pin.map(|p| p.to_string()), Some(full.clone()));
-        assert!(parse_node_input(&format!("autoagents://node?addr=wss://x&id=y&pair=ABCD-EFGH-JKLM-NPQR&fp=sha256:ab")).is_err());
+        assert!(
+            parse_node_input(
+                "autoagents://node?addr=wss://x&id=y&pair=ABCD-EFGH-JKLM-NPQR&fp=sha256:ab"
+            )
+            .is_err()
+        );
         // loopback 上的明文直连也接受
-        let plain = parse_node_input("autoagents://node?addr=ws://127.0.0.1:7100&id=n&pair=ABCD-EFGH-JKLM-NPQR").unwrap();
-        assert_eq!((plain.0.as_str(), plain.1, plain.2.as_str()), ("ws://127.0.0.1:7100", None, "n"));
-        assert_eq!((id.as_str(), name.as_deref(), code.as_str()), ("node-9", Some("home mac"), "ABCD-EFGH-JKLM-NPQR"));
-        assert!(parse_node_input("autoagents://node?addr=wss://x&id=y").unwrap_err().contains("配对码"));
-        assert!(parse_node_input("wss://x").unwrap_err().contains("应以 autoagents://node?"));
+        let plain = parse_node_input(
+            "autoagents://node?addr=ws://127.0.0.1:7100&id=n&pair=ABCD-EFGH-JKLM-NPQR",
+        )
+        .unwrap();
+        assert_eq!(
+            (plain.0.as_str(), plain.1, plain.2.as_str()),
+            ("ws://127.0.0.1:7100", None, "n")
+        );
+        assert_eq!(
+            (id.as_str(), name.as_deref(), code.as_str()),
+            ("node-9", Some("home mac"), "ABCD-EFGH-JKLM-NPQR")
+        );
+        assert!(
+            parse_node_input("autoagents://node?addr=wss://x&id=y")
+                .unwrap_err()
+                .contains("配对码")
+        );
+        assert!(
+            parse_node_input("wss://x")
+                .unwrap_err()
+                .contains("应以 autoagents://node?")
+        );
 
         assert_eq!(percent_decode("a%20b%E4%B8%AD%E6%96%87%zz"), "a b中文%zz");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
 
         let service = fake_agent(OK);
         let TestState { state, secrets, .. } = state(service);
-        assert!(set_relay(&state, Some(""), None, None, None).unwrap_err().contains("中继连接串"));
+        assert!(
+            set_relay(&state, Some(""), None, None, None)
+                .unwrap_err()
+                .contains("中继连接串")
+        );
         let connect = "autoagents://relay?addr=wss://127.0.0.1:17001&token=first-token&fp=sha256:0011223344556677889900112233445566778899001122334455667788990011";
         let view = set_relay(&state, Some(connect), None, None, None).unwrap();
         assert_eq!(view.addr, "wss://127.0.0.1:17001");
         assert!(view.configured);
-        assert_eq!(secrets.get(ACCOUNT_RELAY_TOKEN).unwrap().as_deref(), Some("first-token"));
+        assert_eq!(
+            secrets.get(ACCOUNT_RELAY_TOKEN).unwrap().as_deref(),
+            Some("first-token")
+        );
         // 只改地址：令牌与指纹沿用
         let view = set_relay(&state, None, Some("wss://127.0.0.1:17002/"), None, None).unwrap();
         assert_eq!(view.addr, "wss://127.0.0.1:17002");
         assert!(view.has_token);
         assert!(view.fingerprint.starts_with("sha256:00112233"));
         // 指纹不对：整份都不保存
-        assert!(set_relay(&state, Some(""), Some("wss://127.0.0.1:17003"), None, Some("nope")).is_err());
-        assert_eq!(relay_view(&state.db.lock().unwrap(), secrets.as_ref()).unwrap().addr, "wss://127.0.0.1:17002");
+        assert!(
+            set_relay(
+                &state,
+                Some(""),
+                Some("wss://127.0.0.1:17003"),
+                None,
+                Some("nope")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            relay_view(&state.db.lock().unwrap(), secrets.as_ref())
+                .unwrap()
+                .addr,
+            "wss://127.0.0.1:17002"
+        );
         // 清除
         state.remote.clear_relay().unwrap();
         assert!(!state.remote.relay_configured());

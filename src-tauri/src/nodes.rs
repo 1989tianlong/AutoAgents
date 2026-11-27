@@ -4,8 +4,8 @@
 //! 远程机器由 agentd 提供同一个服务，请求经加密通道转发过去。
 //! 上层模块只认「节点 id + 请求」，不关心它在本地还是远程。
 
-use crate::chat::NodeEvent;
 use crate::AppState;
+use crate::chat::NodeEvent;
 use autoagents_core::discovery::DiscoveredAgent;
 use autoagents_core::machine::{MachineInfo, Metrics};
 use serde::Serialize;
@@ -74,7 +74,11 @@ pub async fn ensure_ready(
         Some(path) => serde_json::json!({ "path": path }),
         None => serde_json::json!({}),
     };
-    let method = if workdir.is_some() { "fs.ls" } else { "sys.info" };
+    let method = if workdir.is_some() {
+        "fs.ls"
+    } else {
+        "sys.info"
+    };
     call(state, node_id, method, &params).await.map(|_| ())
 }
 
@@ -199,7 +203,10 @@ async fn local_info(state: &Arc<AppState>) -> MachineInfo {
 
 /// 某台机器此刻的资源占用
 #[tauri::command]
-pub async fn node_metrics(state: State<'_, Arc<AppState>>, node_id: String) -> Result<Metrics, String> {
+pub async fn node_metrics(
+    state: State<'_, Arc<AppState>>,
+    node_id: String,
+) -> Result<Metrics, String> {
     let node = normalize(Some(&node_id));
     let value = call(&state, &node, "sys.metrics", &serde_json::json!({})).await?;
     serde_json::from_value(value).map_err(|e| format!("解析资源占用失败：{e}"))
@@ -207,20 +214,11 @@ pub async fn node_metrics(state: State<'_, Arc<AppState>>, node_id: String) -> R
 
 /// 列出某台机器上的子目录（远程选择工作目录用）
 #[tauri::command]
-pub async fn node_ls(state: State<'_, Arc<AppState>>, node_id: String, path: String) -> Result<Value, String> {
-    let node = normalize(Some(&node_id));
-    call(&state, &node, "fs.ls", &serde_json::json!({ "path": path })).await
-}
-
-/// 在某台机器上的指定目录执行 git
-#[tauri::command]
-pub async fn node_git(
+pub async fn node_ls(
     state: State<'_, Arc<AppState>>,
     node_id: String,
-    workdir: String,
-    args: Vec<String>,
-) -> Result<crate::remote::GitOut, String> {
+    path: String,
+) -> Result<Value, String> {
     let node = normalize(Some(&node_id));
-    let value = call(&state, &node, "git.run", &serde_json::json!({ "workdir": workdir, "args": args })).await?;
-    serde_json::from_value(value).map_err(|e| format!("解析 git 输出失败：{e}"))
+    call(&state, &node, "fs.ls", &serde_json::json!({ "path": path })).await
 }

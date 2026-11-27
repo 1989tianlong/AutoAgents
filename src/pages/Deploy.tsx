@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openSafeUrl as openUrl } from "../lib/url";
 import {
   deployCancel,
   deployCheckHealth,
@@ -284,31 +284,34 @@ function AddTargetDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (
     enabled: platform !== null && connected(platform ?? "vercel"),
   });
 
-  const toggle = (c: DeployCandidate) =>
-    setChosen((list) =>
-      list.includes(c.platformId) ? list.filter((id) => id !== c.platformId) : [...list, c.platformId],
-    );
-  const patch = (id: string, fields: Partial<{ url: string; hook: string }>) =>
+  const candidateKey = (c: Pick<DeployCandidate, "provider" | "platformId">) => `${c.provider}/${c.platformId}`;
+  const toggle = (c: DeployCandidate) => {
+    const key = candidateKey(c);
+    setChosen((list) => (list.includes(key) ? list.filter((id) => id !== key) : [...list, key]));
+  };
+  const patch = (key: string, fields: Partial<{ url: string; hook: string }>) =>
     setExtra((all) => {
-      const prev = all[id] ?? { url: "", hook: "" };
-      return { ...all, [id]: { ...prev, ...fields } };
+      const prev = all[key] ?? { url: "", hook: "" };
+      return { ...all, [key]: { ...prev, ...fields } };
     });
 
   const add = useMutation({
     mutationFn: async () => {
-      const picks = (found.data ?? []).filter((c) => chosen.includes(c.platformId));
+      const picks = (found.data ?? []).filter((c) => chosen.includes(candidateKey(c)));
       let last: DeployTarget | null = null;
       for (const c of picks) {
-        const x = extra[c.platformId];
+        const x = extra[candidateKey(c)];
         last = await deployTargetAdd(c.provider, c.name, c.platformId, x?.url || null, x?.hook || null);
       }
       return last;
     },
     onSuccess: (last) => {
-      qc.invalidateQueries({ queryKey: ["deployTargets"] });
-      qc.invalidateQueries({ queryKey: ["deployments"] });
       if (last) onAdded(last.id);
       onClose();
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["deployTargets"] });
+      qc.invalidateQueries({ queryKey: ["deployments"] });
     },
     onError: (e) => setError(errText(e)),
   });
@@ -356,9 +359,10 @@ function AddTargetDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (
           </p>
         )}
         {found.data?.map((c) => {
-          const on = chosen.includes(c.platformId);
+          const key = candidateKey(c);
+          const on = chosen.includes(key);
           return (
-            <div key={`${c.provider}/${c.platformId}`} className="rounded-lg border border-slate-800 px-3 py-2">
+            <div key={key} className="rounded-lg border border-slate-800 px-3 py-2">
               <label className="flex cursor-pointer items-center gap-3">
                 <input
                   type="checkbox"
@@ -382,15 +386,15 @@ function AddTargetDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (
                     className={inputClass}
                     placeholder="生产地址（可选，如 https://api.example.com）"
                     aria-label={`${c.name} 的生产地址`}
-                    value={extra[c.platformId]?.url ?? ""}
-                    onChange={(e) => patch(c.platformId, { url: e.target.value })}
+                    value={extra[key]?.url ?? ""}
+                    onChange={(e) => patch(key, { url: e.target.value })}
                   />
                   <input
                     className={inputClass}
                     placeholder="Deploy Hook 地址（可选，主动触发构建用）"
                     aria-label={`${c.name} 的 Deploy Hook`}
-                    value={extra[c.platformId]?.hook ?? ""}
-                    onChange={(e) => patch(c.platformId, { hook: e.target.value })}
+                    value={extra[key]?.hook ?? ""}
+                    onChange={(e) => patch(key, { hook: e.target.value })}
                   />
                 </div>
               )}
@@ -637,26 +641,38 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
   const [logFor, setLogFor] = useState<Deployment | null>(null);
   const [deploying, setDeploying] = useState(false);
   const [rolling, setRolling] = useState(false);
-  const [confirm, setConfirm] = useState<{ text: ReactNode; action: () => Promise<unknown>; danger?: boolean; label: string } | null>(null);
+  const [confirm, setConfirm] = useState<{
+    text: ReactNode;
+    action: () => Promise<unknown>;
+    danger?: boolean;
+    label: string;
+    skipSync?: boolean;
+  } | null>(null);
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   /** 平台上的状态变了：拉一次，再刷新本地记录 */
-  const sync = async () => {
+  const sync = async (): Promise<boolean> => {
+    let ok = true;
     try {
       await deployRefresh(id);
     } catch (e) {
+      ok = false;
       setNotice({ kind: "error", text: errText(e) });
     }
     await qc.invalidateQueries({ queryKey: ["deployments"] });
     await qc.invalidateQueries({ queryKey: ["deployTargets"] });
+    return ok;
   };
   /** 做一件会改动线上状态的事；出错时把平台给的原因留在页面上 */
-  const act = (what: string, run: () => Promise<unknown>) => async () => {
+  const act = (what: string, run: () => Promise<unknown>, skipSync = false) => async () => {
     setNotice(null);
     try {
       await run();
-      await sync();
-      setNotice({ kind: "ok", text: `${what}：已发给平台，稍后状态会更新` });
+      if (skipSync) return;
+      const synced = await sync();
+      if (synced) {
+        setNotice({ kind: "ok", text: `${what}：已发给平台，稍后状态会更新` });
+      }
     } catch (e) {
       setNotice({ kind: "error", text: `${what}失败：${errText(e)}` });
     }
@@ -800,6 +816,7 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
                 text: <>取消登记「{target.name}」：本地的部署记录会删掉，平台上的项目和线上服务都不动。</>,
                 label: "取消登记",
                 danger: true,
+                skipSync: true,
                 action: () =>
                   deployTargetRemove(id).then(() => {
                     qc.invalidateQueries({ queryKey: ["deployTargets"] });
@@ -996,13 +1013,17 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
                           className="text-slate-500 hover:text-sky-300"
                           onClick={(e) => {
                             e.stopPropagation();
-                            void act(
-                              "健康检查",
-                              async () => {
-                                const text = await deployCheckHealth(d.id);
-                                if (text !== "ok") throw new Error(text);
-                              },
-                            )();
+                            setNotice(null);
+                            void deployCheckHealth(d.id)
+                              .then(async (text) => {
+                                await qc.invalidateQueries({ queryKey: ["deployments"] });
+                                setNotice(
+                                  text === "ok"
+                                    ? { kind: "ok", text: "健康检查：通过" }
+                                    : { kind: "error", text: `健康检查未通过：${text}` },
+                                );
+                              })
+                              .catch((err) => setNotice({ kind: "error", text: `健康检查失败：${errText(err)}` }));
                           }}
                         >
                           复查
@@ -1127,9 +1148,9 @@ function TargetDetail({ id, onRemoved }: { id: number; onRemoved: () => void }) 
           danger={confirm.danger}
           onClose={() => setConfirm(null)}
           onConfirm={() => {
-            const { action, label } = confirm;
+            const { action, label, skipSync } = confirm;
             setConfirm(null);
-            void act(label, action)();
+            void act(label, action, skipSync)();
           }}
         >
           {confirm.text}
@@ -1226,7 +1247,7 @@ export default function Deploy() {
             />
           </div>
         ) : (
-          <TargetDetail id={selected} onRemoved={clear} />
+          <TargetDetail key={selected} id={selected} onRemoved={clear} />
         )}
       </section>
 

@@ -125,6 +125,9 @@ fn hook_account(target_id: i64) -> String {
     format!("deploy_hook_{target_id}")
 }
 
+/// 自动回滚同一目标的冷却窗口（30 分钟内最多自动回滚一次，防止外部依赖故障导致无限循环回滚）
+const AUTO_ROLLBACK_COOLDOWN_MS: i64 = 30 * 60 * 1000;
+
 /// 部署模块的运行时状态
 #[derive(Default)]
 pub struct Deployer {
@@ -132,6 +135,8 @@ pub struct Deployer {
     refreshing: Mutex<HashSet<i64>>,
     /// 每个目标最近一次刷新失败的原因；原因没变就不再重复记事件
     last_error: Mutex<HashMap<i64, String>>,
+    /// 每个目标最近一次自动回滚的时间（毫秒）
+    last_auto_rollback: Mutex<HashMap<i64, i64>>,
 }
 
 /// 登记了的部署目标：Vercel 项目、Cloudflare Pages 项目或 Worker
@@ -575,12 +580,110 @@ fn record(state: &AppState, kind: &str, level: &str, source: &str, message: &str
 // HTTP
 // ---------------------------------------------------------------------------
 
-fn client(secs: u64) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(secs))
-        .user_agent(concat!("AutoAgents/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
+/// 最大健康检查响应体读取字节数（1 MiB，防大响应 OOM）
+const HEALTH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// 校验上游 API URL 路径段，阻断 `../`、`?`、`#` 等路径穿越/查询注入
+fn validate_api_seg(seg: &str, what: &str) -> Result<(), String> {
+    let s = seg.trim();
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains('/')
+        || s.contains('\\')
+        || s.contains('?')
+        || s.contains('#')
+        || s.contains('\0')
+        || s.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("{what}格式不合法：{seg}"));
+    }
+    Ok(())
+}
+
+/// 校验 Deploy Hook 地址：生产环境仅允许 `https://api.cloudflare.com/...`
+fn validate_hook_url(hook: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(hook).map_err(|_| "Deploy Hook 地址格式不合法".to_string())?;
+    let host = parsed.host_str().unwrap_or_default();
+    let ok_host = host.eq_ignore_ascii_case("api.cloudflare.com")
+        || cfg!(test) && matches!(host, "127.0.0.1" | "localhost" | "::1");
+    let ok_scheme = parsed.scheme() == "https" || (cfg!(test) && parsed.scheme() == "http");
+    if !ok_scheme {
+        return Err("Deploy Hook 的地址应该以 https:// 开头".to_string());
+    }
+    if !ok_host {
+        return Err("Deploy Hook 仅支持 Cloudflare 官方域名（api.cloudflare.com）".to_string());
+    }
+    Ok(())
+}
+
+/// 判断 IP 是否为禁止 SSRF 访问的内网/回环/元数据网段
+fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                // 100.64.0.0/10 (CGNAT)
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // ULA fc00::/7 & link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_forbidden_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// 校验健康检查目标 URL（非测试环境下强制 https 且解析 DNS 阻断内网/云元数据 SSRF）
+async fn validate_health_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "健康检查地址格式不合法".to_string())?;
+    let scheme = parsed.scheme();
+    if scheme != "https" && !(cfg!(test) && scheme == "http") {
+        return Err("健康检查地址必须使用 https://".to_string());
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("健康检查地址缺少主机名".to_string());
+    };
+    if cfg!(test) {
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("无法解析域名 {host}：{e}"))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if is_forbidden_ip(addr.ip()) {
+            return Err("禁止对回环或内网地址执行健康检查".to_string());
+        }
+    }
+    if !any {
+        return Err(format!("域名 {host} 未解析到有效地址"));
+    }
+    Ok(())
+}
+
+/// 限流读取 HTTP 响应体（上限 `limit` 字节），避免大响应打爆内存
+async fn read_body_limited(mut resp: reqwest::Response, limit: usize) -> String {
+    let mut buf = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let remain = limit.saturating_sub(buf.len());
+        if remain == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..chunk.len().min(remain)]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// 请求 Vercel。失败时把 `error.message` 带出来
@@ -592,7 +695,8 @@ async fn vercel(
     body: Option<Value>,
 ) -> Result<Value, String> {
     let base = state.vercel_api.lock().unwrap().clone();
-    let mut request = client(20)?
+    let mut request = state
+        .http
         .request(
             method
                 .parse()
@@ -645,7 +749,8 @@ async fn cf(
     body: Option<Value>,
 ) -> Result<Value, String> {
     let base = state.cf_api.lock().unwrap().clone();
-    let mut request = client(20)?
+    let mut request = state
+        .http
         .request(
             method
                 .parse()
@@ -770,9 +875,7 @@ fn workers_state(status: &str, outcome: &str) -> (&'static str, bool) {
     };
     if has(&["fail", "error"]) {
         ("error", true)
-    } else if has(&["cancel"]) {
-        ("canceled", true)
-    } else if has(&["skip"]) {
+    } else if has(&["cancel", "skip"]) {
         ("canceled", true)
     } else if has(&["success", "succeed", "complete"]) {
         ("ready", true)
@@ -1040,16 +1143,15 @@ async fn refresh_inner(state: &Arc<AppState>, target: &Target) -> Result<usize, 
     let fresh = fetch(state, &target, provider, &token).await?;
 
     // Vercel 的项目信息里没有生产地址：从最近一次成功的生产部署上认一个域名
-    if provider == Provider::Vercel && target.url.as_deref().is_none_or(|url| url.is_empty()) {
-        if let Some(dep) = fresh
+    if provider == Provider::Vercel
+        && target.url.as_deref().is_none_or(|url| url.is_empty())
+        && let Some(dep) = fresh
             .iter()
             .find(|dep| dep.env == "production" && dep.state == "ready")
-        {
-            if let Some(url) = production_url(state, &target, &token, &dep.id).await {
-                target.url = Some(url);
-                save_target(&state.db.lock().unwrap(), &target)?;
-            }
-        }
+        && let Some(url) = production_url(state, &target, &token, &dep.id).await
+    {
+        target.url = Some(url);
+        save_target(&state.db.lock().unwrap(), &target)?;
     }
 
     let mut count = 0;
@@ -1206,13 +1308,19 @@ pub async fn refresh(state: &Arc<AppState>, target_id: Option<i64>) -> Result<us
     }
 }
 
-/// 应用启动后调用：先拉一遍，然后定期刷新各个目标
+/// 应用启动后调用：先拉一遍，然后定期刷新各个目标（响应关闭信号优雅退出）
 pub fn start_polling(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    shutdown.borrow_and_update();
     tauri::async_runtime::spawn(async move {
         let _ = refresh(&state, None).await;
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let _ = refresh(&state, None).await;
+            tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => {
+                    let _ = refresh(&state, None).await;
+                }
+                _ = shutdown.changed() => return,
+            }
         }
     });
 }
@@ -1240,7 +1348,7 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
     if production && dep.state == "ready" {
         let url = health_url(target);
         let verdict = match &url {
-            Some(url) => check(url, target.health_contains.as_deref()).await,
+            Some(url) => check(state, url, target.health_contains.as_deref()).await,
             None => Health::Unknown("没有生产地址，没法检查".to_string()),
         };
         match &verdict {
@@ -1402,6 +1510,24 @@ async fn guard(state: &Arc<AppState>, target: &Target, dep: &Deployment) -> Opti
 /// 什么都没有就只交给修复任务。回滚到的版本要是也坏，守护会对它再查一次、再回滚一次——
 /// 每一步都有事件，修复任务的 24 小时上限也拦着失控。
 async fn rollback_to_healthy(state: &Arc<AppState>, target: &Target, dep: &Deployment) {
+    // 冷却熔断：避免外部服务故障时每分钟产生新部署并无限回滚
+    let now = now_ms();
+    {
+        let map = state.deploy.last_auto_rollback.lock().unwrap();
+        if let Some(&prev) = map.get(&target.id)
+            && now - prev < AUTO_ROLLBACK_COOLDOWN_MS
+        {
+            record(
+                state,
+                "deploy.rollback",
+                "warning",
+                &target.name,
+                "健康检查仍未通过，但近期已自动回滚过，暂停再次自动回滚以防循环，请人工确认",
+                &event_link(target.id),
+            );
+            return;
+        }
+    }
     let items = match history(state, target.id).await {
         Ok(items) => items,
         Err(e) => {
@@ -1436,23 +1562,32 @@ async fn rollback_to_healthy(state: &Arc<AppState>, target: &Target, dep: &Deplo
         .clone()
         .map(|msg| format!("（{msg}）"))
         .unwrap_or_default();
-    // 回滚完会刷新部署、又走一遍守护：把这一步 box 住，异步递归才有界
-    match Box::pin(rollback(
+    // 已在 refresh_target 内部，此处跳过重入刷新，改由外层 refresh_target 完成后按需刷新
+    match Box::pin(rollback_inner(
         state,
         target.id,
         &candidate.id,
         candidate.version_id.as_deref(),
+        false,
     ))
     .await
     {
-        Ok(()) => record(
-            state,
-            "deploy.auto",
-            "warning",
-            &target.name,
-            &format!("健康检查没过，先自动回滚止血{note}，修复任务照建"),
-            &event_link(target.id),
-        ),
+        Ok(()) => {
+            state
+                .deploy
+                .last_auto_rollback
+                .lock()
+                .unwrap()
+                .insert(target.id, now_ms());
+            record(
+                state,
+                "deploy.auto",
+                "warning",
+                &target.name,
+                &format!("健康检查没过，先自动回滚止血{note}，修复任务照建"),
+                &event_link(target.id),
+            );
+        }
         Err(e) => record(
             state,
             "deploy.rollback",
@@ -1619,13 +1754,12 @@ enum Health {
     Unknown(String),
 }
 
-/// 访问一次生产地址：2xx 才算通过；设了期望内容的话，返回里还要包含它
-async fn check(url: &str, contains: Option<&str>) -> Health {
-    let client = match client(10) {
-        Ok(client) => client,
-        Err(e) => return Health::Fail(e),
-    };
-    let resp = match client.get(url).send().await {
+/// 访问一次生产地址：2xx 才算通过；设了期望内容的话，返回里还要包含它（含 SSRF 防护与 1 MiB 读取上限）
+async fn check(state: &AppState, url: &str, contains: Option<&str>) -> Health {
+    if let Err(e) = validate_health_url(url).await {
+        return Health::Unknown(e);
+    }
+    let resp = match state.health_http.get(url).send().await {
         Ok(resp) => resp,
         Err(e) => {
             // 连不上多半是这台机器的网络问题（平台那边总有人接），不算部署出事；超时才算
@@ -1640,14 +1774,14 @@ async fn check(url: &str, contains: Option<&str>) -> Health {
     if status == 401 || status == 403 {
         return Health::Unknown(format!("HTTP {status}：这个地址有访问保护，检查不了"));
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = read_body_limited(resp, HEALTH_BODY_LIMIT).await;
     if !(200..300).contains(&status) {
         return Health::Fail(format!("HTTP {status}"));
     }
-    if let Some(needle) = contains.map(str::trim).filter(|needle| !needle.is_empty()) {
-        if !body.contains(needle) {
-            return Health::Fail(format!("返回的内容里没有「{needle}」"));
-        }
+    if let Some(needle) = contains.map(str::trim).filter(|needle| !needle.is_empty())
+        && !body.contains(needle)
+    {
+        return Health::Fail(format!("返回的内容里没有「{needle}」"));
     }
     Health::Ok
 }
@@ -1655,6 +1789,51 @@ async fn check(url: &str, contains: Option<&str>) -> Health {
 // ---------------------------------------------------------------------------
 // 操作
 // ---------------------------------------------------------------------------
+async fn verify_token(state: &AppState, platform: &str, token: &str) -> ProviderStatus {
+    let mut status = ProviderStatus {
+        configured: true,
+        error: None,
+        who: None,
+        scopes: Vec::new(),
+        scope: None,
+    };
+    if platform == "vercel" {
+        // 能列出项目就算令牌有效
+        match vercel(state, token, "GET", "/v10/projects?limit=1", None).await {
+            Ok(_) => {}
+            Err(e) => {
+                status.error = Some(e);
+                return status;
+            }
+        }
+        if let Ok(v) = vercel(state, token, "GET", "/v2/user", None).await {
+            let user = &v["user"];
+            status.who = text(user, "username").or_else(|| text(user, "email"));
+            status.scope = text(user, "defaultTeamId");
+        }
+        if let Ok(v) = vercel(state, token, "GET", "/v2/teams", None).await {
+            status.scopes = scopes_from(&v["teams"], "id", &["name", "slug"]);
+        }
+    } else {
+        match cf(state, token, "GET", "/accounts", None).await {
+            Ok(v) => {
+                status.scopes = scopes_from(&v, "id", &["name"]);
+                status.scope = status.scopes.first().map(|scope| scope.id.clone());
+            }
+            Err(e) => {
+                status.error = Some(e);
+                return status;
+            }
+        }
+    }
+    if let Some(saved) =
+        setting(&state.db.lock().unwrap(), &scope_key(platform)).filter(|saved| !saved.is_empty())
+    {
+        status.scope = Some(saved);
+    }
+    status
+}
+
 async fn status(state: &AppState, platform: &str) -> ProviderStatus {
     let mut status = ProviderStatus {
         configured: false,
@@ -1678,42 +1857,7 @@ async fn status(state: &AppState, platform: &str) -> ProviderStatus {
     let Some(token) = token else {
         return status;
     };
-    status.configured = true;
-    if platform == "vercel" {
-        // 能列出项目就算令牌有效
-        match vercel(state, &token, "GET", "/v10/projects?limit=1", None).await {
-            Ok(_) => {}
-            Err(e) => {
-                status.error = Some(e);
-                return status;
-            }
-        }
-        if let Ok(v) = vercel(state, &token, "GET", "/v2/user", None).await {
-            let user = &v["user"];
-            status.who = text(user, "username").or_else(|| text(user, "email"));
-            status.scope = text(user, "defaultTeamId");
-        }
-        if let Ok(v) = vercel(state, &token, "GET", "/v2/teams", None).await {
-            status.scopes = scopes_from(&v["teams"], "id", &["name", "slug"]);
-        }
-    } else {
-        match cf(state, &token, "GET", "/accounts", None).await {
-            Ok(v) => {
-                status.scopes = scopes_from(&v, "id", &["name"]);
-                status.scope = status.scopes.first().map(|scope| scope.id.clone());
-            }
-            Err(e) => {
-                status.error = Some(e);
-                return status;
-            }
-        }
-    }
-    if let Some(saved) =
-        setting(&state.db.lock().unwrap(), &scope_key(platform)).filter(|saved| !saved.is_empty())
-    {
-        status.scope = Some(saved);
-    }
-    status
+    verify_token(state, platform, &token).await
 }
 
 fn scopes_from(list: &Value, id: &str, names: &[&str]) -> Vec<Scope> {
@@ -1731,7 +1875,7 @@ fn scopes_from(list: &Value, id: &str, names: &[&str]) -> Vec<Scope> {
         .unwrap_or_default()
 }
 
-/// 填入令牌：先验证，通过了才存进 Keychain
+/// 填入令牌：先验证，通过了才存进 Keychain（验证失败不破坏已有有效令牌）
 pub async fn connect(
     state: &Arc<AppState>,
     platform: &str,
@@ -1742,25 +1886,22 @@ pub async fn connect(
     if token.is_empty() {
         return Err("请输入 API 令牌".to_string());
     }
-    let account = token_account(platform);
-    state.secrets.set(&account, token)?;
-    let status = status(state, platform).await;
+    let status = verify_token(state, platform, token).await;
     match status.error {
-        Some(error) => {
-            let _ = state.secrets.delete(&account);
-            Err(error)
-        }
+        Some(error) => Err(error),
         None => {
+            let account = token_account(platform);
+            state.secrets.set(&account, token)?;
             let who = status
                 .who
                 .as_deref()
                 .map(|who| format!("（{who}）"))
                 .unwrap_or_default();
             // 还没选过团队 / 账户的话，就把这次认出来的记下来
-            if let Some(scope) = status.scope.as_deref().filter(|scope| !scope.is_empty()) {
-                if scope_of(state, platform).is_empty() {
-                    set_setting(&state.db.lock().unwrap(), &scope_key(platform), scope)?;
-                }
+            if let Some(scope) = status.scope.as_deref().filter(|scope| !scope.is_empty())
+                && scope_of(state, platform).is_empty()
+            {
+                set_setting(&state.db.lock().unwrap(), &scope_key(platform), scope)?;
             }
             record(
                 state,
@@ -1975,10 +2116,10 @@ async fn enrich(state: &AppState, target: &mut Target, token: &str) {
                     .filter(|repo| repo.contains('/'));
                 target.branch = text(repo, "branch");
                 target.git_type = text(repo, "provider")
-                    .or_else(|| Some("github".to_string()).filter(|_| target.repo.is_some()));
+                    .or_else(|| target.repo.is_some().then_some("github".to_string()));
             }
-            if target.url.is_none() {
-                if let Ok(v) = cf(
+            if target.url.is_none()
+                && let Ok(v) = cf(
                     state,
                     token,
                     "GET",
@@ -1986,11 +2127,9 @@ async fn enrich(state: &AppState, target: &mut Target, token: &str) {
                     None,
                 )
                 .await
-                {
-                    if let Some(sub) = text(&v, "subdomain") {
-                        target.url = Some(format!("https://{}.{}.workers.dev", target.name, sub));
-                    }
-                }
+                && let Some(sub) = text(&v, "subdomain")
+            {
+                target.url = Some(format!("https://{}.{}.workers.dev", target.name, sub));
             }
         }
         Err(_) => {}
@@ -2054,10 +2193,8 @@ pub async fn add_target(
         &format!("已登记部署目标（{}）", provider.label()),
         &event_link(target.id),
     );
-    if let Some(hook) = hook_url
-        .map(str::trim)
-        .filter(|hook| hook.starts_with("https://"))
-    {
+    if let Some(hook) = hook_url.map(str::trim).filter(|hook| !hook.is_empty()) {
+        validate_hook_url(hook)?;
         state.secrets.set(&hook_account(target.id), hook)?;
         target.has_hook = true;
     }
@@ -2118,11 +2255,11 @@ pub fn update_target(
             state.secrets.delete(&hook_account(id))?;
             target.has_hook = false;
         }
-        Some(hook) if hook.starts_with("https://") => {
+        Some(hook) => {
+            validate_hook_url(hook)?;
             state.secrets.set(&hook_account(id), hook)?;
             target.has_hook = true;
         }
-        Some(_) => return Err("Deploy Hook 的地址应该以 https:// 开头".to_string()),
         None => {}
     }
     save_target(&state.db.lock().unwrap(), &target)?;
@@ -2131,7 +2268,7 @@ pub fn update_target(
 
 /// 取消登记（它的部署记录一并删掉；平台上的项目不动）
 pub fn remove_target(state: &AppState, id: i64) -> Result<(), String> {
-    let target = {
+    {
         let db = state.db.lock().unwrap();
         let target = load_target(&db, id)?;
         db.execute("DELETE FROM deployments WHERE target_id = ?1", params![id])
@@ -2146,10 +2283,10 @@ pub fn remove_target(state: &AppState, id: i64) -> Result<(), String> {
             "已取消登记部署目标",
             Some("#/deploy"),
         );
-        target
-    };
+    }
     let _ = state.secrets.delete(&hook_account(id));
-    let _ = target;
+    state.deploy.last_error.lock().unwrap().remove(&id);
+    state.deploy.last_auto_rollback.lock().unwrap().remove(&id);
     Ok(())
 }
 
@@ -2204,7 +2341,8 @@ async fn fire_hook(state: &AppState, target: &Target) -> Result<(), String> {
             "这个 Worker 没有配 Deploy Hook：在 Cloudflare 控制台「Settings → Builds → Deploy Hooks」里建一个，填到目标设置里"
                 .to_string()
         })?;
-    let resp = client(20)?
+    let resp = state
+        .http
         .post(&hook)
         .send()
         .await
@@ -2472,6 +2610,8 @@ pub async fn cancel(state: &AppState, id: &str) -> Result<(), String> {
 pub async fn promote(state: &AppState, id: &str) -> Result<(), String> {
     let dep = load_deployment(&state.db.lock().unwrap(), id)?;
     let target = load_target(&state.db.lock().unwrap(), dep.target_id)?;
+    validate_api_seg(&target.platform_id, "项目标识")?;
+    validate_api_seg(&dep.id, "部署标识")?;
     let provider = Provider::parse(&target.provider)?;
     if provider != Provider::Vercel {
         return Err("只有 Vercel 能把预览部署提升为生产；Cloudflare 请用回滚".to_string());
@@ -2506,7 +2646,19 @@ pub async fn rollback(
     to_id: &str,
     version_id: Option<&str>,
 ) -> Result<(), String> {
+    rollback_inner(state, target_id, to_id, version_id, true).await
+}
+
+async fn rollback_inner(
+    state: &Arc<AppState>,
+    target_id: i64,
+    to_id: &str,
+    version_id: Option<&str>,
+    refresh_after: bool,
+) -> Result<(), String> {
+    validate_api_seg(to_id, "回滚目标标识")?;
     let target = load_target(&state.db.lock().unwrap(), target_id)?;
+    validate_api_seg(&target.platform_id, "项目标识")?;
     let provider = Provider::parse(&target.provider)?;
     let token = token_of(state, provider)?;
     match provider {
@@ -2560,7 +2712,9 @@ pub async fn rollback(
         "生产部署已回滚",
         &event_link(target.id),
     );
-    let _ = refresh_target(state, &target).await;
+    if refresh_after {
+        let _ = refresh_target(state, &target).await;
+    }
     Ok(())
 }
 
@@ -2655,7 +2809,7 @@ pub async fn history(state: &Arc<AppState>, target_id: i64) -> Result<Vec<Histor
             })
         })
         .collect();
-    items.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    items.sort_by_key(|a| std::cmp::Reverse(a.created_ms));
     if let Some(first) = items.first_mut().filter(|item| item.created_ms.is_some()) {
         first.current = true;
     }
@@ -2740,7 +2894,7 @@ pub async fn check_health(state: &AppState, id: &str) -> Result<String, String> 
     let dep = load_deployment(&state.db.lock().unwrap(), id)?;
     let target = load_target(&state.db.lock().unwrap(), dep.target_id)?;
     let verdict = match health_url(&target) {
-        Some(url) => check(&url, target.health_contains.as_deref()).await,
+        Some(url) => check(state, &url, target.health_contains.as_deref()).await,
         None => Health::Unknown("没有生产地址：在目标设置里填一个".to_string()),
     };
     let text = match &verdict {
@@ -2831,6 +2985,7 @@ pub async fn deploy_target_add(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_target_update(
     state: State<'_, Arc<AppState>>,
     id: i64,
@@ -3553,7 +3708,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
 
         // 登记 Worker：标签是平台给的；Deploy Hook 的地址进凭据库，不进数据库
         let hook =
-            "https://hooks.cloudflare.example/workers/builds/deploy_hooks/hook123".to_string();
+            "https://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/hook123".to_string();
         let worker = add_target(
             &state,
             "cloudflare-workers",
@@ -4947,7 +5102,7 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"修好了构建。"}'
             None,
             None,
             None,
-            Some("https://hooks.cloudflare.example/x"),
+            Some("https://api.cloudflare.com/client/v4/deploy_hooks/x"),
         )
         .unwrap();
         state.secrets.set(&hook_account(worker.id), &hook).unwrap();

@@ -13,7 +13,7 @@
 //! ```
 
 use crate::net::{self, Channel, Fingerprint, Stream};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -98,18 +98,32 @@ pub struct NodeSummary {
     pub since_ms: u64,
 }
 
+/// 连接与元数据上限（防止内存/FD 耗尽 DoS）
+const MAX_NODES: usize = 1024;
+const MAX_HUBS: usize = 256;
+const MAX_JOINS: usize = 1024;
+const MAX_META_LEN: usize = 256;
+const CTRL_QUEUE: usize = 64;
+const CLIENT_IDLE: Duration = Duration::from_secs(90);
+
+fn clip_meta(s: String) -> String {
+    s.trim().chars().take(MAX_META_LEN).collect()
+}
+
 /// 一次节点登记。同一个节点 id 重新连上来会顶掉旧登记，旧连接下线时不能误删新的。
 struct NodeEntry {
     seq: u64,
     summary: NodeSummary,
-    tx: mpsc::UnboundedSender<RelayFrame>,
+    tx: mpsc::Sender<RelayFrame>,
+    /// 顶号时显式关闭旧控制连接，不等 IDLE 超时
+    cancel: watch::Sender<bool>,
 }
 
 struct State<S> {
     /// 令牌只存哈希：内存里和转储里都不出现明文
     token_hash: [u8; 32],
     nodes: Mutex<HashMap<String, NodeEntry>>,
-    hubs: Mutex<HashMap<u64, mpsc::UnboundedSender<RelayFrame>>>,
+    hubs: Mutex<HashMap<u64, mpsc::Sender<RelayFrame>>>,
     /// 等待节点归队的数据连接
     joins: Mutex<HashMap<String, oneshot::Sender<Channel<S>>>>,
     online: watch::Sender<Vec<NodeSummary>>,
@@ -135,13 +149,15 @@ impl<S> State<S> {
         list
     }
 
-    /// 在线节点有变化：更新列表并通知所有控制端
+    /// 在线节点有变化：更新列表并通知所有控制端（有界队列 `try_send`，慢消费者不拖垮中继内存）
     fn publish(&self) {
         let list = self.summaries();
         let _ = self.online.send(list.clone());
         let hubs: Vec<_> = self.hubs.lock().unwrap().values().cloned().collect();
         for hub in hubs {
-            let _ = hub.send(RelayFrame::Nodes { nodes: list.clone() });
+            let _ = hub.try_send(RelayFrame::Nodes {
+                nodes: list.clone(),
+            });
         }
     }
 }
@@ -178,9 +194,9 @@ where
     pub async fn accept(&self, channel: Channel<S>) -> Result<(), String> {
         let state = Arc::clone(&self.state);
         let mut channel = channel;
-        let first = channel
-            .recv_json::<RelayFrame>()
+        let first = tokio::time::timeout(net::CONNECT_TIMEOUT, channel.recv_json::<RelayFrame>())
             .await
+            .map_err(|_| "等待报到超时".to_string())?
             .map_err(|e| format!("没有收到报到：{e}"))?;
         match first {
             RelayFrame::Hello { token, .. } if !state.token_ok(&token) => {
@@ -194,21 +210,23 @@ where
                 ..
             } => {
                 let node_id = node_id
-                    .map(|id| id.trim().to_string())
+                    .map(clip_meta)
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| "节点没有带 id".to_string())?;
                 node_session(
                     &mut channel,
                     &state,
                     node_id,
-                    name.unwrap_or_default(),
-                    os.unwrap_or_default(),
+                    clip_meta(name.unwrap_or_default()),
+                    clip_meta(os.unwrap_or_default()),
                 )
                 .await
             }
-            RelayFrame::Hello { role: Role::Hub, .. } => hub_session(&mut channel, &state).await,
+            RelayFrame::Hello {
+                role: Role::Hub, ..
+            } => hub_session(&mut channel, &state).await,
             RelayFrame::Open { node_id, token } if state.token_ok(&token) => {
-                open_session(&mut channel, &state, node_id).await
+                open_session(channel, &state, clip_meta(node_id)).await
             }
             RelayFrame::Join { conn_id, token } if state.token_ok(&token) => {
                 let waiting = state.joins.lock().unwrap().remove(&conn_id);
@@ -237,9 +255,12 @@ impl TlsRelay {
         acceptor: TlsAcceptor,
         health: &str,
     ) -> Result<(), String> {
-        let channel = tokio::time::timeout(net::CONNECT_TIMEOUT, net::accept_tls_with_health(stream, acceptor, health))
-            .await
-            .map_err(|_| "TLS / WebSocket 握手超时".to_string())??;
+        let channel = tokio::time::timeout(
+            net::CONNECT_TIMEOUT,
+            net::accept_tls_with_health(stream, acceptor, health),
+        )
+        .await
+        .map_err(|_| "TLS / WebSocket 握手超时".to_string())??;
         self.accept(channel).await
     }
 }
@@ -247,9 +268,12 @@ impl TlsRelay {
 impl PlainRelay {
     /// 接受一个明文 TCP 连接（TLS 已由反向代理终结）：WebSocket 握手 → 处理。
     pub async fn handle_plain(&self, stream: TcpStream, health: &str) -> Result<(), String> {
-        let channel = tokio::time::timeout(net::CONNECT_TIMEOUT, net::accept_with_health(stream, health))
-            .await
-            .map_err(|_| "WebSocket 握手超时".to_string())??;
+        let channel = tokio::time::timeout(
+            net::CONNECT_TIMEOUT,
+            net::accept_with_health(stream, health),
+        )
+        .await
+        .map_err(|_| "WebSocket 握手超时".to_string())??;
         self.accept(channel).await
     }
 }
@@ -272,10 +296,11 @@ where
 }
 
 /// 控制连接与已报到的控制端连接共用：把 `out` 里的消息写出去，
-/// 读进来的只回应保活，超时断开。
+/// 读进来的只回应保活，超时或被顶替立即断开。
 async fn control_loop<S>(
     channel: &mut Channel<S>,
-    out: &mut mpsc::UnboundedReceiver<RelayFrame>,
+    out: &mut mpsc::Receiver<RelayFrame>,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -290,11 +315,19 @@ where
                 None => return Err("连接已被本地结束".into()),
             },
             incoming = channel.recv_json::<RelayFrame>() => {
-                match incoming? {
-                    RelayFrame::Ping {} => channel.send_json(&RelayFrame::Pong {}).await?,
-                    _ => {}
+                if let RelayFrame::Ping {} = incoming? {
+                    channel.send_json(&RelayFrame::Pong {}).await?;
                 }
                 last_rx = tokio::time::Instant::now();
+            }
+            _ = cancel.changed() => {
+                let _ = channel
+                    .send_json(&RelayFrame::Error {
+                        message: "同一个节点 id 的新连接连了上来，这条连接被顶替".into(),
+                    })
+                    .await;
+                let _ = channel.close().await;
+                return Err("连接被新连接顶替".into());
             }
             _ = ticker.tick() => {
                 let idle = last_rx.elapsed();
@@ -303,6 +336,45 @@ where
                 }
             }
         }
+    }
+}
+
+struct NodeGuard<S> {
+    state: Arc<State<S>>,
+    node_id: String,
+    seq: u64,
+}
+
+impl<S> Drop for NodeGuard<S> {
+    fn drop(&mut self) {
+        let mut nodes = self.state.nodes.lock().unwrap();
+        if nodes.get(&self.node_id).is_some_and(|e| e.seq == self.seq) {
+            nodes.remove(&self.node_id);
+        }
+        drop(nodes);
+        self.state.publish();
+    }
+}
+
+struct HubGuard<S> {
+    state: Arc<State<S>>,
+    id: u64,
+}
+
+impl<S> Drop for HubGuard<S> {
+    fn drop(&mut self) {
+        self.state.hubs.lock().unwrap().remove(&self.id);
+    }
+}
+
+struct JoinGuard<S> {
+    state: Arc<State<S>>,
+    conn_id: String,
+}
+
+impl<S> Drop for JoinGuard<S> {
+    fn drop(&mut self) {
+        self.state.joins.lock().unwrap().remove(&self.conn_id);
     }
 }
 
@@ -316,7 +388,9 @@ async fn node_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
+    let (tx, mut rx) = mpsc::channel::<RelayFrame>(CTRL_QUEUE);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    cancel_rx.borrow_and_update();
     let seq = state.seq.fetch_add(1, Ordering::SeqCst);
     let entry = NodeEntry {
         seq,
@@ -327,30 +401,42 @@ where
             since_ms: now_ms(),
         },
         tx,
+        cancel: cancel_tx,
     };
-    if let Some(old) = state.nodes.lock().unwrap().insert(node_id.clone(), entry) {
-        // 同一个节点 id 连了两次：新的顶掉旧的（旧的可能来自没退干净的旧进程）
-        let _ = old.tx.send(RelayFrame::Error {
-            message: "同一个节点 id 的新连接连了上来，这条连接被顶替".into(),
-        });
+    let full = {
+        let mut nodes = state.nodes.lock().unwrap();
+        if !nodes.contains_key(&node_id) && nodes.len() >= MAX_NODES {
+            true
+        } else {
+            if let Some(old) = nodes.insert(node_id.clone(), entry) {
+                // 同一个节点 id 连了两次：立即通知旧连接关闭
+                let _ = old.cancel.send(true);
+            }
+            false
+        }
+    };
+    if full {
+        return refuse(channel, "中继已达到最大节点连接数").await;
     }
+    let _guard = NodeGuard {
+        state: Arc::clone(state),
+        node_id: node_id.clone(),
+        seq,
+    };
     channel.send_json(&RelayFrame::Welcome {}).await?;
     log(&format!("节点上线：{}", node_id));
     state.publish();
 
-    let result = control_loop(channel, &mut rx).await;
-    // 只摘掉自己的登记：可能已经被同一节点的新连接顶替
-    let mut nodes = state.nodes.lock().unwrap();
-    if nodes.get(&node_id).is_some_and(|entry| entry.seq == seq) {
-        nodes.remove(&node_id);
-    }
-    drop(nodes);
+    let result = control_loop(channel, &mut rx, &mut cancel_rx).await;
     log(&format!(
         "节点下线：{}（{}）",
         node_id,
-        result.as_ref().err().map(String::as_str).unwrap_or("对端关闭")
+        result
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .unwrap_or("对端关闭")
     ));
-    state.publish();
     result
 }
 
@@ -359,55 +445,90 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let id = state.seq.fetch_add(1, Ordering::SeqCst);
-    let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
-    state.hubs.lock().unwrap().insert(id, tx);
+    let (tx, mut rx) = mpsc::channel::<RelayFrame>(CTRL_QUEUE);
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    cancel_rx.borrow_and_update();
+    let full = {
+        let mut hubs = state.hubs.lock().unwrap();
+        if hubs.len() >= MAX_HUBS {
+            true
+        } else {
+            hubs.insert(id, tx);
+            false
+        }
+    };
+    if full {
+        return refuse(channel, "中继已达到最大控制端连接数").await;
+    }
+    let _guard = HubGuard {
+        state: Arc::clone(state),
+        id,
+    };
     channel
         .send_json(&RelayFrame::Nodes {
             nodes: state.summaries(),
         })
         .await?;
-    let result = control_loop(channel, &mut rx).await;
-    state.hubs.lock().unwrap().remove(&id);
-    result
+    control_loop(channel, &mut rx, &mut cancel_rx).await
 }
 
 async fn open_session<S>(
-    channel: &mut Channel<S>,
+    mut channel: Channel<S>,
     state: &Arc<State<S>>,
     node_id: String,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let Some(node) = state.nodes.lock().unwrap().get(&node_id).map(|e| e.tx.clone()) else {
-        return refuse(channel, &format!("节点 {node_id} 不在线")).await;
+    let Some(node) = state
+        .nodes
+        .lock()
+        .unwrap()
+        .get(&node_id)
+        .map(|e| e.tx.clone())
+    else {
+        return refuse(&mut channel, &format!("节点 {node_id} 不在线")).await;
     };
     let conn_id = URL_SAFE_NO_PAD.encode(crate::secure::random::<16>());
     let (tx, rx) = oneshot::channel();
-    state.joins.lock().unwrap().insert(conn_id.clone(), tx);
+    let full = {
+        let mut joins = state.joins.lock().unwrap();
+        if joins.len() >= MAX_JOINS {
+            true
+        } else {
+            joins.insert(conn_id.clone(), tx);
+            false
+        }
+    };
+    if full {
+        return refuse(&mut channel, "中继等待队列已满，请稍后再试").await;
+    }
+    let _join_guard = JoinGuard {
+        state: Arc::clone(state),
+        conn_id: conn_id.clone(),
+    };
     if node
-        .send(RelayFrame::Incoming {
+        .try_send(RelayFrame::Incoming {
             conn_id: conn_id.clone(),
         })
         .is_err()
     {
-        state.joins.lock().unwrap().remove(&conn_id);
-        return refuse(channel, &format!("节点 {node_id} 刚刚下线")).await;
+        return refuse(&mut channel, &format!("节点 {node_id} 刚刚下线或过于繁忙")).await;
     }
     match tokio::time::timeout(JOIN_WAIT, rx).await {
-        Ok(Ok(mut node_channel)) => {
+        Ok(Ok(node_channel)) => {
+            drop(_join_guard);
             channel
                 .send_json(&RelayFrame::Opened {
                     node_id: node_id.clone(),
                 })
                 .await?;
             // 之后只是对拷：两端握手与之后的消息都是端到端密文，原样转发
-            channel.pipe(&mut node_channel).await
+            channel.pipe(node_channel).await
         }
         _ => {
-            state.joins.lock().unwrap().remove(&conn_id);
             refuse(
-                channel,
+                &mut channel,
                 &format!("节点 {node_id} 没有响应（它的控制连接可能已经断了）"),
             )
             .await
@@ -434,13 +555,22 @@ pub async fn open(
     node_id: &str,
 ) -> Result<Channel<Stream>, String> {
     let mut channel = net::dial(relay_url, pin).await?;
-    channel
-        .send_json(&RelayFrame::Open {
+    tokio::time::timeout(
+        net::CONNECT_TIMEOUT,
+        channel.send_json(&RelayFrame::Open {
             node_id: node_id.to_string(),
             token: token.to_string(),
-        })
-        .await?;
-    match channel.recv_json::<RelayFrame>().await? {
+        }),
+    )
+    .await
+    .map_err(|_| "向中继发起连接超时".to_string())??;
+    let reply = tokio::time::timeout(
+        net::CONNECT_TIMEOUT + JOIN_WAIT,
+        channel.recv_json::<RelayFrame>(),
+    )
+    .await
+    .map_err(|_| "等待中继响应超时".to_string())??;
+    match reply {
         RelayFrame::Opened { .. } => Ok(channel),
         RelayFrame::Error { message } => Err(format!("中继：{message}")),
         other => Err(format!("中继应答不对：{other:?}")),
@@ -455,12 +585,15 @@ pub async fn join(
     conn_id: &str,
 ) -> Result<Channel<Stream>, String> {
     let mut channel = net::dial(relay_url, pin).await?;
-    channel
-        .send_json(&RelayFrame::Join {
+    tokio::time::timeout(
+        net::CONNECT_TIMEOUT,
+        channel.send_json(&RelayFrame::Join {
             conn_id: conn_id.to_string(),
             token: token.to_string(),
-        })
-        .await?;
+        }),
+    )
+    .await
+    .map_err(|_| "向中继归队超时".to_string())??;
     Ok(channel)
 }
 
@@ -479,25 +612,33 @@ where
     F: FnMut(String) + Send,
 {
     let mut channel = net::dial(relay_url, pin).await?;
-    channel
-        .send_json(&RelayFrame::Hello {
+    tokio::time::timeout(
+        net::CONNECT_TIMEOUT,
+        channel.send_json(&RelayFrame::Hello {
             role: Role::Node,
             node_id: Some(node_id.to_string()),
             name: Some(name.to_string()),
             os: Some(std::env::consts::OS.to_string()),
             token: token.to_string(),
-        })
-        .await?;
-    match channel.recv_json::<RelayFrame>().await? {
+        }),
+    )
+    .await
+    .map_err(|_| "向中继报到超时".to_string())??;
+    let welcome = tokio::time::timeout(net::CONNECT_TIMEOUT, channel.recv_json::<RelayFrame>())
+        .await
+        .map_err(|_| "等待中继欢迎消息超时".to_string())??;
+    match welcome {
         RelayFrame::Welcome {} => {}
         RelayFrame::Error { message } => return Err(format!("中继：{message}")),
         other => return Err(format!("中继应答不对：{other:?}")),
     }
     let mut ticker = tokio::time::interval(net::PING_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx = tokio::time::Instant::now();
     loop {
         tokio::select! {
             incoming = channel.recv_json::<RelayFrame>() => {
+                last_rx = tokio::time::Instant::now();
                 match incoming? {
                     RelayFrame::Incoming { conn_id } => on_incoming(conn_id),
                     RelayFrame::Error { message } => return Err(format!("中继：{message}")),
@@ -505,6 +646,9 @@ where
                 }
             }
             _ = ticker.tick() => {
+                if last_rx.elapsed() > CLIENT_IDLE {
+                    return Err(format!("中继 {} 秒未响应保活，断开重连", last_rx.elapsed().as_secs()));
+                }
                 channel.send_json(&RelayFrame::Ping {}).await?;
             }
         }
@@ -561,6 +705,13 @@ impl RelayWatcher {
     }
 }
 
+fn jitter(base: Duration) -> Duration {
+    let byte = crate::secure::random::<1>()[0] as u64;
+    // 0.75x ~ 1.25x 抖动，避免中继重启后所有客户端同时重连形成风暴
+    let factor_milli = 750 + (byte * 500) / 255;
+    Duration::from_millis((base.as_millis() as u64 * factor_milli) / 1000)
+}
+
 async fn watch_loop(
     url: String,
     pin: Option<Fingerprint>,
@@ -572,15 +723,25 @@ async fn watch_loop(
     shutdown.borrow_and_update();
     let mut backoff = BACKOFF_MIN;
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let _ = status.send(RelayStatus {
             connected: false,
             message: Some("正在连接中继…".into()),
         });
         let started = tokio::time::Instant::now();
-        let reason = match watch_once(&url, pin.as_ref(), &token, &online, &status).await {
-            Ok(()) => "中继关闭了连接".to_string(),
-            Err(e) => e,
+        let reason = tokio::select! {
+            res = watch_once(&url, pin.as_ref(), &token, &online, &status) => match res {
+                Ok(()) => "中继关闭了连接".to_string(),
+                Err(e) => e,
+            },
+            _ = shutdown.changed() => {
+                let _ = online.send(Vec::new());
+                return;
+            }
         };
+        let _ = online.send(Vec::new());
         let _ = status.send(RelayStatus {
             connected: false,
             message: Some(reason),
@@ -590,7 +751,7 @@ async fn watch_loop(
             backoff = BACKOFF_MIN;
         }
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(jitter(backoff)) => {}
             _ = shutdown.changed() => return,
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -606,25 +767,40 @@ async fn watch_once(
     status: &watch::Sender<RelayStatus>,
 ) -> Result<(), String> {
     let mut channel = net::dial(url, pin).await?;
-    channel
-        .send_json(&RelayFrame::Hello {
+    tokio::time::timeout(
+        net::CONNECT_TIMEOUT,
+        channel.send_json(&RelayFrame::Hello {
             role: Role::Hub,
             node_id: None,
             name: None,
             os: None,
             token: token.to_string(),
-        })
-        .await?;
-    // 报到已送达；令牌不对的话中继随即回 Error，那时再改回未连接
-    let _ = status.send(RelayStatus {
-        connected: true,
-        message: None,
-    });
+        }),
+    )
+    .await
+    .map_err(|_| "向中继报到超时".to_string())??;
+    // 收到首帧在线列表才标记已连接，避免令牌错时 connected 闪烁为 true
+    let first = tokio::time::timeout(net::CONNECT_TIMEOUT, channel.recv_json::<RelayFrame>())
+        .await
+        .map_err(|_| "等待中继响应超时".to_string())??;
+    match first {
+        RelayFrame::Nodes { nodes } => {
+            let _ = online.send(nodes);
+            let _ = status.send(RelayStatus {
+                connected: true,
+                message: None,
+            });
+        }
+        RelayFrame::Error { message } => return Err(format!("中继：{message}")),
+        other => return Err(format!("中继应答不对：{other:?}")),
+    }
     let mut ticker = tokio::time::interval(net::PING_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx = tokio::time::Instant::now();
     loop {
         tokio::select! {
             incoming = channel.recv_json::<RelayFrame>() => {
+                last_rx = tokio::time::Instant::now();
                 match incoming? {
                     RelayFrame::Nodes { nodes } => {
                         let _ = online.send(nodes);
@@ -635,6 +811,9 @@ async fn watch_once(
                 }
             }
             _ = ticker.tick() => {
+                if last_rx.elapsed() > CLIENT_IDLE {
+                    return Err(format!("中继 {} 秒未响应保活，断开重连", last_rx.elapsed().as_secs()));
+                }
                 channel.send_json(&RelayFrame::Ping {}).await?;
             }
         }
@@ -650,10 +829,10 @@ pub fn generate_token() -> String {
 mod tests {
     use super::*;
     use crate::link::{self, HubLink, NodeAuth, NodeState};
-    use tokio::net::TcpListener;
     use crate::net::Identity;
     use crate::runner::BinaryResolver;
     use crate::service::{Service, ServiceOptions};
+    use tokio::net::TcpListener;
 
     const TOKEN: &str = "test-relay-token";
 
@@ -661,7 +840,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         std::mem::forget(dir);
         Service::new(ServiceOptions {
             name: Some("home-pc".into()),
@@ -711,18 +891,29 @@ mod tests {
         let fingerprint = relay.fingerprint.clone();
         // 整个节点就这一个任务：中止它，控制连接随之断开，节点下线
         tokio::spawn(async move {
-            let _ = node_control(&url, Some(&fingerprint), TOKEN, "node-1", "home-pc", |conn_id| {
-                let (url, fingerprint, service, auth) =
-                    (url.clone(), fingerprint.clone(), service.clone(), auth.clone());
-                tokio::spawn(async move {
-                    match join(&url, Some(&fingerprint), TOKEN, &conn_id).await {
-                        Ok(channel) => {
-                            let _ = link::serve(channel, auth, service).await;
+            let _ = node_control(
+                &url,
+                Some(&fingerprint),
+                TOKEN,
+                "node-1",
+                "home-pc",
+                |conn_id| {
+                    let (url, fingerprint, service, auth) = (
+                        url.clone(),
+                        fingerprint.clone(),
+                        service.clone(),
+                        auth.clone(),
+                    );
+                    tokio::spawn(async move {
+                        match join(&url, Some(&fingerprint), TOKEN, &conn_id).await {
+                            Ok(channel) => {
+                                let _ = link::serve(channel, auth, service).await;
+                            }
+                            Err(e) => eprintln!("[test] 节点归队失败：{e}"),
                         }
-                        Err(e) => eprintln!("[test] 节点归队失败：{e}"),
-                    }
-                });
-            })
+                    });
+                },
+            )
             .await;
         })
     }
@@ -734,7 +925,11 @@ mod tests {
             if rx.borrow().iter().any(|n| n.node_id == "node-1") == present {
                 return;
             }
-            assert!(tokio::time::Instant::now() < deadline, "等待节点{}线超时", if present { "上" } else { "下" });
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "等待节点{}线超时",
+                if present { "上" } else { "下" }
+            );
             let _ = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
         }
     }
@@ -747,17 +942,28 @@ mod tests {
             r#"printf '%s\n' '{"type":"result","is_error":false,"result":"经中继的回答"}'"#,
         );
         let psk = crate::secure::random_psk();
-        let auth = NodeState::new("node-1".into(), [("hub-1".into(), psk)].into_iter().collect(), None);
+        let auth = NodeState::new(
+            "node-1".into(),
+            [("hub-1".into(), psk)].into_iter().collect(),
+            None,
+        );
         let node = bring_node_online(&relay, Arc::clone(&service), Arc::clone(&auth));
         wait_online(&relay, true).await;
 
         // 中继的指纹不对就进不来
-        assert!(open(&relay.url, Some(&Fingerprint([7; 32])), TOKEN, "node-1").await.is_err());
+        assert!(
+            open(&relay.url, Some(&Fingerprint([7; 32])), TOKEN, "node-1")
+                .await
+                .is_err()
+        );
 
-        let channel = tokio::time::timeout(Duration::from_secs(10), open(&relay.url, Some(&relay.fingerprint), TOKEN, "node-1"))
-            .await
-            .expect("经中继连到节点")
-            .unwrap();
+        let channel = tokio::time::timeout(
+            Duration::from_secs(10),
+            open(&relay.url, Some(&relay.fingerprint), TOKEN, "node-1"),
+        )
+        .await
+        .expect("经中继连到节点")
+        .unwrap();
         let link = tokio::time::timeout(
             Duration::from_secs(10),
             HubLink::handshake(channel, "hub-1", "node-1", psk, None),
@@ -765,12 +971,21 @@ mod tests {
         .await
         .expect("经中继握手")
         .unwrap();
-        let info = tokio::time::timeout(Duration::from_secs(10), link.call("sys.info", serde_json::json!({})))
-            .await
-            .expect("经中继发请求")
-            .unwrap();
+        let info = tokio::time::timeout(
+            Duration::from_secs(10),
+            link.call("sys.info", serde_json::json!({})),
+        )
+        .await
+        .expect("经中继发请求")
+        .unwrap();
         assert_eq!(info["name"], "home-pc");
-        assert!(tokio::time::timeout(Duration::from_secs(10), link.ping()).await.expect("保活").unwrap() < Duration::from_secs(5));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), link.ping())
+                .await
+                .expect("保活")
+                .unwrap()
+                < Duration::from_secs(5)
+        );
 
         let mut events = link.subscribe();
         link.call(
@@ -790,7 +1005,9 @@ mod tests {
                     assert_eq!(text, "经中继的回答");
                     break;
                 }
-                crate::runner::TurnEvent::Failed { message, .. } => panic!("对话在节点上失败：{message}"),
+                crate::runner::TurnEvent::Failed { message, .. } => {
+                    panic!("对话在节点上失败：{message}")
+                }
                 _ => {}
             }
         }
@@ -805,11 +1022,22 @@ mod tests {
     async fn tokens_and_offline_nodes_are_reported() {
         let relay = start_relay().await;
         // 令牌错误：报到就被拒
-        assert!(node_control(&relay.url, Some(&relay.fingerprint), "wrong", "node-1", "x", |_| {})
+        assert!(
+            node_control(
+                &relay.url,
+                Some(&relay.fingerprint),
+                "wrong",
+                "node-1",
+                "x",
+                |_| {}
+            )
             .await
             .unwrap_err()
-            .contains("令牌不对"));
-        let mut channel = net::dial(&relay.url, Some(&relay.fingerprint)).await.unwrap();
+            .contains("令牌不对")
+        );
+        let mut channel = net::dial(&relay.url, Some(&relay.fingerprint))
+            .await
+            .unwrap();
         channel
             .send_json(&RelayFrame::Hello {
                 role: Role::Hub,
@@ -825,23 +1053,26 @@ mod tests {
             RelayFrame::Error { message } if message.contains("令牌不对")
         ));
         // 没报到就想连节点
-        let mut channel = net::dial(&relay.url, Some(&relay.fingerprint)).await.unwrap();
-        channel
-            .send_json(&RelayFrame::Ping {})
+        let mut channel = net::dial(&relay.url, Some(&relay.fingerprint))
             .await
             .unwrap();
+        channel.send_json(&RelayFrame::Ping {}).await.unwrap();
         assert!(matches!(
             channel.recv_json::<RelayFrame>().await.unwrap(),
             RelayFrame::Error { message } if message.contains("先报到")
         ));
-        assert!(open(&relay.url, Some(&relay.fingerprint), "wrong", "node-1")
-            .await
-            .unwrap_err()
-            .contains("令牌不对"));
-        assert!(open(&relay.url, Some(&relay.fingerprint), TOKEN, "ghost")
-            .await
-            .unwrap_err()
-            .contains("不在线"));
+        assert!(
+            open(&relay.url, Some(&relay.fingerprint), "wrong", "node-1")
+                .await
+                .unwrap_err()
+                .contains("令牌不对")
+        );
+        assert!(
+            open(&relay.url, Some(&relay.fingerprint), TOKEN, "ghost")
+                .await
+                .unwrap_err()
+                .contains("不在线")
+        );
     }
 
     /// 控制端的监听：能看到节点上线、下线；中继不可达时给出原因，恢复后自动重连
@@ -870,7 +1101,11 @@ mod tests {
         }
         dead.stop();
 
-        let watcher = RelayWatcher::spawn(relay.url.clone(), Some(relay.fingerprint.clone()), TOKEN.into());
+        let watcher = RelayWatcher::spawn(
+            relay.url.clone(),
+            Some(relay.fingerprint.clone()),
+            TOKEN.into(),
+        );
         let service = fake_agent("sleep 30");
         let auth = NodeState::new("node-1".into(), HashMap::new(), None);
         let node = bring_node_online(&relay, service, auth);
@@ -880,12 +1115,18 @@ mod tests {
             if online.borrow().len() == 1 {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "监听没有收到在线节点");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "监听没有收到在线节点"
+            );
             let _ = tokio::time::timeout(Duration::from_secs(5), online.changed()).await;
         }
         let node_info = online.borrow()[0].clone();
-        assert_eq!((node_info.node_id.as_str(), node_info.name.as_str()), ("node-1", "home-pc"));
-        assert_eq!(watcher.status().connected, true);
+        assert_eq!(
+            (node_info.node_id.as_str(), node_info.name.as_str()),
+            ("node-1", "home-pc")
+        );
+        assert!(watcher.status().connected);
         node.abort();
         wait_online(&relay, false).await;
         watcher.stop();
@@ -926,7 +1167,10 @@ mod tests {
             }],
         })
         .unwrap();
-        assert!(list.contains(r#""nodeId":"n""#) && list.contains(r#""sinceMs":5"#), "{list}");
+        assert!(
+            list.contains(r#""nodeId":"n""#) && list.contains(r#""sinceMs":5"#),
+            "{list}"
+        );
         assert_eq!(generate_token().len(), 32);
         assert_ne!(generate_token(), generate_token());
     }

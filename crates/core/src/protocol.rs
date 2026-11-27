@@ -20,14 +20,10 @@ pub enum Frame {
     Confirm(Confirm),
     /// 握手或配对被拒绝
     #[serde(rename = "reject")]
-    Reject {
-        message: String,
-    },
+    Reject { message: String },
     /// 首次配对后换成长期密钥（base64）。只应出现在加密通道里
     #[serde(rename = "rotate")]
-    Rotate {
-        psk: String,
-    },
+    Rotate { psk: String },
     #[serde(rename = "rotated")]
     Rotated {},
     #[serde(rename = "request")]
@@ -46,13 +42,9 @@ pub enum Frame {
         error: Option<String>,
     },
     #[serde(rename = "ping")]
-    Ping {
-        nonce: u64,
-    },
+    Ping { nonce: u64 },
     #[serde(rename = "pong")]
-    Pong {
-        nonce: u64,
-    },
+    Pong { nonce: u64 },
 }
 
 impl Frame {
@@ -111,11 +103,18 @@ mod tests {
         let cases = [
             (
                 r#"{"type":"hello","hubId":"h","nodeId":"n","eph":"e"}"#,
-                Frame::Hello(Hello { hub_id: "h".into(), node_id: "n".into(), eph: "e".into() }),
+                Frame::Hello(Hello {
+                    hub_id: "h".into(),
+                    node_id: "n".into(),
+                    eph: "e".into(),
+                }),
             ),
             (
                 r#"{"type":"hello_ok","eph":"e","mac":"m"}"#,
-                Frame::HelloOk(HelloOk { eph: "e".into(), mac: "m".into() }),
+                Frame::HelloOk(HelloOk {
+                    eph: "e".into(),
+                    mac: "m".into(),
+                }),
             ),
             (
                 r#"{"type":"confirm","mac":"m"}"#,
@@ -133,13 +132,24 @@ mod tests {
                 r#"{"type":"response","id":7,"result":{"ok":true}}"#,
                 Frame::ok(7, serde_json::json!({ "ok": true })),
             ),
-            (r#"{"type":"response","id":7,"error":"boom"}"#, Frame::err(7, "boom")),
+            (
+                r#"{"type":"response","id":7,"error":"boom"}"#,
+                Frame::err(7, "boom"),
+            ),
             (r#"{"type":"ping","nonce":3}"#, Frame::Ping { nonce: 3 }),
         ];
         for (text, frame) in cases {
-            assert_eq!(serde_json::from_str::<Frame>(text).unwrap(), frame, "{text}");
+            assert_eq!(
+                serde_json::from_str::<Frame>(text).unwrap(),
+                frame,
+                "{text}"
+            );
             let back = serde_json::to_string(&frame).unwrap();
-            assert_eq!(serde_json::from_str::<Frame>(&back).unwrap(), frame, "往返：{back}");
+            assert_eq!(
+                serde_json::from_str::<Frame>(&back).unwrap(),
+                frame,
+                "往返：{back}"
+            );
         }
         // 错误应答不带 result，成功应答不带 error
         assert_eq!(

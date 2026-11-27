@@ -1031,12 +1031,14 @@ const MOCK = () => {
     unregisterCallback: (id) => callbacks.delete(id),
     metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
     invoke: async (cmd, args) => {
-      state.calls.push({ cmd, args: args ?? {} });
+      // 模拟真实 Tauri IPC 的 JSON 序列化边界（例如 NaN -> null）
+      const cleanArgs = JSON.parse(JSON.stringify(args ?? {}));
+      state.calls.push({ cmd, args: cleanArgs });
       const h = handlers[cmd];
       if (!h) throw new Error(`mock: 未实现的命令 ${cmd}`);
       // 真实的 Tauri 每次都回一份新的数据；这里的状态是原地改的，不拷贝的话
       // 界面看到的新旧数据是同一个对象，会以为什么都没变
-      return JSON.parse(JSON.stringify(h(args ?? {}) ?? null));
+      return JSON.parse(JSON.stringify(h(cleanArgs) ?? null));
     },
   };
   window.__mock = {

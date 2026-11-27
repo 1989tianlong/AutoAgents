@@ -43,12 +43,19 @@ function Budget({ spent, budget }: { spent: number; budget: number | null }) {
     if (budget != null) setInput(budget.toString());
   }, [budget]);
   const save = useMutation({
-    mutationFn: () => usageBudgetSet(Number(input.trim())),
+    mutationFn: () => {
+      const trimmed = input.trim();
+      const parsed = Number(trimmed);
+      if (!trimmed || !Number.isFinite(parsed) || parsed <= 0) {
+        return Promise.reject(new Error("预算要是大于 0 的数字（美元）"));
+      }
+      return usageBudgetSet(parsed);
+    },
     onSuccess: async () => {
       setNotice("已保存；超了之后自动化不再自动开工，手动的不拦");
       await qc.invalidateQueries({ queryKey: ["usage"] });
     },
-    onError: (e) => setNotice(String(e)),
+    onError: (e) => setNotice(e instanceof Error ? e.message : String(e)),
   });
   const pct = budget ? Math.min(100, (spent / budget) * 100) : 0;
   const over = budget != null && spent >= budget;

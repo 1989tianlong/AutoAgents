@@ -12,12 +12,19 @@
 //! - `failed`    中途失败，或 PR 被关闭；可以重试
 
 use crate::AppState;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 
-pub const STATUSES: &[&str] = &["pending", "running", "changes", "reviewing", "done", "failed"];
+pub const STATUSES: &[&str] = &[
+    "pending",
+    "running",
+    "changes",
+    "reviewing",
+    "done",
+    "failed",
+];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,10 +111,14 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
 
 /// 按 id 取任务
 pub fn load(db: &Connection, id: i64) -> Result<Task, String> {
-    db.query_row(&format!("SELECT {COLS} FROM tasks WHERE id = ?1"), params![id], row_to_task)
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("任务不存在：#{id}"))
+    db.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id = ?1"),
+        params![id],
+        row_to_task,
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("任务不存在：#{id}"))
 }
 
 /// 这一任务的会话对应的任务
@@ -125,7 +136,9 @@ pub fn by_session(db: &Connection, session_id: i64) -> Option<Task> {
 /// 按状态取任务
 pub fn in_status(db: &Connection, status: &str) -> Result<Vec<Task>, String> {
     let mut stmt = db
-        .prepare_cached(&format!("SELECT {COLS} FROM tasks WHERE status = ?1 ORDER BY id"))
+        .prepare_cached(&format!(
+            "SELECT {COLS} FROM tasks WHERE status = ?1 ORDER BY id"
+        ))
         .map_err(|e| e.to_string())?;
     stmt.query_map(params![status], row_to_task)
         .map_err(|e| e.to_string())?
@@ -174,7 +187,11 @@ pub fn event_source(task: &Task) -> String {
 /// 记一条任务事件（活动流里按任务归，链回任务详情）
 pub fn record(db: &Connection, task: &Task, kind: &str, level: &str, message: &str) {
     let title: String = task.title.chars().take(60).collect();
-    let ellipsis = if task.title.chars().count() > 60 { "…" } else { "" };
+    let ellipsis = if task.title.chars().count() > 60 {
+        "…"
+    } else {
+        ""
+    };
     crate::events::record(
         db,
         kind,
@@ -218,11 +235,23 @@ pub fn task_create_issue(
     if title.trim().is_empty() || repo.trim().is_empty() {
         return Err("标题和仓库不能为空".into());
     }
-    create_issue(&state.db.lock().unwrap(), &title, &repo, issue_number, &issue_url)
+    create_issue(
+        &state.db.lock().unwrap(),
+        &title,
+        &repo,
+        issue_number,
+        &issue_url,
+    )
 }
 
 /// 建任务的两个入口（不经过 Tauri 的命令层，测试与内部调用用）
-pub fn create_issue(db: &Connection, title: &str, repo: &str, number: i64, url: &str) -> Result<Task, String> {
+pub fn create_issue(
+    db: &Connection,
+    title: &str,
+    repo: &str,
+    number: i64,
+    url: &str,
+) -> Result<Task, String> {
     let branch = branch_name(0, "issue", Some(number));
     db.execute(
         "INSERT INTO tasks (title, source, repo, issue_number, issue_url, branch)
@@ -235,7 +264,12 @@ pub fn create_issue(db: &Connection, title: &str, repo: &str, number: i64, url: 
     Ok(task)
 }
 
-pub fn create_manual(db: &Connection, title: &str, repo: &str, instructions: &str) -> Result<Task, String> {
+pub fn create_manual(
+    db: &Connection,
+    title: &str,
+    repo: &str,
+    instructions: &str,
+) -> Result<Task, String> {
     db.execute(
         "INSERT INTO tasks (title, source, repo, instructions) VALUES (?1, 'manual', ?2, ?3)",
         params![title.trim(), repo.trim(), instructions.trim()],
@@ -282,14 +316,27 @@ pub fn task_set_status(
     let db = state.db.lock().unwrap();
     set_status(&db, id, &status, None, None)?;
     let task = load(&db, id)?;
-    record(&db, &task, "task.status", "info", &format!("状态改为 {status}"));
+    record(
+        &db,
+        &task,
+        "task.status",
+        "info",
+        &format!("状态改为 {status}"),
+    );
     Ok(())
 }
 
-/// 删除任务（它的工作树一并清掉；PR 不动）
+/// 删除任务（若正在运行则先中止会话，再清掉工作树；PR 不动）
 #[tauri::command]
 pub async fn task_delete(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     let task = load(&state.db.lock().unwrap(), id)?;
+    let running = task.status == "running"
+        || task
+            .session_id
+            .is_some_and(|sid| state.live.lock().unwrap().contains_key(&sid));
+    if running {
+        let _ = crate::pipeline::abort(&state, id).await;
+    }
     if let Err(e) = crate::pipeline::clean_worktree(&state, &task).await {
         eprintln!("[pipeline] 清理工作树失败：{e}");
     }

@@ -1,9 +1,9 @@
 //! 测试共用的小工具：冒充 Agent 的脚本、收集推给界面的事件、组装测试用的应用状态。
 
+use crate::AppState;
 use crate::chat::{ChatEvent, Sink};
 use crate::remote::{NodeSink, NodeStatusEvent};
 use crate::secrets::MemoryStore;
-use crate::AppState;
 use autoagents_core::runner::BinaryResolver;
 use autoagents_core::service::{Service, ServiceOptions};
 use std::collections::HashMap;
@@ -134,11 +134,21 @@ pub async fn read_request(stream: &mut tokio::net::TcpStream) -> Req {
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect();
-    Req { method, path, body, headers }
+    Req {
+        method,
+        path,
+        body,
+        headers,
+    }
 }
 
 /// 回一个响应，然后关掉连接
-pub async fn respond(stream: &mut tokio::net::TcpStream, status: &str, content_type: &str, body: &str) {
+pub async fn respond(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
     let text = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -154,7 +164,12 @@ pub fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=tester", "-c", "user.email=tester@example.com"])
+        .args([
+            "-c",
+            "user.name=tester",
+            "-c",
+            "user.email=tester@example.com",
+        ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
@@ -171,17 +186,36 @@ pub fn setup_repo(root: &Path) -> PathBuf {
 pub fn setup_repo_at(root: &Path, owner: &str, name: &str) -> PathBuf {
     let remote = root.join(format!("github.com/{owner}/{name}.git"));
     std::fs::create_dir_all(&remote).unwrap();
-    assert!(git_in(&remote, &["init", "--bare", "-b", "main"]).status.success());
+    assert!(
+        git_in(&remote, &["init", "--bare", "-b", "main"])
+            .status
+            .success()
+    );
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
     assert!(git_in(&seed, &["init", "-b", "main"]).status.success());
     std::fs::write(seed.join("README.md"), "# demo\n").unwrap();
     assert!(git_in(&seed, &["add", "-A"]).status.success());
     assert!(git_in(&seed, &["commit", "-m", "init"]).status.success());
-    assert!(git_in(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
-    assert!(git_in(&seed, &["push", "-q", "origin", "main"]).status.success());
+    assert!(
+        git_in(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        git_in(&seed, &["push", "-q", "origin", "main"])
+            .status
+            .success()
+    );
     let machine = root.join("machine");
     std::fs::create_dir_all(&machine).unwrap();
-    assert!(git_in(&machine, &["clone", "-q", remote.to_str().unwrap(), "app"]).status.success());
+    assert!(
+        git_in(&machine, &["clone", "-q", remote.to_str().unwrap(), "app"])
+            .status
+            .success()
+    );
     machine.join("app")
 }

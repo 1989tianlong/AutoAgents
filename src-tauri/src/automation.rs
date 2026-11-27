@@ -371,47 +371,55 @@ pub async fn automation_scan(state: State<'_, Arc<AppState>>) -> Result<usize, S
 // ---------------------------------------------------------------------------
 
 pub fn start_polling(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    shutdown.borrow_and_update();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            tick(&state).await;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    tick(&state).await;
+                }
+                _ = shutdown.changed() => return,
+            }
         }
     });
 }
 
-/// 检查一遍所有启用的规则。单条规则出错只记事件，不拖垮别的规则
+/// 检查一遍所有启用的规则。串行化防并发重复评论；单条规则出错只记事件，不拖垮别的规则
 pub async fn tick(state: &Arc<AppState>) -> usize {
+    let _guard = state.automation_lock.lock().await;
     let Ok(token) = github::token_of(state) else {
         return 0; // 还没连 GitHub：没有可盯的
     };
-    // 每日预算：超了的话自动化先歇着（手动发起的会话与任务不拦）。一天只记一条，免得刷屏。
-    // 先把锁还了再进 if：if let 条件里的临时锁会活到块尾，块内再拿就死锁
+    // 每日预算：超了的话自动化先歇着（手动发起的会话与任务不拦；已完成的 PR 审查结论照常贴出）。
     let budget_hit = crate::usage::over_budget(&state.db.lock().unwrap());
     if let Some((spent, budget)) = budget_hit {
-        let db = state.db.lock().unwrap();
-        let already = db
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind = 'usage.budget' \
-                 AND date(ts, 'localtime') = date('now', 'localtime')",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        if already == 0 {
-            events::record(
-                &db,
-                "usage.budget",
-                "warning",
-                "用量",
-                &format!(
-                    "今天的 Agent 花费 ${spent:.2} 已经到了每日预算 ${budget:.2}：自动化规则暂停触发，手动发起的不拦；预算可以在「用量」页改"
-                ),
-                Some("#/usage"),
-            );
+        {
+            let db = state.db.lock().unwrap();
+            let already = db
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind = 'usage.budget' \
+                     AND date(ts, 'localtime') = date('now', 'localtime')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            if already == 0 {
+                events::record(
+                    &db,
+                    "usage.budget",
+                    "warning",
+                    "用量",
+                    &format!(
+                        "今天的 Agent 花费 ${spent:.2} 已经到了每日预算 ${budget:.2}：自动化规则暂停触发，手动发起的不拦；预算可以在「用量」页改"
+                    ),
+                    Some("#/usage"),
+                );
+            }
         }
-        return 0;
+        return post_pending_comments(state, &token).await;
     }
     let rules = match load_rules(&state.db.lock().unwrap(), true) {
         Ok(rules) => rules,
@@ -553,16 +561,29 @@ async fn launch(
     Ok(())
 }
 
+fn encode_query_val(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 async fn trigger_issues(state: &Arc<AppState>, token: &str, rule: &Rule) -> Result<usize, String> {
     let (owner, repo) = pipeline::split_repo(&rule.repo)?;
-    let issues = github::issues_list(
-        state,
-        token,
-        &owner,
-        &repo,
-        "state=open&per_page=30&sort=updated",
-    )
-    .await?;
+    let query = if rule.config.label.trim().is_empty() {
+        "state=open&per_page=30&sort=updated".to_string()
+    } else {
+        format!(
+            "state=open&per_page=30&sort=updated&labels={}",
+            encode_query_val(rule.config.label.trim())
+        )
+    };
+    let issues = github::issues_list(state, token, &owner, &repo, &query).await?;
     let mut triggered = 0;
     for issue in issues
         .iter()
@@ -593,7 +614,18 @@ async fn trigger_issues(state: &Arc<AppState>, token: &str, rule: &Rule) -> Resu
             .map(|wf| wf.id),
             Err(e) => Err(e),
         };
-        launch(state, rule, &key, result).await?;
+        if let Err(e) = launch(state, rule, &key, result).await {
+            let db = state.db.lock().unwrap();
+            events::record(
+                &db,
+                "automation.error",
+                "warning",
+                &rule.name,
+                &format!("Issue #{} 触发失败：{e}", issue.number),
+                None,
+            );
+            continue;
+        }
         triggered += 1;
     }
     Ok(triggered)
@@ -637,7 +669,18 @@ async fn trigger_prs(state: &Arc<AppState>, token: &str, rule: &Rule) -> Result<
             .map(|wf| wf.id),
             Err(e) => Err(e),
         };
-        launch(state, rule, &key, result).await?;
+        if let Err(e) = launch(state, rule, &key, result).await {
+            let db = state.db.lock().unwrap();
+            events::record(
+                &db,
+                "automation.error",
+                "warning",
+                &rule.name,
+                &format!("PR #{} 触发失败：{e}", pr.number),
+                None,
+            );
+            continue;
+        }
         triggered += 1;
     }
     Ok(triggered)
@@ -713,10 +756,10 @@ async fn trigger_check_fixes(state: &Arc<AppState>, rule: &Rule) -> Result<usize
 /// PR 审查流水线跑完了、结论还没贴回去的：把「汇总结论」步骤的产出贴成 PR 评论。
 /// 贴过（或贴不成）都打上标记，不会反复刷
 async fn post_pending_comments(state: &Arc<AppState>, token: &str) -> usize {
-    let pending: Vec<(i64, i64, String, i64)> = {
+    let pending: Vec<(i64, i64, String, i64, String)> = {
         let db = state.db.lock().unwrap();
         let Ok(mut stmt) = db.prepare(
-            "SELECT rr.id, wf.id, wf.repo, wf.pr_number \
+            "SELECT rr.id, wf.id, wf.repo, wf.pr_number, r.config \
              FROM rule_runs rr \
              JOIN rules r ON r.id = rr.rule_id \
              JOIN workflows wf ON wf.id = rr.workflow_id \
@@ -726,13 +769,29 @@ async fn post_pending_comments(state: &Arc<AppState>, token: &str) -> usize {
             return 0;
         };
         stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
     };
     let mut posted = 0;
-    for (run_id, wf_id, repo, pr_number) in pending {
+    for (run_id, wf_id, repo, pr_number, config_json) in pending {
+        // 尊重规则里的 comment 开关：关闭时只打标不再发 PR 评论
+        let cfg: RuleConfig = serde_json::from_str(&config_json).unwrap_or_default();
+        if !cfg.comment {
+            let db = state.db.lock().unwrap();
+            let _ = db.execute(
+                "UPDATE rule_runs SET posted = 1 WHERE id = ?1",
+                params![run_id],
+            );
+            continue;
+        }
         let summary: Option<String> = {
             let db = state.db.lock().unwrap();
             db.query_row(

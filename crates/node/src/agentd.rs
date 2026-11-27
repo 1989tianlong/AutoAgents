@@ -12,7 +12,7 @@ use autoagents_core::net::{self, Fingerprint, Identity};
 use autoagents_core::relay;
 use autoagents_core::secure::{self, Psk};
 use autoagents_core::service::{Service, ServiceOptions};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,7 +108,6 @@ async fn main() {
     }
 }
 
-
 fn usage() -> String {
     format!(
         "agentd {VERSION} — AutoAgents 节点守护进程\n\
@@ -190,10 +189,7 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn data_dir(options: &Options) -> PathBuf {
-    options
-        .data_dir
-        .clone()
-        .unwrap_or_else(default_data_dir)
+    options.data_dir.clone().unwrap_or_else(default_data_dir)
 }
 
 fn config_path(data_dir: &Path) -> PathBuf {
@@ -208,23 +204,27 @@ fn pair_request_path(data_dir: &Path) -> PathBuf {
     data_dir.join("pair.request")
 }
 
-/// 读配置；命令行上给了值的字段覆盖进去并保存
+/// 读配置；命令行上给了值的字段覆盖进去并保存。
+/// 配置文件损坏或无权限读取时显式报错，绝不静默生成新 node_id 覆盖原有配置。
 fn load_config(options: &Options, data_dir: &Path) -> Result<Config, String> {
-    let existing = std::fs::read_to_string(config_path(data_dir))
-        .ok()
-        .and_then(|text| toml::from_str(&text).ok());
-    let mut config: Config = existing.unwrap_or_default();
+    let path = config_path(data_dir);
+    let (mut config, mut changed) = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let parsed: Config = toml::from_str(&text)
+                .map_err(|e| format!("配置文件 {} 格式有误：{e}", path.display()))?;
+            (parsed, false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), true),
+        Err(e) => return Err(format!("读取配置 {} 失败：{e}", path.display())),
+    };
     if config.node_id.trim().is_empty() {
         config.node_id = URL_SAFE_NO_PAD.encode(secure::random::<16>());
+        changed = true;
     }
     if config.name.trim().is_empty() {
         config.name = autoagents_core::discovery::hostname();
+        changed = true;
     }
-    // 第一次运行（或上次没能保存）一定要落盘，否则节点 id 每次都会变
-    let mut changed = std::fs::read_to_string(config_path(data_dir))
-        .ok()
-        .and_then(|text| toml::from_str::<Config>(&text).ok())
-        .is_none_or(|saved| saved.node_id != config.node_id);
     macro_rules! set {
         ($field:ident) => {
             if let Some($field) = options.$field.clone() {
@@ -245,7 +245,15 @@ fn load_config(options: &Options, data_dir: &Path) -> Result<Config, String> {
         config.allow_roots = options.allow.clone();
         changed = true;
     }
-    if !config.relay.is_empty() && !(config.relay.starts_with("wss://") || config.relay.starts_with("ws://")) {
+    if config.token.is_empty()
+        && let Ok(env_token) = std::env::var("AUTOAGENTS_TOKEN")
+        && !env_token.trim().is_empty()
+    {
+        config.token = env_token.trim().to_string();
+    }
+    if !config.relay.is_empty()
+        && !(config.relay.starts_with("wss://") || config.relay.starts_with("ws://"))
+    {
         return Err(format!("--relay 应以 wss:// 开头：{}", config.relay));
     }
     if !config.fingerprint.is_empty() {
@@ -258,19 +266,22 @@ fn load_config(options: &Options, data_dir: &Path) -> Result<Config, String> {
 }
 
 fn save_config(config: &Config, data_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(data_dir)
-        .map_err(|e| format!("创建数据目录 {} 失败：{e}", data_dir.display()))?;
     let text = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    write_private(&config_path(data_dir), text.as_bytes())
+    net::write_private(&config_path(data_dir), text.as_bytes())
 }
 
 fn load_hubs(data_dir: &Path) -> Result<HashMap<String, Psk>, String> {
-    let text = std::fs::read_to_string(hubs_path(data_dir)).unwrap_or_default();
+    let path = hubs_path(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("读取 {} 失败：{e}", path.display())),
+    };
     if text.trim().is_empty() {
         return Ok(HashMap::new());
     }
     let raw: HashMap<String, String> =
-        serde_json::from_str(&text).map_err(|e| format!("读取 {} 失败：{e}", hubs_path(data_dir).display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
     raw.into_iter()
         .map(|(hub, key)| {
             let bytes = URL_SAFE_NO_PAD
@@ -293,27 +304,7 @@ fn save_hub(data_dir: &Path, hub_id: &str, psk: Psk) -> Result<(), String> {
         .collect();
     raw.retain(|_, key| !key.is_empty());
     let text = serde_json::to_string_pretty(&raw).map_err(|e| e.to_string())?;
-    write_private(&hubs_path(data_dir), text.as_bytes())
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("创建 {} 失败：{e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+    net::write_private(&hubs_path(data_dir), text.as_bytes())
 }
 
 fn now_ms() -> u64 {
@@ -346,7 +337,12 @@ fn local_clock() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{:02}:{:02}:{:02}Z", secs / 3600 % 24, secs / 60 % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        secs / 3600 % 24,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// 前台运行
@@ -372,7 +368,13 @@ async fn run(options: Options) -> Result<(), String> {
             }
         })),
     );
-    if let Some(code) = &options.pair {
+    let pair_code = options.pair.clone().or_else(|| {
+        std::env::var("AUTOAGENTS_PAIR_CODE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    if let Some(code) = &pair_code {
+        secure::normalize_pairing_code(code)?;
         state.allow_pairing(code);
         log("已按安装命令开放配对，等待 AutoAgents 接入（10 分钟内有效）");
     }
@@ -383,6 +385,28 @@ async fn run(options: Options) -> Result<(), String> {
         max_turns: config.max_turns,
         ..Default::default()
     });
+
+    // 直连监听在后台任务启动前就完成绑定与证书加载，端口占用等启动错误立即失败退出
+    let direct_listener = if !config.listen.is_empty() {
+        let identity = Identity::load_or_create(&data_dir.join("identity"))
+            .map_err(|e| format!("无法加载本机证书：{e}"))?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            identity
+                .server_config()
+                .map_err(|e| format!("本机证书不可用：{e}"))?,
+        );
+        let listener = tokio::net::TcpListener::bind(&config.listen)
+            .await
+            .map_err(|e| format!("无法监听 {}：{e}", config.listen))?;
+        log(&format!(
+            "直连模式：wss://{}，证书指纹 {}",
+            config.listen,
+            identity.fingerprint()
+        ));
+        Some((listener, acceptor))
+    } else {
+        None
+    };
 
     say!(
         "AutoAgents agentd {VERSION}\n  节点：{}（id {}）\n  数据目录：{}",
@@ -398,17 +422,20 @@ async fn run(options: Options) -> Result<(), String> {
 
     let (shutdown, shutdown_rx) = watch::channel(false);
     spawn_signal_handler(shutdown.clone());
-    tokio::spawn(pair_poller(pair_request_path(&data_dir), Arc::clone(&state)));
+    tokio::spawn(pair_poller(
+        pair_request_path(&data_dir),
+        Arc::clone(&state),
+        shutdown_rx.clone(),
+    ));
 
-    if !config.listen.is_empty() {
-        let listener = listen_loop(
-            config.clone(),
-            data_dir.clone(),
+    if let Some((listener, acceptor)) = direct_listener {
+        tokio::spawn(listen_loop(
+            listener,
+            acceptor,
             Arc::clone(&state),
             Arc::clone(&service),
             shutdown_rx.clone(),
-        );
-        tokio::spawn(listener);
+        ));
     }
     if !config.relay.is_empty() {
         tokio::spawn(relay_loop(
@@ -433,8 +460,9 @@ fn spawn_signal_handler(shutdown: watch::Sender<bool>) {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("订阅 SIGTERM");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("订阅 SIGTERM");
             tokio::select! {
                 _ = ctrl_c => {}
                 _ = term.recv() => {}
@@ -468,6 +496,7 @@ async fn relay_loop(
             config.node_id.clone(),
             config.name.clone(),
         );
+        let join_limit = Arc::new(tokio::sync::Semaphore::new(64));
         // 每来一个控制端连接，闭包里都要有一份自己的副本
         let ctx = (
             relay_url.clone(),
@@ -475,21 +504,29 @@ async fn relay_loop(
             token.clone(),
             Arc::clone(&state),
             Arc::clone(&service),
+            join_limit,
         );
-        let result = relay::node_control(&relay_url, pin.as_ref(), &token, &node_id, &name, move |conn_id| {
-            let (relay_url, pin, token, state, service) = ctx.clone();
-            tokio::spawn(async move {
-                match relay::join(&relay_url, pin.as_ref(), &token, &conn_id).await {
-                    Ok(channel) => {
-                        if let Err(e) = link::serve(channel, state, service).await {
-                            log(&format!("一条控制端连接结束：{e}"));
+        let result = tokio::select! {
+            res = relay::node_control(&relay_url, pin.as_ref(), &token, &node_id, &name, move |conn_id| {
+                let (relay_url, pin, token, state, service, join_limit) = ctx.clone();
+                let Ok(permit) = join_limit.try_acquire_owned() else {
+                    log("并发数据连接已达上限，忽略本次接入");
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match relay::join(&relay_url, pin.as_ref(), &token, &conn_id).await {
+                        Ok(channel) => {
+                            if let Err(e) = link::serve(channel, state, service).await {
+                                log(&format!("一条控制端连接结束：{e}"));
+                            }
                         }
+                        Err(e) => log(&format!("接通控制端失败：{e}")),
                     }
-                    Err(e) => log(&format!("接通控制端失败：{e}")),
-                }
-            });
-        })
-        .await;
+                });
+            }) => res,
+            _ = shutdown.changed() => return,
+        };
         let reason = result.err().unwrap_or_else(|| "中继关闭了连接".into());
         if started.elapsed() > Duration::from_secs(30) {
             backoff = BACKOFF_MIN;
@@ -531,47 +568,35 @@ fn hint_for(reason: &str) -> Option<&'static str> {
 
 /// 直连模式：在本机监听 TLS，等待控制端直连
 async fn listen_loop(
-    config: Config,
-    data_dir: PathBuf,
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
     state: Arc<NodeState>,
     service: Arc<Service>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     shutdown.borrow_and_update();
-    let identity = match Identity::load_or_create(&data_dir.join("identity")) {
-        Ok(identity) => identity,
-        Err(e) => {
-            log(&format!("无法加载本机证书：{e}"));
-            return;
-        }
-    };
-    let acceptor = match identity.server_config() {
-        Ok(config) => tokio_rustls::TlsAcceptor::from(config),
-        Err(e) => {
-            log(&format!("本机证书不可用：{e}"));
-            return;
-        }
-    };
-    let listener = match tokio::net::TcpListener::bind(&config.listen).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            log(&format!("无法监听 {}：{e}", config.listen));
-            return;
-        }
-    };
-    log(&format!(
-        "直连模式：wss://{}，证书指纹 {}",
-        config.listen,
-        identity.fingerprint()
-    ));
     let health = format!("autoagents agentd {VERSION}\n");
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let (stream, _) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        log(&format!("接受直连失败（退避重试）：{e}"));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+                    log("直连并发数已达上限，拒绝新连接");
+                    drop(stream);
+                    continue;
+                };
                 let (acceptor, state, service) = (acceptor.clone(), Arc::clone(&state), Arc::clone(&service));
                 let health = health.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match net::accept_tls_with_health(stream, acceptor, &health).await {
                         Ok(channel) => {
                             if let Err(e) = link::serve(channel, state, service).await {
@@ -589,21 +614,27 @@ async fn listen_loop(
 }
 
 /// 定时看有没有 `agentd pair` 留下的配对请求
-async fn pair_poller(path: PathBuf, state: Arc<NodeState>) {
+async fn pair_poller(path: PathBuf, state: Arc<NodeState>, mut shutdown: watch::Receiver<bool>) {
+    shutdown.borrow_and_update();
     loop {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let _ = std::fs::remove_file(&path);
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            let _ = tokio::fs::remove_file(&path).await;
             match serde_json::from_str::<PairRequest>(&text) {
                 Ok(request) if request.until_ms > now_ms() => {
-                    state.allow_pairing(&request.code);
-                    let minutes = (request.until_ms.saturating_sub(now_ms())) / 60_000;
+                    let remain_ms = request.until_ms.saturating_sub(now_ms());
+                    let ttl = Duration::from_millis(remain_ms);
+                    state.allow_pairing_for(&request.code, ttl);
+                    let minutes = ttl.as_secs().div_ceil(60);
                     log(&format!("已开放配对：{minutes} 分钟内有效，只能用一次"));
                 }
                 Ok(_) => log("配对请求已经过期，已忽略"),
                 Err(_) => log("配对请求无法解析，已忽略"),
             }
         }
-        tokio::time::sleep(PAIR_POLL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(PAIR_POLL) => {}
+            _ = shutdown.changed() => return,
+        }
     }
 }
 
@@ -617,21 +648,22 @@ fn pair(options: Options) -> Result<(), String> {
         code: code.clone(),
         until_ms: now_ms() + ttl.as_millis() as u64,
     };
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("创建数据目录 {} 失败：{e}", data_dir.display()))?;
-    write_private(
+    net::write_private(
         &pair_request_path(&data_dir),
-        serde_json::to_string(&request).map_err(|e| e.to_string())?.as_bytes(),
+        serde_json::to_string(&request)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
     )?;
     say!(
         "配对码：{code}\n  {} 分钟内有效，只能用一次（守护进程会在几秒内读到这个请求）。\n",
-        (ttl.as_secs() + 59) / 60
+        ttl.as_secs().div_ceil(60)
     );
     say!("在另一台电脑的 AutoAgents 里：机器 → 添加机器 → 选「已安装 agentd」。");
     if !config.relay.is_empty() {
         say!(
             "  在线机器里选「{}」，输入上面的配对码。\n  （选不到时手动填写节点 id：{}）",
-            config.name, config.node_id
+            config.name,
+            config.node_id
         );
     }
     if !config.listen.is_empty() {
@@ -721,7 +753,11 @@ fn info(options: Options) -> Result<(), String> {
     );
     say!(
         "  同时运行的对话上限：{}",
-        if config.max_turns == 0 { 8 } else { config.max_turns }
+        if config.max_turns == 0 {
+            8
+        } else {
+            config.max_turns
+        }
     );
     Ok(())
 }
@@ -752,13 +788,25 @@ async fn install(options: Options) -> Result<(), String> {
     say!("程序：{exe}");
     say!("数据目录：{data}");
 
+    if exe.chars().any(char::is_control) || data.chars().any(char::is_control) {
+        return Err("路径不能包含换行或控制字符".into());
+    }
     #[cfg(target_os = "macos")]
     {
+        let xml_escape = |s: &str| -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        };
         let home = autoagents_core::discovery::home_dir();
         let dir = home.join("Library/LaunchAgents");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
         let plist = dir.join(format!("{SERVICE_LABEL}.plist"));
-        let log_file = data_dir.join("agentd.log");
+        let log_file = xml_escape(&data_dir.join("agentd.log").to_string_lossy());
+        let exe_xml = xml_escape(&exe);
+        let data_xml = xml_escape(&data);
         let content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -767,21 +815,20 @@ async fn install(options: Options) -> Result<(), String> {
     <key>Label</key><string>{SERVICE_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{exe}</string>
+        <string>{exe_xml}</string>
         <string>--data-dir</string>
-        <string>{data}</string>
+        <string>{data_xml}</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{}</string>
-    <key>StandardErrorPath</key><string>{}</string>
+    <key>StandardOutPath</key><string>{log_file}</string>
+    <key>StandardErrorPath</key><string>{log_file}</string>
 </dict>
 </plist>
-"#,
-            log_file.display(),
-            log_file.display()
+"#
         );
-        std::fs::write(&plist, content).map_err(|e| format!("写入 {} 失败：{e}", plist.display()))?;
+        std::fs::write(&plist, content)
+            .map_err(|e| format!("写入 {} 失败：{e}", plist.display()))?;
         let uid = unsafe { libc::getuid() };
         let _ = std::process::Command::new("launchctl")
             .args(["bootout", &format!("gui/{uid}/{SERVICE_LABEL}")])
@@ -808,13 +855,14 @@ async fn install(options: Options) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        // systemd 单元文件里带空格的路径要加引号
+        // systemd ExecStart 转义：双引号包裹并转义 \ " % $，防止指令或占位符注入
         let quote = |text: &str| {
-            if text.contains(char::is_whitespace) {
-                format!("\"{text}\"")
-            } else {
-                text.to_string()
-            }
+            let escaped = text
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$");
+            format!("\"{escaped}\"")
         };
         let exec = format!("{} --data-dir {}", quote(&exe), quote(&data));
         let run = |args: &[&str]| -> Result<(), String> {
@@ -850,7 +898,8 @@ async fn install(options: Options) -> Result<(), String> {
         } else if has_systemd {
             let home = autoagents_core::discovery::home_dir();
             let dir = home.join(".config/systemd/user");
-            std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("创建 {} 失败：{e}", dir.display()))?;
             let unit = dir.join("autoagents-agentd.service");
             std::fs::write(
                 &unit,
@@ -878,7 +927,9 @@ async fn install(options: Options) -> Result<(), String> {
                 say!("要让它在你没有登录时也保持运行：sudo loginctl enable-linger $USER");
             }
         } else {
-            say!("这台机器上没有 systemd，没法注册成服务。请自行保持下面这条命令运行（写进启动脚本、容器入口或进程管理器）：");
+            say!(
+                "这台机器上没有 systemd，没法注册成服务。请自行保持下面这条命令运行（写进启动脚本、容器入口或进程管理器）："
+            );
             say!("  {exec}");
         }
     }

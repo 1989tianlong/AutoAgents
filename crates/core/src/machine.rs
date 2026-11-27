@@ -2,8 +2,12 @@
 
 use crate::discovery;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::time::{Duration, Instant};
-use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, LoadAvg, MemoryRefreshKind, ProcessRefreshKind, RefreshKind, Signal, System,
+    UpdateKind,
+};
 
 /// CPU 占用率要取两次采样之差，间隔太短读数没有意义
 const CPU_SAMPLE: Duration = Duration::from_millis(300);
@@ -88,8 +92,11 @@ pub async fn metrics(running_turns: usize) -> Result<Metrics, String> {
     sys.refresh_cpu_usage();
     sys.refresh_memory();
     // Windows 没有平均负载的概念，读不到时记 0
-    let LoadAvg { one, five, fifteen } =
-        System::load_average().unwrap_or(LoadAvg { one: 0.0, five: 0.0, fifteen: 0.0 });
+    let LoadAvg { one, five, fifteen } = System::load_average().unwrap_or(LoadAvg {
+        one: 0.0,
+        five: 0.0,
+        fifteen: 0.0,
+    });
     Ok(Metrics {
         cpu_percent: sys.global_cpu_usage(),
         mem_used: sys.used_memory(),
@@ -100,6 +107,87 @@ pub async fn metrics(running_turns: usize) -> Result<Metrics, String> {
         uptime_s: System::uptime().unwrap_or(0),
         running_turns,
     })
+}
+
+/// 按 `.app` 目录路径做精确字面匹配（不用正则，不伤及无关进程）
+fn app_needles(app_path: &Path) -> Vec<String> {
+    let mut needles = Vec::new();
+    let push = |out: &mut Vec<String>, p: &Path| {
+        let s = p.to_string_lossy();
+        let trimmed = s.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            let needle = format!("{trimmed}/");
+            if !out.contains(&needle) {
+                out.push(needle);
+            }
+        }
+    };
+    push(&mut needles, app_path);
+    if let Ok(canon) = app_path.canonicalize() {
+        push(&mut needles, &canon);
+    }
+    needles
+}
+
+fn process_matches_app(proc: &sysinfo::Process, needles: &[String]) -> bool {
+    if let Some(exe) = proc.exe().map(|p| p.to_string_lossy())
+        && needles.iter().any(|n| exe.starts_with(n.as_str()))
+    {
+        return true;
+    }
+    proc.cmd().iter().any(|arg| {
+        let s = arg.to_string_lossy();
+        needles
+            .iter()
+            .any(|n| s.starts_with(n.as_str()) || s.contains(n.as_str()))
+    })
+}
+
+fn scan_processes() -> Option<System> {
+    let kinds = RefreshKind::nothing().with_processes(
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always),
+    );
+    System::new_with_specifics(kinds).ok()
+}
+
+/// 指定 `.app` 是否正在运行（精确前缀/字面匹配，避免 `pgrep -f` 正则注入）
+pub fn app_running(app_path: &Path) -> bool {
+    let needles = app_needles(app_path);
+    if needles.is_empty() {
+        return false;
+    }
+    let Some(sys) = scan_processes() else {
+        return false;
+    };
+    let me = std::process::id();
+    sys.processes()
+        .values()
+        .any(|p| p.pid().as_u32() != me && process_matches_app(p, &needles))
+}
+
+/// 向属于指定 `.app` 的进程逐一发送 SIGTERM（仅限精确匹配的 PID，避免 `pkill -f` 误杀）
+pub fn terminate_app(app_path: &Path) -> usize {
+    let needles = app_needles(app_path);
+    if needles.is_empty() {
+        return 0;
+    }
+    let Some(sys) = scan_processes() else {
+        return 0;
+    };
+    let me = std::process::id();
+    let mut signaled = 0;
+    for proc in sys.processes().values() {
+        let pid = proc.pid().as_u32();
+        if pid <= 1 || pid == me {
+            continue;
+        }
+        if process_matches_app(proc, &needles) && proc.kill_with(Signal::Term).unwrap_or(false) {
+            signaled += 1;
+        }
+    }
+    signaled
 }
 
 #[cfg(test)]

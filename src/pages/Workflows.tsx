@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ModelPicker from "../components/ModelPicker";
 import { Badge, Button, Card, Empty, Modal, PageHeader, inputClass } from "../components/ui";
+import { openSafeUrl } from "../lib/url";
 import {
   agentModels,
   automationRuleCreate,
@@ -54,17 +55,24 @@ function StatusBadge({ map, status }: { map: typeof WF_STATUS; status: string })
 }
 
 /** 步骤的产出：任务给分支和 PR，会话给结论文本 */
-function StepOutcome({ step }: { step: WorkflowStep }) {  if (step.outcome == null) return null;
+function StepOutcome({ step }: { step: WorkflowStep }) {
+  if (step.outcome == null) return null;
   if (step.kind === "task") {
     try {
-      const o = JSON.parse(step.outcome);
+      const parsed: unknown = JSON.parse(step.outcome);
+      if (!parsed || typeof parsed !== "object") return null;
+      const o = parsed as { branch?: string; prUrl?: string; taskId?: number };
       return (
         <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
           {o.branch && <code className="rounded bg-slate-800 px-1.5 py-0.5 text-slate-300">{o.branch}</code>}
           {o.prUrl && (
-            <a href={o.prUrl} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300">
+            <button
+              type="button"
+              onClick={() => openSafeUrl(o.prUrl)}
+              className="text-sky-400 hover:text-sky-300"
+            >
               PR →
-            </a>
+            </button>
           )}
           {o.taskId != null && (
             <Link to={`/tasks?t=${o.taskId}`} className="text-sky-400 hover:text-sky-300">
@@ -558,14 +566,24 @@ function CreateDialog({ templates, initial, onClose }: { templates: WorkflowTemp
   }, [templateId]);
 
   const create = async () => {
+    const parsePositiveInt = (raw: string, label: string): number | null => {
+      const s = raw.trim().replace(/^#/, "");
+      if (!s) return null;
+      if (!/^\d+$/.test(s)) throw new Error(`${label}应当是正整数`);
+      const n = Number(s);
+      if (!Number.isSafeInteger(n) || n <= 0) throw new Error(`${label}应当是正整数`);
+      return n;
+    };
     setBusy(true);
     setError(null);
     try {
+      const issueNumber = templateId !== "pr-review" ? parsePositiveInt(issue, "Issue 编号") : null;
+      const prNumber = templateId === "pr-review" ? parsePositiveInt(pr, "PR 编号") : null;
       await workflowCreate({
         template: templateId,
         repo: repo.trim(),
-        issueNumber: templateId !== "pr-review" && issue.trim() ? Number(issue.trim()) : null,
-        prNumber: templateId === "pr-review" && pr.trim() ? Number(pr.trim()) : null,
+        issueNumber,
+        prNumber,
         instructions: instructions.trim() || null,
         nodeId: node,
         workdir: workdir.trim(),

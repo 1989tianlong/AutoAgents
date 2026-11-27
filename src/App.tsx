@@ -1,4 +1,5 @@
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Sidebar from "./components/Sidebar";
 import { useNodeEvents } from "./lib/nodeEvents";
 import Dashboard from "./pages/Dashboard";
@@ -21,21 +22,23 @@ export default function App() {
       <div className="flex h-full">
         <Sidebar />
         <main className="min-w-0 flex-1 overflow-y-auto">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/inbox" element={<Inbox />} />
-            <Route path="/machines" element={<Machines />} />
-            <Route path="/agents" element={<Agents />} />
-            <Route path="/tasks" element={<Tasks />} />
-            <Route path="/workflows" element={<Workflows />} />
-            <Route path="/github" element={<GitHub />} />
-            <Route path="/deploy" element={<Deploy />} />
-            <Route path="/usage" element={<Usage />} />
-            <Route path="/sessions" element={<Sessions />} />
-            <Route path="/activity" element={<Activity />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <ErrorBoundary>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/inbox" element={<Inbox />} />
+              <Route path="/machines" element={<Machines />} />
+              <Route path="/agents" element={<Agents />} />
+              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/workflows" element={<Workflows />} />
+              <Route path="/github" element={<GitHub />} />
+              <Route path="/deploy" element={<Deploy />} />
+              <Route path="/usage" element={<Usage />} />
+              <Route path="/sessions" element={<Sessions />} />
+              <Route path="/activity" element={<Activity />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </ErrorBoundary>
         </main>
       </div>
     </HashRouter>

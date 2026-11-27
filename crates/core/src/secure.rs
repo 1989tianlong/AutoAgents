@@ -25,7 +25,7 @@
 //! 一个新的随机 psk（`rotate`），配对码随之作废，之后的连接都用新 psk。
 //! 握手之后每条消息都是 ChaCha20-Poly1305 密文，带严格递增的序号，重放会被拒绝。
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// 预共享密钥：只有控制端与这一个节点知道
 pub type Psk = [u8; 32];
@@ -61,24 +61,53 @@ pub fn random_psk() -> Psk {
 /// 配对码用的字母表：去掉了容易看错的 0 / O / 1 / I / L
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
-/// 生成一个配对码：16 位约 79 比特，`XXXX-XXXX-XXXX-XXXX`
+/// 生成一个配对码：16 位约 79 比特，`XXXX-XXXX-XXXX-XXXX`（拒绝采样消除取模偏差）
 pub fn pairing_code() -> String {
-    let raw: [u8; 16] = random();
-    let code: String = raw
-        .iter()
-        .map(|byte| CODE_ALPHABET[*byte as usize % CODE_ALPHABET.len()] as char)
-        .collect();
-    format!("{}-{}-{}-{}", &code[0..4], &code[4..8], &code[8..12], &code[12..16])
+    let limit = (256 / CODE_ALPHABET.len()) * CODE_ALPHABET.len(); // 248 = 31 * 8
+    let mut code = String::with_capacity(16);
+    while code.len() < 16 {
+        let raw: [u8; 32] = random();
+        for byte in raw {
+            if (byte as usize) < limit {
+                code.push(CODE_ALPHABET[byte as usize % CODE_ALPHABET.len()] as char);
+                if code.len() == 16 {
+                    break;
+                }
+            }
+        }
+    }
+    format!(
+        "{}-{}-{}-{}",
+        &code[0..4],
+        &code[4..8],
+        &code[8..12],
+        &code[12..16]
+    )
 }
 
-/// 配对码 → 握手用的 psk。配对码不区分大小写、忽略首尾空白与连字符（手工输入容错）。
-pub fn psk_from_code(code: &str) -> Psk {
+/// 规范化并校验配对码：去除空白和连字符后必须至少 12 位字母/数字（避免 `"--------"` 退化成空密钥）。
+pub fn normalize_pairing_code(code: &str) -> Result<Zeroizing<String>, String> {
     let normalized: String = code
         .trim()
         .chars()
         .filter(|c| *c != '-' && *c != ' ')
         .flat_map(|c| c.to_uppercase())
         .collect();
+    if normalized.len() < 12 || !normalized.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("配对码长度不足或包含非法字符（去掉连字符后至少 12 位）".into());
+    }
+    Ok(Zeroizing::new(normalized))
+}
+
+/// 配对码 → 握手用的 psk。配对码不区分大小写、忽略首尾空白与连字符（手工输入容错）。
+pub fn psk_from_code(code: &str) -> Psk {
+    let normalized = Zeroizing::new(
+        code.trim()
+            .chars()
+            .filter(|c| *c != '-' && *c != ' ')
+            .flat_map(|c| c.to_uppercase())
+            .collect::<String>(),
+    );
     hmac(CODE_LABEL, normalized.as_bytes())
 }
 
@@ -87,13 +116,13 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn unb64(text: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD.decode(text).map_err(|_| "编码不合法".to_string())
+    URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|_| "编码不合法".to_string())
 }
 
 fn key32(text: &str) -> Result<[u8; 32], String> {
-    unb64(text)?
-        .try_into()
-        .map_err(|_| "长度不对".to_string())
+    unb64(text)?.try_into().map_err(|_| "长度不对".to_string())
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -121,21 +150,39 @@ struct Keys {
     node_to_hub: [u8; 32],
 }
 
+impl Drop for Keys {
+    fn drop(&mut self) {
+        self.mac.zeroize();
+        self.hub_to_node.zeroize();
+        self.node_to_hub.zeroize();
+    }
+}
+
 /// `secret` / `other` 是参与 DH 的私钥与对方公钥（哪一方调用都一样）。
-fn derive(secret: &StaticSecret, other: &[u8; 32], psk: &[u8], th: &[u8; 32]) -> Keys {
-    let shared = secret.diffie_hellman(&PublicKey::from(*other)).to_bytes();
-    let ck = hmac(th, &shared);
-    let ck = hmac(&ck, psk);
-    let hk = Hkdf::<Sha256>::from_prk(&ck).expect("链密钥正好是一个哈希的长度");
-    let mut okm = [0u8; 96];
-    hk.expand(LABEL, &mut okm).expect("输出长度合法");
+/// 拒绝低阶点（RFC 7748 §6.1），并对中间密钥材料立即清零。
+fn derive(
+    secret: &StaticSecret,
+    other: &[u8; 32],
+    psk: &[u8],
+    th: &[u8; 32],
+) -> Result<Keys, String> {
+    let dh = secret.diffie_hellman(&PublicKey::from(*other));
+    if !dh.was_contributory() {
+        return Err("对方的临时公钥无效（低阶点），拒绝握手".into());
+    }
+    let shared = Zeroizing::new(dh.to_bytes());
+    let ck1 = Zeroizing::new(hmac(th, &*shared));
+    let ck = Zeroizing::new(hmac(&*ck1, psk));
+    let hk = Hkdf::<Sha256>::from_prk(&*ck).expect("链密钥正好是一个哈希的长度");
+    let mut okm = Zeroizing::new([0u8; 96]);
+    hk.expand(LABEL, &mut *okm).expect("输出长度合法");
     let (mac, rest) = okm.split_at(32);
     let (hub_to_node, node_to_hub) = rest.split_at(32);
-    Keys {
+    Ok(Keys {
         mac: mac.try_into().expect("32 字节"),
         hub_to_node: hub_to_node.try_into().expect("32 字节"),
         node_to_hub: node_to_hub.try_into().expect("32 字节"),
-    }
+    })
 }
 
 /// 控制端 → 节点的第一句话
@@ -199,7 +246,7 @@ impl Initiator {
     pub fn finish(self, reply: &HelloOk) -> Result<(Cipher, Confirm), String> {
         let their = key32(&reply.eph)?;
         let th = transcript(&self.hub_id, &self.node_id, &self.eph, &their);
-        let keys = derive(&self.secret, &their, &self.psk, &th);
+        let keys = derive(&self.secret, &their, &self.psk, &th)?;
         if !equal(&hmac(&keys.mac, b"node"), &key32(&reply.mac)?) {
             return Err("节点身份校验失败：预共享密钥不匹配，或数据在中途被改过".into());
         }
@@ -219,15 +266,27 @@ pub struct Responder {
 }
 
 impl Responder {
-    /// `psk` 是这台节点为该控制端保存的密钥（首次配对时由配对码派生）。
-    /// 控制端的临时公钥解不出来时用一个无效值，握手必然失败，不会panic。
-    pub fn new(psk: Psk, hello: &Hello) -> Self {
+    /// 校验发起方公钥并派生会话密钥；拒绝非法编码或低阶点。
+    pub fn try_new(mut psk: Psk, hello: &Hello) -> Result<Self, String> {
         let secret = StaticSecret::from(random());
         let eph = PublicKey::from(&secret).to_bytes();
-        let their = key32(&hello.eph).unwrap_or([0; 32]);
+        let their = key32(&hello.eph)?;
         let th = transcript(&hello.hub_id, &hello.node_id, &their, &eph);
         let keys = derive(&secret, &their, &psk, &th);
-        Self { eph, keys }
+        psk.zeroize();
+        Ok(Self { eph, keys: keys? })
+    }
+
+    /// 兼容旧调用的构造：非法公钥时直接返回全零假密钥（`complete` 必然失败）。
+    pub fn new(psk: Psk, hello: &Hello) -> Self {
+        Self::try_new(psk, hello).unwrap_or_else(|_| Self {
+            eph: random(),
+            keys: Keys {
+                mac: random(),
+                hub_to_node: random(),
+                node_to_hub: random(),
+            },
+        })
     }
 
     pub fn reply(&self) -> HelloOk {
@@ -278,17 +337,32 @@ impl Cipher {
         }
     }
 
-    /// 加密一条消息：`序号(8) ‖ 密文 ‖ 标签(16)`，序号参与认证
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+    /// 加密一条消息：`序号(8) ‖ 密文 ‖ 标签(16)`，序号参与认证（序号耗尽时拒绝加密防 nonce 重用）
+    pub fn try_seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let next = self
+            .send_counter
+            .checked_add(1)
+            .ok_or_else(|| "会话密钥序号已耗尽，请重新建立连接".to_string())?;
         let counter = self.send_counter;
         let mut frame = counter.to_be_bytes().to_vec();
         let sealed = self
             .send
-            .encrypt(&Nonce::from(nonce(counter)), Payload { msg: plaintext, aad: &frame })
-            .expect("ChaCha20-Poly1305 不会因为长度失败");
+            .encrypt(
+                &Nonce::from(nonce(counter)),
+                Payload {
+                    msg: plaintext,
+                    aad: &frame,
+                },
+            )
+            .map_err(|_| "加密消息失败".to_string())?;
         frame.extend_from_slice(&sealed);
-        self.send_counter += 1;
-        frame
+        self.send_counter = next;
+        Ok(frame)
+    }
+
+    /// 加密一条消息（便捷方法）
+    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        self.try_seal(plaintext).expect("会话序号未耗尽")
     }
 
     /// 解密一条消息。序号必须与期望值完全一致：重放、乱序、对端重启都会被拒绝。
@@ -296,6 +370,10 @@ impl Cipher {
         if frame.len() < COUNTER + TAG {
             return Err("密文过短".into());
         }
+        let next = self
+            .recv_counter
+            .checked_add(1)
+            .ok_or_else(|| "接收序号已耗尽，请重新建立连接".to_string())?;
         let (head, body) = frame.split_at(COUNTER);
         let counter = u64::from_be_bytes(head.try_into().expect("8 字节"));
         if counter != self.recv_counter {
@@ -306,9 +384,15 @@ impl Cipher {
         }
         let plain = self
             .recv
-            .decrypt(&Nonce::from(nonce(counter)), Payload { msg: body, aad: head })
+            .decrypt(
+                &Nonce::from(nonce(counter)),
+                Payload {
+                    msg: body,
+                    aad: head,
+                },
+            )
             .map_err(|_| "解密失败：数据被篡改，或两边的密钥不一致".to_string())?;
-        self.recv_counter += 1;
+        self.recv_counter = next;
         Ok(plain)
     }
 }
@@ -341,7 +425,10 @@ mod tests {
         let f2 = hub.seal(b"two");
         assert_eq!(node.open(&f1).unwrap(), b"one");
         assert_eq!(node.open(&f2).unwrap(), b"two");
-        assert_eq!(hub.open(&node.seal("结果".as_bytes())).unwrap(), "结果".as_bytes());
+        assert_eq!(
+            hub.open(&node.seal("结果".as_bytes())).unwrap(),
+            "结果".as_bytes()
+        );
         // 密文里看不到明文
         assert!(!f1.windows(3).any(|w| w == b"one"));
         assert_eq!(f1.len(), 8 + 3 + 16);
@@ -360,7 +447,13 @@ mod tests {
         let psk = random_psk();
         let initiator = Initiator::new(psk, "hub-1", "node-1");
         let responder = Responder::new(psk, &initiator.hello());
-        assert!(responder.complete(&Confirm { mac: b64(&random::<32>()) }).is_err());
+        assert!(
+            responder
+                .complete(&Confirm {
+                    mac: b64(&random::<32>())
+                })
+                .is_err()
+        );
         // 拿「配对码错了」的 psk 也一样
         let responder = Responder::new(random_psk(), &initiator.hello());
         assert!(initiator.finish(&responder.reply()).is_err());
@@ -434,7 +527,10 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, psk_from_code("K7QM-2X9P-4R8T-6WYX"));
         let (mut hub, mut node) = handshake(a, b).unwrap();
-        assert_eq!(node.open(&hub.seal("配对成功".as_bytes())).unwrap(), "配对成功".as_bytes());
+        assert_eq!(
+            node.open(&hub.seal("配对成功".as_bytes())).unwrap(),
+            "配对成功".as_bytes()
+        );
     }
 
     /// 握手消息是线上格式：字段名稳定、能原样往返
@@ -455,7 +551,11 @@ mod tests {
         let b = pairing_code();
         assert_ne!(a, b);
         assert_eq!(a.len(), 19);
-        assert!(a.chars().all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8))), "{a}");
+        assert!(
+            a.chars()
+                .all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8))),
+            "{a}"
+        );
     }
 
     #[test]

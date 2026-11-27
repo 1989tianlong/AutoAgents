@@ -9,9 +9,14 @@ import { Badge, Empty, LevelBadge, PageHeader, StatusDot } from "../components/u
 /** 桌面 Agent 的进程控制（目前只有本机 macOS 支持） */
 function DesktopControls({ agent }: { agent: AgentEntry }) {
   const qc = useQueryClient();
-  const states = useQuery({ queryKey: ["desktopStates"], queryFn: desktopStates, refetchInterval: 15000 });
-  const running = (states.data ?? []).find((s) => s.path === agent.path)?.running ?? false;
   const local = agent.nodeId === "local";
+  const states = useQuery({
+    queryKey: ["desktopStates"],
+    queryFn: desktopStates,
+    refetchInterval: 15000,
+    enabled: local,
+  });
+  const running = local && ((states.data ?? []).find((s) => s.path === agent.path)?.running ?? false);
   const refresh = { onSuccess: () => qc.invalidateQueries({ queryKey: ["desktopStates"] }) };
   const launch = useMutation({ mutationFn: () => desktopLaunch(agent.nodeId, agent.path, agent.name), ...refresh });
   const quit = useMutation({ mutationFn: () => desktopQuit(agent.nodeId, agent.path, agent.name), ...refresh });

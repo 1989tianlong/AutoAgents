@@ -194,7 +194,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="https://raw.githubusercontent.com/${{ github.repository }}/main/scripts"
+          base="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts"
           export AUTOAGENTS_INSTALL_DIR="${RUNNER_TEMP}/autoagents-bin"
           curl -fsSL "${base}/install-agentd.sh" | sh -s -- upgrade
           curl -fsSL "${base}/install-relay.sh" | sh -s -- --public wss://relay.example.com:7000

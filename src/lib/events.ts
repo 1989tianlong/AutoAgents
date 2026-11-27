@@ -16,6 +16,8 @@ export const KIND_GROUPS: KindGroup[] = [
   { key: "deploy", label: "部署" },
   { key: "github", label: "GitHub" },
   { key: "relay", label: "中继" },
+  { key: "usage", label: "用量" },
+  { key: "agent", label: "Agents" },
 ];
 
 const KIND_LABEL: Record<string, string> = {

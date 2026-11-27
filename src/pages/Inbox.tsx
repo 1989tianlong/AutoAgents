@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge, Button, Card, Empty, PageHeader } from "../components/ui";
 import { inboxList, inboxMergePr } from "../lib/api";
+import { openSafeUrl } from "../lib/url";
 
 const CHECKS: Record<string, { label: string; tone: "emerald" | "amber" | "rose" | "slate" }> = {
   success: { label: "检查全绿", tone: "emerald" },
@@ -109,9 +110,13 @@ export default function Inbox() {
                     <div className="flex shrink-0 items-center gap-2">
                       {r.checks && <Badge tone={CHECKS[r.checks]?.tone ?? "slate"}>{CHECKS[r.checks]?.label ?? r.checks}</Badge>}
                       {r.prUrl && (
-                        <a href={r.prUrl} target="_blank" rel="noreferrer" className="text-xs text-sky-400 hover:text-sky-300">
+                        <button
+                          type="button"
+                          onClick={() => openSafeUrl(r.prUrl)}
+                          className="text-xs text-sky-400 hover:text-sky-300"
+                        >
                           GitHub →
-                        </a>
+                        </button>
                       )}
                       <Button variant="primary" disabled={busy === r.id} onClick={() => merge(r.id)} data-testid="inbox-merge">
                         合并

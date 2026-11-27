@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::http::Request;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::http::Request;
 use url::Url;
 
 /// 单条消息的上限：一轮对话的完整回答、git 输出都在这之内。
@@ -40,15 +40,16 @@ impl Fingerprint {
 
     /// 解析 `sha256:abcd…`（十六进制不区分大小写，忽略其中的冒号）
     pub fn parse(text: &str) -> Result<Self, String> {
-        let hex: String = text
-            .trim()
-            .trim_start_matches("sha256:")
+        let lower = text.trim().to_ascii_lowercase();
+        let hex: String = lower
+            .strip_prefix("sha256:")
+            .unwrap_or(&lower)
             .chars()
             .filter(|c| *c != ':')
             .collect();
-        let bytes = hex::decode(&hex).filter(|b| b.len() == 32).ok_or_else(|| {
-            format!("证书指纹不合法（应为 sha256: 加 64 位十六进制）：{text}")
-        })?;
+        let bytes = hex::decode(&hex)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| format!("证书指纹不合法（应为 sha256: 加 64 位十六进制）：{text}"))?;
         Ok(Self(bytes.try_into().expect("32 字节")))
     }
 }
@@ -65,7 +66,7 @@ mod hex {
     }
 
     pub fn decode(text: &str) -> Option<Vec<u8>> {
-        if text.len() % 2 != 0 || !text.is_ascii() {
+        if !text.len().is_multiple_of(2) || !text.is_ascii() {
             return None;
         }
         (0..text.len())
@@ -84,7 +85,8 @@ pub struct Identity {
 impl Identity {
     /// 从 `dir/cert.der`、`dir/key.der` 读取；不存在就生成（私钥文件权限 0600）。
     pub fn load_or_create(dir: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("创建目录 {} 失败：{e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("创建目录 {} 失败：{e}", dir.display()))?;
         let cert_path = dir.join("cert.der");
         let key_path = dir.join("key.der");
         let load = |path: &Path| -> Result<Option<Vec<u8>>, String> {
@@ -127,24 +129,69 @@ impl Identity {
     }
 }
 
+/// 原子写入私密文件（Unix 上确保父目录 0700、临时文件 0600 + fsync + 原子 rename，防止崩溃截断或权限放宽）
 #[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("创建 {} 失败：{e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let suffix = hex::encode(&crate::secure::random::<8>());
+    let tmp = path.with_file_name(format!(
+        ".{}.{suffix}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "secret".into())
+    ));
+    let write_res = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("创建临时文件 {} 失败：{e}", tmp.display()))?;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        file.write_all(bytes)
+            .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("落盘 {} 失败：{e}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换 {} 失败：{e}", path.display())
+    })
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
+    }
+    let suffix = hex::encode(&crate::secure::random::<8>());
+    let tmp = path.with_file_name(format!(
+        ".{}.{suffix}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "secret".into())
+    ));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换 {} 失败：{e}", path.display())
+    })
 }
 
 /// 只认指定指纹的证书校验器：自签名证书不需要 CA，指纹对上即可信。
@@ -179,7 +226,12 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -188,11 +240,18 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -225,7 +284,7 @@ fn client_config(pin: Option<&Fingerprint>) -> Result<Arc<rustls::ClientConfig>,
 
 /// `Sec-WebSocket-Key`：16 字节随机数的 base64
 fn b64_key() -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     STANDARD.encode(crate::secure::random::<16>())
 }
 
@@ -235,10 +294,10 @@ fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         .max_frame_size(Some(MAX_MESSAGE))
 }
 
-/// 客户端一侧的底层流：明文 TCP 或 TLS
+/// 客户端一侧的底层流：明文 TCP 或 TLS（Box 消除大枚举变体栈膨胀）
 pub enum Stream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for Stream {
@@ -324,7 +383,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Channel<S> {
     pub async fn send_json<T: serde::Serialize>(&mut self, value: &T) -> Result<(), String> {
         let plain = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         let message = match &mut self.cipher {
-            Some(cipher) => Message::Binary(cipher.seal(&plain).into()),
+            Some(cipher) => Message::Binary(cipher.try_seal(&plain)?.into()),
             None => Message::Text(String::from_utf8(plain).map_err(|e| e.to_string())?.into()),
         };
         self.ws
@@ -363,32 +422,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Channel<S> {
         }
     }
 
-    /// 在两条连接之间原样转发消息，直到任何一方断开。
+    /// 在两条连接之间并发双向原样转发消息，带空闲超时与 Close 透传（拆分读写防背压死锁）。
     /// 中继用它转发密文：不解析、不解密，也就不可能看到内容。
-    pub async fn pipe<T: AsyncRead + AsyncWrite + Unpin>(&mut self, other: &mut Channel<T>) -> Result<(), String> {
-        loop {
-            tokio::select! {
-                message = self.ws.next() => {
-                    match message {
-                        Some(Ok(message)) if matches!(message, Message::Text(_) | Message::Binary(_)) => {
-                            other.ws.send(message).await.map_err(|e| format!("转发失败：{e}"))?;
+    pub async fn pipe<T: AsyncRead + AsyncWrite + Unpin>(
+        self,
+        other: Channel<T>,
+    ) -> Result<(), String> {
+        const PIPE_IDLE: Duration = Duration::from_secs(150);
+        let (mut a_tx, mut a_rx) = self.ws.split();
+        let (mut b_tx, mut b_rx) = other.ws.split();
+        let last_activity = std::sync::Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+
+        let copy_ab = {
+            let last = std::sync::Arc::clone(&last_activity);
+            async move {
+                while let Some(msg) = a_rx.next().await {
+                    let msg = msg.map_err(|e| format!("连接出错：{e}"))?;
+                    *last.lock().unwrap() = tokio::time::Instant::now();
+                    match msg {
+                        Message::Text(_) | Message::Binary(_) => {
+                            b_tx.send(msg).await.map_err(|e| format!("转发失败：{e}"))?;
                         }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => return Err(format!("连接出错：{e}")),
-                        None => return Err("连接已断开".into()),
+                        Message::Close(_) => {
+                            let _ = b_tx.send(Message::Close(None)).await;
+                            return Err("对端关闭了连接".into());
+                        }
+                        _ => {}
                     }
                 }
-                message = other.ws.next() => {
-                    match message {
-                        Some(Ok(message)) if matches!(message, Message::Text(_) | Message::Binary(_)) => {
-                            self.ws.send(message).await.map_err(|e| format!("转发失败：{e}"))?;
+                let _ = b_tx.send(Message::Close(None)).await;
+                Err::<(), String>("连接已断开".into())
+            }
+        };
+
+        let copy_ba = {
+            let last = std::sync::Arc::clone(&last_activity);
+            async move {
+                while let Some(msg) = b_rx.next().await {
+                    let msg = msg.map_err(|e| format!("连接出错：{e}"))?;
+                    *last.lock().unwrap() = tokio::time::Instant::now();
+                    match msg {
+                        Message::Text(_) | Message::Binary(_) => {
+                            a_tx.send(msg).await.map_err(|e| format!("转发失败：{e}"))?;
                         }
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => return Err(format!("连接出错：{e}")),
-                        None => return Err("连接已断开".into()),
+                        Message::Close(_) => {
+                            let _ = a_tx.send(Message::Close(None)).await;
+                            return Err("对端关闭了连接".into());
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = a_tx.send(Message::Close(None)).await;
+                Err::<(), String>("连接已断开".into())
+            }
+        };
+
+        let idle_watch = {
+            let last = std::sync::Arc::clone(&last_activity);
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let elapsed = last.lock().unwrap().elapsed();
+                    if elapsed > PIPE_IDLE {
+                        return Err::<(), String>(format!(
+                            "数据通道 {} 秒无流量，断开",
+                            elapsed.as_secs()
+                        ));
                     }
                 }
             }
+        };
+
+        tokio::select! {
+            r = copy_ab => r,
+            r = copy_ba => r,
+            r = idle_watch => r,
         }
     }
 
@@ -407,16 +517,20 @@ pub async fn dial(url: &str, pin: Option<&Fingerprint>) -> Result<Channel<Stream
         other => return Err(format!("不支持的协议「{other}」，请用 wss:// 或 ws://")),
     };
     let host = url.host_str().ok_or("地址里没有主机名")?.to_string();
-    let port = url.port_or_known_default().unwrap_or(if secure { 443 } else { 80 });
+    // IPv6 字面量在 URL 里带方括号（如 `[::1]`）；TCP 连接与 TLS ServerName 需剥离括号
+    let connect_host = host.trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if secure { 443 } else { 80 });
     if !secure && !is_loopback(&host) {
         return Err("远程地址必须使用 wss://（明文 ws:// 只允许连接本机）".into());
     }
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((connect_host, port)))
         .await
         .map_err(|_| format!("连接 {host}:{port} 超时"))?
         .map_err(|e| format!("无法连接 {host}:{port}：{e}"))?;
     let stream = if secure {
-        let name = rustls::pki_types::ServerName::try_from(host.clone())
+        let name = rustls::pki_types::ServerName::try_from(connect_host.to_string())
             .map_err(|_| format!("主机名不合法：{host}"))?
             .to_owned();
         let connector = tokio_rustls::TlsConnector::from(client_config(pin)?);
@@ -424,7 +538,7 @@ pub async fn dial(url: &str, pin: Option<&Fingerprint>) -> Result<Channel<Stream
             .await
             .map_err(|_| format!("TLS 握手超时：{host}:{port}"))?
             .map_err(|e| format!("TLS 握手失败：{e}"))?;
-        Stream::Tls(tls)
+        Stream::Tls(Box::new(tls))
     } else {
         Stream::Plain(stream)
     };
@@ -437,12 +551,11 @@ pub async fn dial(url: &str, pin: Option<&Fingerprint>) -> Result<Channel<Stream
         Some(port) => format!("{host}:{port}"),
         None => host.clone(),
     };
-    // client_async 要求请求行是绝对地址（ws://host/path），从中校验 Host
-    let mut target = format!("{}://{host_header}{path}", if secure { "wss" } else { "ws" });
-    if let Some(query) = url.query() {
-        target.push('?');
-        target.push_str(query);
-    }
+    // client_async 要求请求行是绝对地址（ws://host/path），从中校验 Host（query 已含在 path 中）
+    let target = format!(
+        "{}://{host_header}{path}",
+        if secure { "wss" } else { "ws" }
+    );
     // 握手头由这里补齐（client_async 不代劳）：随机挑战串防缓存代理误判
     let request = Request::builder()
         .uri(target)
@@ -564,6 +677,7 @@ async fn peek_request<S: AsyncRead + AsyncWrite + Unpin>(
     health: &str,
 ) -> Result<Prefixed<S>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let head_end = loop {
         if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -573,7 +687,7 @@ async fn peek_request<S: AsyncRead + AsyncWrite + Unpin>(
             return Err("请求头过大，不像 WebSocket 握手".into());
         }
         let mut chunk = [0u8; 1024];
-        let read = tokio::time::timeout(CONNECT_TIMEOUT, stream.read(&mut chunk))
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
             .await
             .map_err(|_| "等待请求超时".to_string())?
             .map_err(|e| format!("读取请求失败：{e}"))?;
@@ -583,17 +697,22 @@ async fn peek_request<S: AsyncRead + AsyncWrite + Unpin>(
         buf.extend_from_slice(&chunk[..read]);
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
-    // Upgrade: websocket，且 Connection 里列了 upgrade（可能还带着 keep-alive 等其它选项）
-    let header = |name: &str| -> Option<String> {
-        head.lines().find_map(|line| {
-            let rest = line.trim_start().strip_prefix(name)?;
-            rest.starts_with([':', ' ', '\t'])
-                .then(|| rest.trim_start_matches([':', ' ', '\t']).trim().to_string())
-        })
+    // 支持多行同名的 Connection / Upgrade 头（RFC 9110）
+    let header_values = |name: &str| -> Vec<String> {
+        head.lines()
+            .filter_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                (k.trim() == name).then(|| v.trim().to_string())
+            })
+            .collect()
     };
-    let wants_upgrade = header("connection")
-        .is_some_and(|value| value.split(',').any(|token| token.trim() == "upgrade"));
-    if wants_upgrade && header("upgrade").as_deref() == Some("websocket") {
+    let wants_upgrade = header_values("connection")
+        .iter()
+        .any(|value| value.split(',').any(|token| token.trim() == "upgrade"));
+    let is_ws = header_values("upgrade")
+        .iter()
+        .any(|value| value.split(',').any(|token| token.trim() == "websocket"));
+    if wants_upgrade && is_ws {
         return Ok(Prefixed::new(stream, buf));
     }
     let response = format!(
@@ -651,15 +770,18 @@ mod tests {
         assert!(text.starts_with("sha256:abab"));
         assert_eq!(Fingerprint::parse(&text).unwrap(), fp);
         // 带冒号的写法（openssl 风格）与大小写都不影响
-        let colon = Fingerprint([0xab; 32]).to_string().replace("sha256:", "sha256:").chars().collect::<String>();
-        let mut grouped = String::from("sha256:");
-        for (i, b) in colon["sha256:".len()..].as_bytes().chunks(2).enumerate() {
+        let raw = Fingerprint([0xab; 32]).to_string().to_uppercase();
+        let mut grouped = String::from("SHA256:");
+        for (i, b) in raw.as_bytes()["sha256:".len()..].chunks(2).enumerate() {
             if i > 0 {
                 grouped.push(':');
             }
             grouped.push_str(std::str::from_utf8(b).unwrap());
         }
-        assert_eq!(Fingerprint::parse(&grouped).unwrap(), Fingerprint([0xab; 32]));
+        assert_eq!(
+            Fingerprint::parse(&grouped).unwrap(),
+            Fingerprint([0xab; 32])
+        );
         assert!(Fingerprint::parse("sha256:abcd").is_err());
         assert!(Fingerprint::parse("nope").is_err());
     }
@@ -672,7 +794,12 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint(), "证书应当只生成一次");
         assert!(a.server_config().is_ok());
         let other = tempfile::tempdir().unwrap();
-        assert_ne!(a.fingerprint(), Identity::load_or_create(other.path()).unwrap().fingerprint());
+        assert_ne!(
+            a.fingerprint(),
+            Identity::load_or_create(other.path())
+                .unwrap()
+                .fingerprint()
+        );
     }
 
     #[test]
@@ -723,7 +850,9 @@ mod tests {
             .header("Sec-WebSocket-Key", b64_key())
             .body(())
             .unwrap();
-        let (ws, _) = tokio_tungstenite::client_async(request, client_io).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(request, client_io)
+            .await
+            .unwrap();
         let mut client = Channel::new(ws);
         client
             .send(&Wire::Frame(crate::protocol::Frame::Ping { nonce: 1 }))
@@ -779,13 +908,30 @@ mod tests {
                 });
             }
         });
-        let good = dial(&format!("wss://localhost:{}", addr.port()), Some(&identity.fingerprint())).await;
+        let good = dial(
+            &format!("wss://localhost:{}", addr.port()),
+            Some(&identity.fingerprint()),
+        )
+        .await;
         assert!(good.is_ok(), "{good:?}");
-        let wrong = dial(&format!("wss://localhost:{}", addr.port()), Some(&Fingerprint([9; 32]))).await;
+        let wrong = dial(
+            &format!("wss://localhost:{}", addr.port()),
+            Some(&Fingerprint([9; 32])),
+        )
+        .await;
         assert!(wrong.unwrap_err().contains("指纹"), "指纹不匹配应当被拒绝");
         // 明文连不上 TLS 端口；非回环地址不允许明文
-        assert!(dial(&format!("ws://localhost:{}", addr.port()), None).await.is_err());
-        assert!(dial("ws://10.0.0.1:7000", None).await.unwrap_err().contains("wss://"));
+        assert!(
+            dial(&format!("ws://localhost:{}", addr.port()), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            dial("ws://10.0.0.1:7000", None)
+                .await
+                .unwrap_err()
+                .contains("wss://")
+        );
         assert!(dial("http://localhost:1", None).await.is_err());
         server.abort();
     }

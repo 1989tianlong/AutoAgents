@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openSafeUrl as openUrl } from "../lib/url";
 import {
   githubConnect,
   githubDisconnect,

@@ -47,13 +47,11 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 主机名；取不到时退回「localhost」
+/// 主机名；优先用 sysinfo 直接读系统调用（不 fork 外部 `hostname` 进程），取不到时退回「localhost」
 pub fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
+    sysinfo::System::host_name()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".into())
 }
@@ -141,26 +139,26 @@ pub fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 pub fn find_binary(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     dirs.iter().find_map(|d| {
         let p = d.join(binary);
-        p.is_file().then_some(p)
+        let meta = std::fs::metadata(&p).ok()?;
+        (meta.is_file() && (meta.permissions().mode() & 0o111) != 0).then_some(p)
     })
 }
 
 /// 探测版本号：执行 `<bin> --version`，3 秒超时，取首行。
 async fn probe_version(bin: &Path) -> Option<String> {
     use std::process::Stdio;
-    let out = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::process::Command::new(bin)
-            .arg("--version")
-            .env("PATH", child_path())
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
+        .env("PATH", child_path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(3), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     if !out.status.success() {
         return None;
     }

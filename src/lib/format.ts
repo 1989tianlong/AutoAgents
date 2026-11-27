@@ -31,10 +31,15 @@ export function fmtCountdown(seconds: number): string {
   return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
 }
 
+function parseUtcMs(input: string): number {
+  const iso = input.trim().replace(" ", "T");
+  return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso}Z`);
+}
+
 /** 距现在多久：`刚刚` / `5 分钟前` / `3 小时前` / 日期 */
 export function fmtAgo(input: string | number | null | undefined): string {
   if (input == null) return "—";
-  const ms = typeof input === "number" ? input : Date.parse(input.replace(" ", "T") + "Z");
+  const ms = typeof input === "number" ? input : parseUtcMs(input);
   if (!Number.isFinite(ms)) return String(input);
   const diff = Date.now() - ms;
   if (diff < 0) return new Date(ms).toLocaleString();
@@ -50,7 +55,7 @@ export function fmtAgo(input: string | number | null | undefined): string {
 
 /** 事件时间戳（SQLite 的 UTC `YYYY-MM-DD HH:MM:SS`）→ 本地 `MM-DD HH:MM` */
 export function fmtTime(input: string): string {
-  const ms = Date.parse(input.replace(" ", "T") + "Z");
+  const ms = parseUtcMs(input);
   return Number.isFinite(ms) ? new Date(ms).toLocaleString() : input;
 }
 

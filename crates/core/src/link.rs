@@ -11,15 +11,15 @@ use crate::protocol::{Frame, Wire};
 use crate::runner::TurnEvent;
 use crate::secure::{self, Psk, Responder};
 use crate::service::Service;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 /// 控制端多久没收到任何消息就发一次保活
 const PING_AFTER: Duration = Duration::from_secs(20);
@@ -47,7 +47,15 @@ pub const PAIRING_TTL: Duration = Duration::from_secs(600);
 /// 每条连接一个序号，用来给这条连接上的对话加前缀
 static CONNECTION: AtomicU64 = AtomicU64::new(1);
 
+/// 单连接最大并发在途 RPC 数（防 fork-bomb / 任务洪泛）
+const MAX_INFLIGHT_RPCS: usize = 32;
+
+/// 配对失败超过该次数自动作废当前配对码（防暴力枚举）
+const MAX_PAIR_FAILURES: u32 = 5;
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type PingMap = Arc<Mutex<HashMap<u64, (Instant, Option<oneshot::Sender<Duration>>)>>>;
+pub type PersistFn = Box<dyn Fn(&str, Psk) + Send + Sync>;
 
 /// 控制端这一头的连接。可以克隆，最后一份丢开时连接关闭。
 #[derive(Clone)]
@@ -58,7 +66,7 @@ pub struct HubLink {
     closed: watch::Receiver<Option<String>>,
     shutdown: watch::Sender<bool>,
     next_id: Arc<AtomicU64>,
-    pings: Arc<Mutex<HashMap<u64, Instant>>>,
+    pings: PingMap,
     rtt_ms: Arc<Mutex<Option<u64>>>,
 }
 
@@ -75,7 +83,7 @@ impl std::fmt::Debug for HubLink {
 struct Io {
     pending: Pending,
     events: broadcast::Sender<TurnEvent>,
-    pings: Arc<Mutex<HashMap<u64, Instant>>>,
+    pings: PingMap,
     rtt_ms: Arc<Mutex<Option<u64>>>,
 }
 
@@ -95,10 +103,16 @@ impl HubLink {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let initiator = secure::Initiator::new(psk, hub_id, node_id);
-        channel
-            .send(&Wire::Frame(Frame::Hello(initiator.hello())))
-            .await?;
-        match channel.recv().await? {
+        tokio::time::timeout(
+            crate::net::CONNECT_TIMEOUT,
+            channel.send(&Wire::Frame(Frame::Hello(initiator.hello()))),
+        )
+        .await
+        .map_err(|_| "发送握手请求超时".to_string())??;
+        let first = tokio::time::timeout(crate::net::CONNECT_TIMEOUT, channel.recv())
+            .await
+            .map_err(|_| "等待节点握手应答超时".to_string())??;
+        match first {
             Wire::Frame(Frame::HelloOk(reply)) => {
                 let (cipher, confirm) = match initiator.finish(&reply) {
                     Ok(ok) => ok,
@@ -109,9 +123,12 @@ impl HubLink {
                 };
                 // 确认本身仍是明文（节点验完它才会开始解密）；它只含 mac，不涉密。
                 // 确认一发出，这个方向的消息就全是密文了
-                channel
-                    .send(&Wire::Frame(Frame::Confirm(confirm)))
-                    .await?;
+                tokio::time::timeout(
+                    crate::net::CONNECT_TIMEOUT,
+                    channel.send(&Wire::Frame(Frame::Confirm(confirm))),
+                )
+                .await
+                .map_err(|_| "发送握手确认超时".to_string())??;
                 channel.encrypt(cipher);
             }
             Wire::Frame(Frame::Reject { message }) => {
@@ -124,12 +141,18 @@ impl HubLink {
             }
         }
         if let Some(fresh) = rotate_to {
-            channel
-                .send(&Wire::Frame(Frame::Rotate {
+            tokio::time::timeout(
+                crate::net::CONNECT_TIMEOUT,
+                channel.send(&Wire::Frame(Frame::Rotate {
                     psk: URL_SAFE_NO_PAD.encode(fresh),
-                }))
-                .await?;
-            match channel.recv().await? {
+                })),
+            )
+            .await
+            .map_err(|_| "发送密钥轮换请求超时".to_string())??;
+            let rotated = tokio::time::timeout(crate::net::CONNECT_TIMEOUT, channel.recv())
+                .await
+                .map_err(|_| "等待节点确认新密钥超时".to_string())??;
+            match rotated {
                 Wire::Frame(Frame::Rotated {}) => {}
                 other => {
                     let e = format!("节点没有确认新密钥：{other:?}");
@@ -233,26 +256,29 @@ impl HubLink {
         let _ = self.shutdown.send(true);
     }
 
-    /// 测一次往返耗时
+    /// 测一次往返耗时（独立于 RPC pending 表，避免 Pong 干扰在途 RPC）
     pub async fn ping(&self) -> Result<Duration, String> {
         let nonce = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pings.lock().unwrap().insert(nonce, Instant::now());
-        self.pending.lock().unwrap().insert(nonce, tx);
-        self.out
+        self.pings
+            .lock()
+            .unwrap()
+            .insert(nonce, (Instant::now(), Some(tx)));
+        if self
+            .out
             .send(Wire::Frame(Frame::Ping { nonce }))
             .await
-            .map_err(|_| self.closed_reason().unwrap_or_else(|| "连接已断开".into()))?;
+            .is_err()
+        {
+            self.pings.lock().unwrap().remove(&nonce);
+            return Err(self.closed_reason().unwrap_or_else(|| "连接已断开".into()));
+        }
         let reply = tokio::time::timeout(Duration::from_secs(10), rx).await;
         self.pings.lock().unwrap().remove(&nonce);
         match reply {
-            Ok(Ok(Ok(_))) => Ok(Duration::from_millis(self.rtt_ms().unwrap_or(0))),
-            Ok(Ok(Err(e))) => Err(e),
+            Ok(Ok(rtt)) => Ok(rtt),
             Ok(Err(_)) => Err(self.closed_reason().unwrap_or_else(|| "连接已断开".into())),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&nonce);
-                Err("节点 10 秒内没有回应保活".into())
-            }
+            Err(_) => Err("节点 10 秒内没有回应保活".into()),
         }
     }
 }
@@ -310,11 +336,12 @@ async fn run_io<S>(
                         }
                     }
                     Wire::Frame(Frame::Pong { nonce }) => {
-                        if let Some(sent) = io.pings.lock().unwrap().remove(&nonce) {
-                            *io.rtt_ms.lock().unwrap() = Some(sent.elapsed().as_millis() as u64);
-                        }
-                        if let Some(tx) = io.pending.lock().unwrap().remove(&nonce) {
-                            let _ = tx.send(Ok(Value::Null));
+                        if let Some((sent, waiter)) = io.pings.lock().unwrap().remove(&nonce) {
+                            let rtt = sent.elapsed();
+                            *io.rtt_ms.lock().unwrap() = Some(rtt.as_millis() as u64);
+                            if let Some(tx) = waiter {
+                                let _ = tx.send(rtt);
+                            }
                         }
                     }
                     Wire::Event(event) => {
@@ -333,10 +360,15 @@ async fn run_io<S>(
                 if idle > DEAD_AFTER {
                     break Err(format!("节点 {} 秒没有任何消息，判定为断线", idle.as_secs()));
                 }
+                // 清理长期未回应的空闲 ping，避免内存缓慢增长
+                io.pings
+                    .lock()
+                    .unwrap()
+                    .retain(|_, (sent, _)| sent.elapsed() <= DEAD_AFTER);
                 if idle > PING_AFTER {
                     idle_pings = idle_pings.wrapping_add(1);
                     let nonce = u64::MAX - idle_pings;
-                    io.pings.lock().unwrap().insert(nonce, Instant::now());
+                    io.pings.lock().unwrap().insert(nonce, (Instant::now(), None));
                     if channel.send(&Wire::Frame(Frame::Ping { nonce })).await.is_err() {
                         break Err("发送失败".into());
                     }
@@ -346,10 +378,11 @@ async fn run_io<S>(
         }
     };
     let reason = result.err().unwrap_or_default();
-    // 把等着的请求全部结束掉，免得调用方一直等
+    // 把等着的请求和 ping 全部结束掉，免得调用方一直等
     for (_, tx) in io.pending.lock().unwrap().drain() {
         let _ = tx.send(Err(reason.clone()));
     }
+    io.pings.lock().unwrap().clear();
     let _ = closed.send(Some(reason.clone()));
     let _ = channel.close().await;
 }
@@ -363,20 +396,37 @@ pub trait NodeAuth: Send + Sync + 'static {
     fn pending_psk(&self) -> Option<Psk>;
     /// 配对完成：保存新的长期密钥，配对码作废
     fn paired(&self, hub_id: &str, psk: Psk);
-    /// 已配对的控制端为另一台设备开放配对
+    /// 原子消费待配对槽位并落盘（防止同一一次性配对码被两个并发连接同时使用）
+    fn complete_pairing(
+        &self,
+        hub_id: &str,
+        _expected_pending: Psk,
+        new_psk: Psk,
+    ) -> Result<(), String> {
+        self.paired(hub_id, new_psk);
+        Ok(())
+    }
+    /// 记录一次配对失败（连续失败达到阈值时作废配对码）
+    fn record_pairing_failure(&self) {}
+    /// 已配对的控制端为另一台设备开放配对（默认有效期 [`PAIRING_TTL`]）
     fn allow_pairing(&self, code: &str);
+    /// 按指定有效期开放配对
+    fn allow_pairing_for(&self, code: &str, _ttl: Duration) {
+        self.allow_pairing(code);
+    }
 }
 
 /// [`NodeAuth`] 的现成实现：内存里的配对表，`persist` 负责落盘。
 pub struct NodeState {
     node_id: String,
     inner: Mutex<NodeInner>,
-    persist: Option<Box<dyn Fn(&str, Psk) + Send + Sync>>,
+    persist: Option<PersistFn>,
 }
 
 struct NodeInner {
     paired: HashMap<String, Psk>,
-    pending: Option<(Psk, Instant)>,
+    /// (待配对 PSK, 过期时刻, 失败次数)
+    pending: Option<(Psk, Instant, u32)>,
 }
 
 impl NodeState {
@@ -384,7 +434,7 @@ impl NodeState {
     pub fn new(
         node_id: String,
         paired: HashMap<String, Psk>,
-        persist: Option<Box<dyn Fn(&str, Psk) + Send + Sync>>,
+        persist: Option<PersistFn>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
@@ -408,7 +458,7 @@ impl NodeState {
             .unwrap()
             .pending
             .as_ref()
-            .is_some_and(|( _, until)| Instant::now() < *until)
+            .is_some_and(|(_, until, _)| Instant::now() < *until)
     }
 }
 
@@ -424,7 +474,7 @@ impl NodeAuth for NodeState {
     fn pending_psk(&self) -> Option<Psk> {
         let mut inner = self.inner.lock().unwrap();
         match inner.pending {
-            Some((psk, until)) if Instant::now() < until => Some(psk),
+            Some((psk, until, _)) if Instant::now() < until => Some(psk),
             Some(_) => {
                 inner.pending = None;
                 None
@@ -434,18 +484,61 @@ impl NodeAuth for NodeState {
     }
 
     fn paired(&self, hub_id: &str, psk: Psk) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.paired.insert(hub_id.to_string(), psk);
-        // 配对码只能用一次
-        inner.pending = None;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.paired.insert(hub_id.to_string(), psk);
+            // 配对码只能用一次
+            inner.pending = None;
+        }
+        // 释放内存锁后再落盘，避免磁盘 I/O 阻塞并发握手/查询
         if let Some(persist) = &self.persist {
             persist(hub_id, psk);
         }
     }
 
+    fn complete_pairing(
+        &self,
+        hub_id: &str,
+        expected_pending: Psk,
+        new_psk: Psk,
+    ) -> Result<(), String> {
+        if hub_id.trim().is_empty() {
+            return Err("控制端标识不能为空".into());
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.pending {
+                Some((psk, until, _)) if psk == expected_pending && Instant::now() < until => {
+                    inner.pending = None;
+                    inner.paired.insert(hub_id.to_string(), new_psk);
+                }
+                _ => return Err("配对码已失效或已被使用".into()),
+            }
+        }
+        if let Some(persist) = &self.persist {
+            persist(hub_id, new_psk);
+        }
+        Ok(())
+    }
+
+    fn record_pairing_failure(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((_, _, fails)) = inner.pending.as_mut() {
+            *fails += 1;
+            if *fails >= MAX_PAIR_FAILURES {
+                inner.pending = None;
+            }
+        }
+    }
+
     fn allow_pairing(&self, code: &str) {
+        self.allow_pairing_for(code, PAIRING_TTL);
+    }
+
+    fn allow_pairing_for(&self, code: &str, ttl: Duration) {
+        let ttl = ttl.clamp(Duration::from_secs(10), Duration::from_secs(3600));
         self.inner.lock().unwrap().pending =
-            Some((secure::psk_from_code(code), Instant::now() + PAIRING_TTL));
+            Some((secure::psk_from_code(code), Instant::now() + ttl, 0));
     }
 }
 
@@ -462,7 +555,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let guard = TurnGuard::new(Arc::clone(&service));
-    let result = serve_inner(&mut channel, auth, Arc::clone(&service), Arc::clone(&guard.turns)).await;
+    let result = serve_inner(
+        &mut channel,
+        auth,
+        Arc::clone(&service),
+        Arc::clone(&guard.turns),
+    )
+    .await;
     let _ = channel.close().await;
     // guard 在这里离开作用域：停掉这条连接上还在跑的对话
     result
@@ -505,18 +604,21 @@ async fn serve_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // ---- 握手 ----
-    let (hub_id, pairing) = match channel.recv().await? {
+    // ---- 握手（带超时防 Slowloris） ----
+    let first = tokio::time::timeout(crate::net::CONNECT_TIMEOUT, channel.recv())
+        .await
+        .map_err(|_| "等待握手请求超时".to_string())??;
+    let (hub_id, pairing_psk) = match first {
         Wire::Frame(Frame::Hello(hello)) => {
             if hello.node_id != auth.node_id() {
-                let e = format!("找错节点了：这里是 {}", auth.node_id());
+                let e = "找错节点了：节点身份不匹配".to_string();
                 reject(channel, &e).await;
                 return Err(e);
             }
-            let (psk, pairing) = match auth.paired_psk(&hello.hub_id) {
-                Some(psk) => (psk, false),
+            let (psk, pairing_psk) = match auth.paired_psk(&hello.hub_id) {
+                Some(psk) => (psk, None),
                 None => match auth.pending_psk() {
-                    Some(psk) => (psk, true),
+                    Some(psk) => (psk, Some(psk)),
                     None => {
                         let e = "这台机器还没有和该控制端配对".to_string();
                         reject(channel, &e).await;
@@ -524,14 +626,32 @@ where
                     }
                 },
             };
-            let responder = Responder::new(psk, &hello);
-            channel
-                .send(&Wire::Frame(Frame::HelloOk(responder.reply())))
-                .await?;
-            match channel.recv().await? {
+            let responder = match Responder::try_new(psk, &hello) {
+                Ok(r) => r,
+                Err(e) => {
+                    if pairing_psk.is_some() {
+                        auth.record_pairing_failure();
+                    }
+                    reject(channel, &e).await;
+                    return Err(e);
+                }
+            };
+            tokio::time::timeout(
+                crate::net::CONNECT_TIMEOUT,
+                channel.send(&Wire::Frame(Frame::HelloOk(responder.reply()))),
+            )
+            .await
+            .map_err(|_| "发送握手应答超时".to_string())??;
+            let confirm_frame = tokio::time::timeout(crate::net::CONNECT_TIMEOUT, channel.recv())
+                .await
+                .map_err(|_| "等待握手确认超时".to_string())??;
+            match confirm_frame {
                 Wire::Frame(Frame::Confirm(confirm)) => match responder.complete(&confirm) {
                     Ok(cipher) => channel.encrypt(cipher),
                     Err(e) => {
+                        if pairing_psk.is_some() {
+                            auth.record_pairing_failure();
+                        }
                         reject(channel, &e).await;
                         return Err(e);
                     }
@@ -542,7 +662,7 @@ where
                     return Err(e);
                 }
             }
-            (hello.hub_id, pairing)
+            (hello.hub_id, pairing_psk)
         }
         other => {
             let e = format!("应当先握手：{other:?}");
@@ -550,16 +670,23 @@ where
             return Err(e);
         }
     };
-    // 首次配对：第一件事实成长期密钥
-    if pairing {
-        match channel.recv().await? {
+    let pairing = pairing_psk.is_some();
+    // 首次配对：第一件事实成长期密钥（原子消费一次性配对码）
+    if let Some(expected_pending) = pairing_psk {
+        let rotate_frame = tokio::time::timeout(crate::net::CONNECT_TIMEOUT, channel.recv())
+            .await
+            .map_err(|_| "等待密钥轮换超时".to_string())??;
+        match rotate_frame {
             Wire::Frame(Frame::Rotate { psk }) => {
                 let psk: Psk = URL_SAFE_NO_PAD
                     .decode(&psk)
                     .map_err(|_| "新密钥编码不合法".to_string())?
                     .try_into()
                     .map_err(|_| "新密钥长度不对".to_string())?;
-                auth.paired(&hub_id, psk);
+                if let Err(e) = auth.complete_pairing(&hub_id, expected_pending, psk) {
+                    reject(channel, &e).await;
+                    return Err(e);
+                }
                 channel.send(&Wire::Frame(Frame::Rotated {})).await?;
             }
             other => {
@@ -572,6 +699,7 @@ where
 
     // ---- 请求 / 应答 ----
     let (out_tx, mut out_rx) = mpsc::channel::<Wire>(QUEUE);
+    let rpc_limit = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_RPCS));
 
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -588,17 +716,29 @@ where
                 last_rx = Instant::now();
                 match wire {
                     Wire::Frame(Frame::Request { id, method, params }) => {
-                        handle(
-                            id,
-                            method,
-                            params,
-                            conn,
-                            pairing,
-                            Arc::clone(&auth),
-                            Arc::clone(&service),
-                            out_tx.clone(),
-                            Arc::clone(&turns),
-                        );
+                        match Arc::clone(&rpc_limit).try_acquire_owned() {
+                            Ok(permit) => {
+                                handle(
+                                    id,
+                                    method,
+                                    params,
+                                    conn,
+                                    pairing,
+                                    Arc::clone(&auth),
+                                    Arc::clone(&service),
+                                    out_tx.clone(),
+                                    Arc::clone(&turns),
+                                    permit,
+                                );
+                            }
+                            Err(_) => {
+                                let _ = out_tx
+                                    .try_send(Wire::Frame(Frame::err(
+                                        id,
+                                        "并发请求过多，请稍后重试",
+                                    )));
+                            }
+                        }
                     }
                     Wire::Frame(Frame::Ping { nonce }) => {
                         channel.send(&Wire::Frame(Frame::Pong { nonce })).await?;
@@ -631,47 +771,82 @@ fn handle(
     service: Arc<Service>,
     out: mpsc::Sender<Wire>,
     turns: TurnSet,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     tokio::spawn(async move {
+        let _permit = permit;
         // 靠配对码连上来的这一次连接不能为别的设备开放配对
-        let result = if method == "pair.allow" {
+        let result: Result<Value, String> = if method == "pair.allow" {
             if pairing {
                 Err("只有已配对的控制端才能开放配对".into())
             } else {
-                match params["code"].as_str().filter(|c| c.len() >= 8) {
+                match params["code"]
+                    .as_str()
+                    .and_then(|c| secure::normalize_pairing_code(c).ok().map(|_| c))
+                {
                     Some(code) => {
                         auth.allow_pairing(code);
                         Ok(json!({}))
                     }
-                    None => Err("配对码不合法".into()),
+                    None => Err("配对码不合法（去掉连字符后至少 12 位字母或数字）".into()),
                 }
             }
         } else {
             let mut params = params;
             // 对话标识带上连接序号：不同控制端的会话号可能相同，不能撞在一起
+            let mut raw_turn_id: Option<String> = None;
             let turn_key = match &mut params {
                 Value::Object(map) if method == "turn.start" || method == "turn.stop" => {
-                    let key = format!(
-                        "{conn}:{}",
-                        map.get("turnId").and_then(Value::as_str).unwrap_or_default()
-                    );
-                    map.insert("turnId".into(), Value::String(key.clone()));
-                    key
+                    let raw = map
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if raw.is_empty() {
+                        String::new()
+                    } else {
+                        let key = format!("{conn}:{raw}");
+                        raw_turn_id = Some(raw);
+                        map.insert("turnId".into(), Value::String(key.clone()));
+                        key
+                    }
                 }
                 _ => String::new(),
             };
             let (tx, rx) = mpsc::channel::<TurnEvent>(QUEUE);
-            if method == "turn.start" {
-                turns.lock().unwrap().insert(turn_key.clone());
-                let (out, service) = (out.clone(), Arc::clone(&service));
-                let finished = Arc::clone(&turns);
-                let key = turn_key.clone();
-                tokio::spawn(async move {
-                    forward(rx, out, conn, key.clone(), service).await;
-                    finished.lock().unwrap().remove(&key);
-                });
+            let result = if (method == "turn.start" || method == "turn.stop") && turn_key.is_empty()
+            {
+                Err("缺少参数 turnId".into())
+            } else {
+                service.call(&method, &params, tx).await
+            };
+            // 先把 Response 发出去再启动 forward，确保事件不会早于 turn.start 响应到达；
+            // 且仅在 turn.start 成功时才登记与转发，避免重复 turnId 失败时误杀运行中的轮次。
+            match result {
+                Ok(mut res) => {
+                    if method == "turn.start" {
+                        if let (Some(raw), Value::Object(map)) = (raw_turn_id, &mut res) {
+                            map.insert("turnId".into(), Value::String(raw));
+                        }
+                        let _ = out.send(Wire::Frame(Frame::ok(id, res))).await;
+                        turns.lock().unwrap().insert(turn_key.clone());
+                        let (out, service) = (out.clone(), Arc::clone(&service));
+                        let finished = Arc::clone(&turns);
+                        let key = turn_key;
+                        tokio::spawn(async move {
+                            forward(rx, out, conn, key.clone(), service).await;
+                            finished.lock().unwrap().remove(&key);
+                        });
+                    } else {
+                        let _ = out.send(Wire::Frame(Frame::ok(id, res))).await;
+                    }
+                }
+                Err(error) => {
+                    let _ = out.send(Wire::Frame(Frame::err(id, error))).await;
+                }
             }
-            service.call(&method, &params, tx).await
+            return;
         };
         let frame = match result {
             Ok(result) => Frame::ok(id, result),
@@ -691,9 +866,8 @@ async fn forward(
 ) {
     let prefix = format!("{conn}:");
     while let Some(event) = rx.recv().await {
-        let event = event.map_turn_id(|id| {
-            id.strip_prefix(&prefix).unwrap_or(id.as_str()).to_string()
-        });
+        let event =
+            event.map_turn_id(|id| id.strip_prefix(&prefix).unwrap_or(id.as_str()).to_string());
         if out.send(Wire::Event(event)).await.is_err() {
             break;
         }
@@ -712,7 +886,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         std::mem::forget(dir);
         Service::new(ServiceOptions {
             name: Some("test".into()),
@@ -724,7 +899,10 @@ mod tests {
     fn auth(pairs: &[(&str, Psk)]) -> Arc<NodeState> {
         NodeState::new(
             "node-1".into(),
-            pairs.iter().map(|(id, psk)| (id.to_string(), *psk)).collect(),
+            pairs
+                .iter()
+                .map(|(id, psk)| (id.to_string(), *psk))
+                .collect(),
             None,
         )
     }
@@ -785,7 +963,12 @@ mod tests {
             .unwrap();
         assert!(ls["entries"].is_array());
         // 节点侧的错误原样带回
-        assert!(link.call("nope", json!({})).await.unwrap_err().contains("不支持请求"));
+        assert!(
+            link.call("nope", json!({}))
+                .await
+                .unwrap_err()
+                .contains("不支持请求")
+        );
 
         let mut events = link.subscribe();
         link.call(
@@ -794,12 +977,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(next_event(&mut events).await, TurnEvent::Session { ref r#ref, .. } if r#ref == "s1"));
+        assert!(
+            matches!(next_event(&mut events).await, TurnEvent::Session { ref r#ref, .. } if r#ref == "s1")
+        );
         assert_eq!(
             next_event(&mut events).await,
-            TurnEvent::Delta { turn_id: "5".into(), text: "远程".into() }
+            TurnEvent::Delta {
+                turn_id: "5".into(),
+                text: "远程".into()
+            }
         );
-        let TurnEvent::Finished { turn_id, text, cost_usd, .. } = next_event(&mut events).await else {
+        let TurnEvent::Finished {
+            turn_id,
+            text,
+            cost_usd,
+            ..
+        } = next_event(&mut events).await
+        else {
             panic!("应当以 Finished 收尾");
         };
         assert_eq!((turn_id.as_str(), text.as_str()), ("5", "远程回答"));
@@ -819,9 +1013,14 @@ mod tests {
     async fn wrong_psk_is_rejected() {
         let service = fake_agent(OK);
         // 两边都会发现密钥不一致：控制端验不过节点的应答
-        let err = connect(service, auth(&[("hub-1", secure::random_psk())]), secure::random_psk(), None)
-            .await
-            .unwrap_err();
+        let err = connect(
+            service,
+            auth(&[("hub-1", secure::random_psk())]),
+            secure::random_psk(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("预共享密钥不匹配"), "{err}");
     }
 
@@ -846,9 +1045,14 @@ mod tests {
         assert!(node.is_pairing_open());
 
         // 用配对码握手却不换密钥：节点不处理任何请求，直接断开
-        let sloppy = connect(Arc::clone(&service), Arc::clone(&node), secure::psk_from_code("K7QM-2X9P-4R8T-6WYZ"), None)
-            .await
-            .unwrap();
+        let sloppy = connect(
+            Arc::clone(&service),
+            Arc::clone(&node),
+            secure::psk_from_code("K7QM-2X9P-4R8T-6WYZ"),
+            None,
+        )
+        .await
+        .unwrap();
         let err = sloppy.call("sys.info", json!({})).await.unwrap_err();
         assert!(err.contains("先换成长期密钥"), "{err}");
         // 配对码没被消耗
@@ -865,17 +1069,30 @@ mod tests {
         .unwrap();
         assert_eq!(node.paired_count(), 1);
         assert!(!node.is_pairing_open(), "配对码只能用一次");
-        assert_eq!(link.call("sys.info", json!({})).await.unwrap()["name"], "test");
+        assert_eq!(
+            link.call("sys.info", json!({})).await.unwrap()["name"],
+            "test"
+        );
 
         // 之后用长期密钥连接
         let again = connect(Arc::clone(&service), Arc::clone(&node), long_term, None)
             .await
             .unwrap();
-        assert_eq!(again.call("sys.info", json!({})).await.unwrap()["name"], "test");
+        assert_eq!(
+            again.call("sys.info", json!({})).await.unwrap()["name"],
+            "test"
+        );
         // 配对码已经不能再用
-        assert!(connect(Arc::clone(&service), Arc::clone(&node), secure::psk_from_code("k7qm-2x9p-4r8t-6wyz"), Some(secure::random_psk()))
+        assert!(
+            connect(
+                Arc::clone(&service),
+                Arc::clone(&node),
+                secure::psk_from_code("k7qm-2x9p-4r8t-6wyz"),
+                Some(secure::random_psk())
+            )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     /// 配对码过期后失效
@@ -895,12 +1112,19 @@ mod tests {
         let service = fake_agent("sleep 30");
         let psk = secure::random_psk();
         let node = auth(&[("hub-1", psk)]);
-        let a = connect(Arc::clone(&service), Arc::clone(&node), psk, None).await.unwrap();
-        let b = connect(Arc::clone(&service), Arc::clone(&node), psk, None).await.unwrap();
+        let a = connect(Arc::clone(&service), Arc::clone(&node), psk, None)
+            .await
+            .unwrap();
+        let b = connect(Arc::clone(&service), Arc::clone(&node), psk, None)
+            .await
+            .unwrap();
         for link in [&a, &b] {
-            link.call("turn.start", json!({ "turnId": "1", "adapter": "claude-cli", "prompt": "hi" }))
-                .await
-                .unwrap();
+            link.call(
+                "turn.start",
+                json!({ "turnId": "1", "adapter": "claude-cli", "prompt": "hi" }),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(service.running_turns(), 2, "两条连接上同名会话应当都能启动");
         let mut a_events = a.subscribe();
@@ -915,7 +1139,10 @@ mod tests {
             "{event:?}"
         );
         a.call("turn.stop", json!({ "turnId": "1" })).await.unwrap();
-        assert!(matches!(next_event(&mut a_events).await, TurnEvent::Failed { .. }));
+        assert!(matches!(
+            next_event(&mut a_events).await,
+            TurnEvent::Failed { .. }
+        ));
         wait_until("全部停掉", || service.running_turns() == 0).await;
     }
 
@@ -927,12 +1154,18 @@ mod tests {
         let link = connect(Arc::clone(&service), auth(&[("hub-1", psk)]), psk, None)
             .await
             .unwrap();
-        link.call("turn.start", json!({ "turnId": "9", "adapter": "claude-cli", "prompt": "hi" }))
-            .await
-            .unwrap();
+        link.call(
+            "turn.start",
+            json!({ "turnId": "9", "adapter": "claude-cli", "prompt": "hi" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(service.running_turns(), 1);
         drop(link);
-        wait_until("对话随连接一起停掉", || service.running_turns() == 0).await;
+        wait_until("对话随连接一起停掉", || {
+            service.running_turns() == 0
+        })
+        .await;
         // 连接断了之后发起的请求会立刻失败，而不是一直等
         let psk2 = secure::random_psk();
         let link = connect(Arc::clone(&service), auth(&[("hub-1", psk2)]), psk2, None)
@@ -955,11 +1188,12 @@ mod tests {
         let link = connect(Arc::clone(&service), Arc::clone(&node), psk, None)
             .await
             .unwrap();
-        assert!(link
-            .call("pair.allow", json!({ "code": "short" }))
-            .await
-            .unwrap_err()
-            .contains("不合法"));
+        assert!(
+            link.call("pair.allow", json!({ "code": "short" }))
+                .await
+                .unwrap_err()
+                .contains("不合法")
+        );
         // 靠配对码连上来的连接不能开放配对：换一个只有配对码的节点状态验证
         link.call("pair.allow", json!({ "code": "ABCD-EFGH-JKLM-NPQR" }))
             .await
@@ -973,7 +1207,9 @@ mod tests {
             let ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
             let _ = serve(Channel::new(ws), node2, service2).await;
         });
-        let (ws, _) = tokio_tungstenite::client_async("ws://node/", client_io).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async("ws://node/", client_io)
+            .await
+            .unwrap();
         HubLink::handshake(
             Channel::new(ws),
             "hub-2",
@@ -997,7 +1233,9 @@ mod tests {
             let ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
             let _ = serve(Channel::new(ws), node, service).await;
         });
-        let (ws, _) = tokio_tungstenite::client_async("ws://node/", client_io).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async("ws://node/", client_io)
+            .await
+            .unwrap();
         let err = HubLink::handshake(Channel::new(ws), "hub-1", "node-2", psk, None)
             .await
             .unwrap_err();

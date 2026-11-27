@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
@@ -196,21 +196,30 @@ export default function Sessions() {
   const machineNames = Object.fromEntries((machines.data ?? []).map((m) => [m.id, m.name]));
   const machineName = (id: string | undefined) => (id && id !== "local" ? (machineNames[id] ?? id) : "本机");
 
-  // 工作目录默认为那台机器的主目录
+  // 工作目录默认为那台机器的主目录（仅在首次或切机时初始化，允许用户手动清空）
   const home = machine?.info?.home;
+  const initHomeNodeRef = useRef<string | null>(null);
   useEffect(() => {
-    if (home && !workdir) setWorkdir(home);
-  }, [home, workdir]);
+    if (home && initHomeNodeRef.current !== node) {
+      initHomeNodeRef.current = node;
+      setWorkdir((prev) => (prev ? prev : home));
+    }
+  }, [home, node]);
 
   // 换一台机器：模型清单与默认目录都跟着换
   const pickMachine = (id: string) => {
+    initHomeNodeRef.current = id;
     setNode(id);
     setModel("");
     setWorkdir(machines.data?.find((m) => m.id === id)?.info?.home ?? "");
   };
 
-  const cliAgents = agents.data?.filter(
-    (a) => a.nodeId === node && a.kind === "cli" && isChatAdapter(a.adapter),
+  const cliAgents = useMemo(
+    () =>
+      agents.data?.filter(
+        (a) => a.nodeId === node && a.kind === "cli" && isChatAdapter(a.adapter),
+      ),
+    [agents.data, node],
   );
   // 当前选中的 Agent 在本机不可用时，换成第一个可用的
   useEffect(() => {
@@ -269,12 +278,15 @@ export default function Sessions() {
         setStarting(true);
         const id = await chatStart(use, chosenModel || null, workdir.trim() || null, text, node);
         setStarting(false);
-        selectedRef.current = id;
-        setSelected(id);
+        if (selectedRef.current == null) {
+          selectedRef.current = id;
+          setSelected(id);
+        }
         // 清单里立刻有这个会话：头部才能显示它的机器、Agent 等信息
         qc.invalidateQueries({ queryKey: ["chatSessions"] });
-        pushSeenRef.current.delete(id);
-        if (!finishedRef.current.has(id)) updateRunning((ids) => [...ids, id]);
+        if (!finishedRef.current.has(id)) {
+          updateRunning((ids) => (ids.includes(id) ? ids : [...ids, id]));
+        }
         // 清单之外的模型记下来，下次直接出现在下拉里
         const list = models.data;
         if (chosenModel && list && !list.options.some((o) => o.value === chosenModel)) {
@@ -671,7 +683,7 @@ function Composer({
           value={value}
           onChange={(e) => onChange(e.currentTarget.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
               e.preventDefault();
               onSend();
             }

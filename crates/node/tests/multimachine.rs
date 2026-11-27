@@ -34,7 +34,10 @@ struct Process {
 
 impl Process {
     fn spawn(mut command: Command, name: &str) -> Self {
-        let mut child = command.stderr(Stdio::piped()).spawn().unwrap_or_else(|e| panic!("启动 {name}：{e}"));
+        let mut child = command
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("启动 {name}：{e}"));
         let log = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&log);
         let stderr = child.stderr.take().expect("标准错误");
@@ -103,7 +106,10 @@ struct Relay {
 fn start_relay(data_dir: &Path, processes: &mut Processes) -> Relay {
     let mut child = Process::spawn(
         {
-            let mut command = Command::new(bin("autoagents-relay", env!("CARGO_BIN_EXE_autoagents-relay")));
+            let mut command = Command::new(bin(
+                "autoagents-relay",
+                env!("CARGO_BIN_EXE_autoagents-relay"),
+            ));
             command
                 .args(["--listen", "127.0.0.1:0", "--data-dir"])
                 .arg(data_dir)
@@ -221,7 +227,10 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     let code = secure::pairing_code();
     let node_dir = tmp.path().join("node");
     start_agentd(&node_dir, &relay, Some(&code), &mut processes);
-    wait_for("机器出现在中继上", || watcher.online().borrow().len() == 1).await;
+    wait_for("机器出现在中继上", || {
+        watcher.online().borrow().len() == 1
+    })
+    .await;
     let node_id = watcher.online().borrow()[0].node_id.clone();
     assert_eq!(watcher.online().borrow()[0].name, "home-pc");
 
@@ -237,9 +246,14 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     assert!(wrong.is_err(), "配对码不对不该配上");
 
     // 配对：握手后立即换成长期密钥
-    let link = connect(&relay, &node_id, secure::psk_from_code(&code), Some(long_term))
-        .await
-        .unwrap_or_else(|e| panic!("凭配对码连不上：{e}\n{}", processes.dump()));
+    let link = connect(
+        &relay,
+        &node_id,
+        secure::psk_from_code(&code),
+        Some(long_term),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("凭配对码连不上：{e}\n{}", processes.dump()));
     let info = link.call("sys.info", json!({})).await.unwrap();
     assert_eq!(info["name"], "home-pc");
     assert_eq!(info["flavor"], "agentd");
@@ -278,11 +292,12 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     // 机器侧返回的是规范化之后的路径（macOS 上 /var 是 /private/var 的符号链接）
     let canonical = tmp.path().canonicalize().unwrap();
     assert_eq!(listed["path"], json!(canonical.to_string_lossy()));
-    assert!(link
-        .call("nope", json!({}))
-        .await
-        .unwrap_err()
-        .contains("不支持请求"));
+    assert!(
+        link.call("nope", json!({}))
+            .await
+            .unwrap_err()
+            .contains("不支持请求")
+    );
     assert!(link.ping().await.is_ok());
     link.close();
 
@@ -296,7 +311,10 @@ async fn a_machine_joins_through_a_real_relay_and_keeps_its_key_across_restarts(
     })
     .await;
     start_agentd(&node_dir, &relay, None, &mut processes);
-    wait_for("机器重新上线", || watcher.online().borrow().len() == 1).await;
+    wait_for("机器重新上线", || {
+        watcher.online().borrow().len() == 1
+    })
+    .await;
     assert_eq!(
         watcher.online().borrow()[0].node_id,
         node_id,

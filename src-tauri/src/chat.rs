@@ -4,10 +4,10 @@
 //! 过程事件汇入事件总线，由 [`dispatch`] 按会话归档：
 //! 推送 `chat-event` → 留一份实时快照 → 结束后落库。
 
+use crate::nodes;
+use crate::{AppState, events};
 use autoagents_core::adapters;
 use autoagents_core::runner::{TurnEvent, TurnParams};
-use crate::nodes;
-use crate::{events, AppState};
 use rusqlite::params;
 use serde::Serialize;
 use std::sync::Arc;
@@ -47,33 +47,32 @@ pub struct ChatMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ChatEvent {
-    #[serde(rename = "delta")]
     Delta {
         session_id: i64,
         text: String,
     },
     /// 过程提示（工具调用、思考等），不落库
-    #[serde(rename = "notice")]
     Notice {
         session_id: i64,
         text: String,
     },
     /// 本轮结束时的完整文本，前端用它校正流式预览
-    #[serde(rename = "replace")]
     Replace {
         session_id: i64,
         text: String,
     },
-    #[serde(rename = "done")]
     Done {
         session_id: i64,
         cost_usd: Option<f64>,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
     },
-    #[serde(rename = "error")]
     Error {
         session_id: i64,
         message: String,
@@ -166,16 +165,42 @@ fn insert_message(
     );
 }
 
+/// 内存中单轮流式预览的字节上限（避免超长输出 OOM）
+const LIVE_TEXT_LIMIT: usize = 512 * 1024;
+
 fn emit(state: &AppState, session_id: i64, event: ChatEvent) {
     // 同时留一份在内存里：窗口不可见时推送事件可能没有送达，界面会据此校正状态
-    if let Ok(mut live) = state.live.lock() {
-        if let Some(turn) = live.get_mut(&session_id) {
-            match &event {
-                ChatEvent::Delta { text, .. } => turn.text.push_str(text),
-                ChatEvent::Notice { text, .. } => turn.activity = Some(text.clone()),
-                ChatEvent::Replace { text, .. } => turn.text = text.clone(),
-                _ => {}
+    if let Ok(mut live) = state.live.lock()
+        && let Some(turn) = live.get_mut(&session_id)
+    {
+        match &event {
+            ChatEvent::Delta { text, .. } => {
+                if turn.text.len() < LIVE_TEXT_LIMIT {
+                    let remain = LIVE_TEXT_LIMIT - turn.text.len();
+                    if text.len() <= remain {
+                        turn.text.push_str(text);
+                    } else {
+                        let mut end = remain;
+                        while end > 0 && !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        turn.text.push_str(&text[..end]);
+                    }
+                }
             }
+            ChatEvent::Notice { text, .. } => turn.activity = Some(text.clone()),
+            ChatEvent::Replace { text, .. } => {
+                if text.len() <= LIVE_TEXT_LIMIT {
+                    turn.text = text.clone();
+                } else {
+                    let mut end = LIVE_TEXT_LIMIT;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    turn.text = text[..end].to_string();
+                }
+            }
+            _ => {}
         }
     }
     state.sink.send(event);
@@ -196,7 +221,14 @@ fn event_source(state: &AppState, node: &str, adapter: &str) -> String {
 }
 
 /// 记一条会话事件（活动页与仪表盘从这里读）
-fn record_event(state: &AppState, session_id: i64, kind: &str, level: &str, source: &str, message: &str) {
+fn record_event(
+    state: &AppState,
+    session_id: i64,
+    kind: &str,
+    level: &str,
+    source: &str,
+    message: &str,
+) {
     let db = state.db.lock().unwrap();
     events::record(
         &db,
@@ -208,10 +240,20 @@ fn record_event(state: &AppState, session_id: i64, kind: &str, level: &str, sour
     );
 }
 
-/// 本轮以失败收尾：写入系统消息、通知前端、从运行中摘掉
+/// 本轮以失败收尾：原子摘除运行态后写入系统消息、通知前端并回调
 fn fail(state: &AppState, session_id: i64, message: &str) {
+    if state.live.lock().unwrap().remove(&session_id).is_none() {
+        return;
+    }
     let (node, adapter) = session_where(state, session_id);
-    record_event(state, session_id, "session.failed", "warning", &event_source(state, &node, &adapter), message);
+    record_event(
+        state,
+        session_id,
+        "session.failed",
+        "warning",
+        &event_source(state, &node, &adapter),
+        message,
+    );
     insert_message(state, session_id, "system", message, Usage::default(), None);
     emit(
         state,
@@ -221,7 +263,6 @@ fn fail(state: &AppState, session_id: i64, message: &str) {
             message: message.to_string(),
         },
     );
-    state.live.lock().unwrap().remove(&session_id);
     turn_ended_hook(state, session_id, false);
 }
 
@@ -309,9 +350,14 @@ fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) 
         TurnEvent::Notice { text, .. } => {
             emit(state, session_id, ChatEvent::Notice { session_id, text })
         }
-        TurnEvent::System { message, .. } => {
-            insert_message(state, session_id, "system", &message, Usage::default(), None)
-        }
+        TurnEvent::System { message, .. } => insert_message(
+            state,
+            session_id,
+            "system",
+            &message,
+            Usage::default(),
+            None,
+        ),
         TurnEvent::Failed { message, .. } => fail(state, session_id, &message),
         TurnEvent::Finished {
             text,
@@ -326,14 +372,7 @@ fn handle(state: &Arc<AppState>, session_id: i64, node: &str, event: TurnEvent) 
                 output_tokens,
             };
             let elapsed = started.elapsed().as_millis() as i64;
-            insert_message(
-                state,
-                session_id,
-                "assistant",
-                &text,
-                usage,
-                Some(elapsed),
-            );
+            insert_message(state, session_id, "assistant", &text, usage, Some(elapsed));
             let (node, adapter) = session_where(state, session_id);
             let spent = match cost_usd {
                 Some(cost) => format!("≈ ${cost:.4}"),
@@ -378,7 +417,7 @@ fn thousands(n: i64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -782,7 +821,7 @@ pub async fn chat_stop(state: State<'_, Arc<AppState>>, session_id: i64) -> Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::testutil::{fake_agent, test_state, Collect, TestState};
+    use crate::testutil::{Collect, TestState, fake_agent, test_state};
     use autoagents_core::runner::BinaryResolver;
     use autoagents_core::service::{Service, ServiceOptions};
     use std::time::Duration;
@@ -812,7 +851,10 @@ mod tests {
     async fn settle(state: &AppState, session_id: i64) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while state.live.lock().unwrap().contains_key(&session_id) {
-            assert!(Instant::now() < deadline, "会话 #{session_id} 一直停在运行中");
+            assert!(
+                Instant::now() < deadline,
+                "会话 #{session_id} 一直停在运行中"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -824,27 +866,54 @@ mod tests {
     async fn turn_streams_persists_and_settles() {
         let (_, service) = fake_agent(OK);
         let (state, collector) = chat_state(service);
-        let id = start(&state, None, "claude-cli", Some("glm-5.3"), Some("~"), "hi").await.unwrap();
+        let id = start(&state, None, "claude-cli", Some("glm-5.3"), Some("~"), "hi")
+            .await
+            .unwrap();
         settle(&state, id).await;
         let rows = rows(&state, id);
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("user", "hi"));
-        assert_eq!((rows[1].0.as_str(), rows[1].1.as_str()), ("assistant", "hello"));
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1.as_str()),
+            ("assistant", "hello")
+        );
         assert_eq!(rows[1].2, Some(0.02));
         assert!(rows[1].3.is_some(), "回答要带耗时");
 
         let events: Vec<ChatEvent> = collector.0.lock().unwrap().iter().cloned().collect();
-        let kinds: Vec<String> = events
+        let serialized: Vec<serde_json::Value> = events
             .iter()
-            .map(|e| serde_json::to_value(e).unwrap()["type"].as_str().unwrap().to_string())
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+        let kinds: Vec<String> = serialized
+            .iter()
+            .map(|v| v["type"].as_str().unwrap().to_string())
             .collect();
         // 增量只推给界面，不落库；结束时用完整文本校正
         assert_eq!(kinds, ["delta", "delta", "replace", "done"]);
+        // 契约回归：字段名必须是 camelCase（sessionId / costUsd / inputTokens / outputTokens）
+        assert!(
+            serialized
+                .iter()
+                .all(|v| v["sessionId"].as_i64() == Some(id))
+        );
+        assert_eq!(serialized[3]["costUsd"].as_f64(), Some(0.02));
+        assert_eq!(serialized[3]["inputTokens"].as_i64(), Some(5));
+        assert_eq!(serialized[3]["outputTokens"].as_i64(), Some(2));
         assert!(events.iter().all(|e| e.session_id() == id));
-        let ChatEvent::Done { cost_usd, input_tokens, output_tokens, .. } = &events[3] else {
+        let ChatEvent::Done {
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            ..
+        } = &events[3]
+        else {
             panic!("最后一则应当是 Done：{events:?}");
         };
-        assert_eq!((*cost_usd, *input_tokens, *output_tokens), (Some(0.02), Some(5), Some(2)));
+        assert_eq!(
+            (*cost_usd, *input_tokens, *output_tokens),
+            (Some(0.02), Some(5), Some(2))
+        );
 
         let db = state.db.lock().unwrap();
         let (r#ref, node, model): (String, String, String) = db
@@ -854,7 +923,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((r#ref.as_str(), node.as_str(), model.as_str()), ("s1", "local", "glm-5.3"));
+        assert_eq!(
+            (r#ref.as_str(), node.as_str(), model.as_str()),
+            ("s1", "local", "glm-5.3")
+        );
     }
 
     /// 窗口不可见、事件全丢：靠 live 快照也能看到进度，结束后快照清空
@@ -862,29 +934,55 @@ mod tests {
     async fn live_snapshot_tracks_progress() {
         let (_, service) = fake_agent(OK);
         let (state, _) = chat_state(service);
-        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "hi")
+            .await
+            .unwrap();
         settle(&state, id).await;
         let running = live(&state);
-        assert!(running.is_empty(), "结束后不应再有运行中的会话：{running:?}");
+        assert!(
+            running.is_empty(),
+            "结束后不应再有运行中的会话：{running:?}"
+        );
     }
 
     #[tokio::test]
     async fn start_rejects_bad_input_without_creating_a_session() {
         let (bin, service) = fake_agent(OK);
         let (state, _) = chat_state(service);
-        assert!(start(&state, None, "zcode", None, None, "hi").await.unwrap_err().contains("适配"));
-        assert!(start(&state, None, "claude-cli", None, None, "  ").await.unwrap_err().contains("不能为空"));
+        assert!(
+            start(&state, None, "zcode", None, None, "hi")
+                .await
+                .unwrap_err()
+                .contains("适配")
+        );
+        assert!(
+            start(&state, None, "claude-cli", None, None, "  ")
+                .await
+                .unwrap_err()
+                .contains("不能为空")
+        );
         let missing = bin.parent().unwrap().join("no-such-dir");
-        let err = start(&state, None, "claude-cli", None, Some(&missing.to_string_lossy()), "hi")
-            .await
-            .unwrap_err();
+        let err = start(
+            &state,
+            None,
+            "claude-cli",
+            None,
+            Some(&missing.to_string_lossy()),
+            "hi",
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("工作目录不存在"), "{err}");
-        assert!(start(&state, Some("nope"), "claude-cli", None, None, "hi")
-            .await
-            .unwrap_err()
-            .contains("不在线"));
+        assert!(
+            start(&state, Some("nope"), "claude-cli", None, None, "hi")
+                .await
+                .unwrap_err()
+                .contains("不在线")
+        );
         let db = state.db.lock().unwrap();
-        let count: i64 = db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0)).unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0, "校验失败不应留下会话记录");
     }
 
@@ -895,25 +993,52 @@ mod tests {
         let echo = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' "{\"type\":\"result\",\"is_error\":false,\"result\":\"$*\"}""#;
         let (_, service) = fake_agent(echo);
         let (state, _) = chat_state(service);
-        let id = start(&state, None, "claude-cli", Some("glm-5.3"), None, "one").await.unwrap();
+        let id = start(&state, None, "claude-cli", Some("glm-5.3"), None, "one")
+            .await
+            .unwrap();
         settle(&state, id).await;
         assert!(send(&state, id, "two").await.is_ok());
         settle(&state, id).await;
         let history = rows(&state, id);
         assert_eq!(history.len(), 4, "两轮各一条用户消息、一条回答");
         assert!(history[1].1.contains("--model glm-5.3"), "{}", history[1].1);
-        assert!(!history[1].1.contains("--resume"), "首轮不应续聊：{}", history[1].1);
-        assert!(history[3].1.contains("--resume s1"), "续聊要带上会话标识：{}", history[3].1);
+        assert!(
+            !history[1].1.contains("--resume"),
+            "首轮不应续聊：{}",
+            history[1].1
+        );
+        assert!(
+            history[3].1.contains("--resume s1"),
+            "续聊要带上会话标识：{}",
+            history[3].1
+        );
         assert!(history[3].1.contains("--model glm-5.3"), "{}", history[3].1);
-        assert!(send(&state, 9999, "x").await.unwrap_err().contains("不存在"));
-        assert!(send(&state, id, " ").await.unwrap_err().contains("不能为空"));
+        assert!(
+            send(&state, 9999, "x")
+                .await
+                .unwrap_err()
+                .contains("不存在")
+        );
+        assert!(
+            send(&state, id, " ")
+                .await
+                .unwrap_err()
+                .contains("不能为空")
+        );
 
         // 运行中再发：拒绝，且不落用户消息
         let (_, slow) = fake_agent("sleep 30");
         let (state, _) = chat_state(slow);
-        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "slow")
+            .await
+            .unwrap();
         assert!(state.live.lock().unwrap().contains_key(&id));
-        assert!(send(&state, id, "again").await.unwrap_err().contains("还在运行"));
+        assert!(
+            send(&state, id, "again")
+                .await
+                .unwrap_err()
+                .contains("还在运行")
+        );
         assert_eq!(rows(&state, id).len(), 1);
         stop(&state, id).await.unwrap();
         settle(&state, id).await;
@@ -927,11 +1052,19 @@ mod tests {
 sleep 30"#;
         let (_, service) = fake_agent(partial);
         let (state, collector) = chat_state(service);
-        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "hi")
+            .await
+            .unwrap();
         // 等第一个增量到达再停
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if state.live.lock().unwrap().get(&id).is_some_and(|t| t.text == "部分") {
+            if state
+                .live
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|t| t.text == "部分")
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "没有收到增量");
@@ -941,8 +1074,14 @@ sleep 30"#;
         settle(&state, id).await;
         let history = rows(&state, id);
         assert_eq!(history.len(), 3, "{history:?}");
-        assert_eq!((history[1].0.as_str(), history[1].1.as_str()), ("system", "已停止：完整回答尚未生成，以上是已经产出的内容"));
-        assert_eq!((history[2].0.as_str(), history[2].1.as_str()), ("assistant", "部分"));
+        assert_eq!(
+            (history[1].0.as_str(), history[1].1.as_str()),
+            ("system", "已停止：完整回答尚未生成，以上是已经产出的内容")
+        );
+        assert_eq!(
+            (history[2].0.as_str(), history[2].1.as_str()),
+            ("assistant", "部分")
+        );
         let events = collector.0.lock().unwrap();
         assert!(events.iter().any(|e| matches!(e, ChatEvent::Done { .. })));
         assert!(!events.iter().any(|e| matches!(e, ChatEvent::Error { .. })));
@@ -956,7 +1095,9 @@ sleep 30"#;
             ..Default::default()
         });
         let (state, collector) = chat_state(service);
-        let id = start(&state, None, "codex-cli", None, None, "hi").await.unwrap();
+        let id = start(&state, None, "codex-cli", None, None, "hi")
+            .await
+            .unwrap();
         settle(&state, id).await;
         let rows = rows(&state, id);
         assert_eq!(rows.len(), 2);
@@ -975,10 +1116,15 @@ sleep 30"#;
         let (state, _) = chat_state(slow);
         // 逐次紧挨着发、停：机器侧还没来得及登记的那几次，停止要靠事后补发
         for _ in 0..5 {
-            let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+            let id = start(&state, None, "claude-cli", None, None, "slow")
+                .await
+                .unwrap();
             stop(&state, id).await.unwrap();
             settle(&state, id).await;
-            assert!(!state.live.lock().unwrap().contains_key(&id), "停止后不该留在运行中");
+            assert!(
+                !state.live.lock().unwrap().contains_key(&id),
+                "停止后不该留在运行中"
+            );
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         while state.service.running_turns() > 0 {
@@ -987,7 +1133,9 @@ sleep 30"#;
         }
 
         // 登记完之后才发现有人点过停止：照常补发
-        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "slow")
+            .await
+            .unwrap();
         wait_running(&state, 1).await;
         state
             .live
@@ -1002,7 +1150,9 @@ sleep 30"#;
         assert_eq!(state.service.running_turns(), 0);
 
         // 已经登记的一轮：点停止照常立即结束
-        let id = start(&state, None, "claude-cli", None, None, "slow").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "slow")
+            .await
+            .unwrap();
         wait_running(&state, 1).await;
         stop(&state, id).await.unwrap();
         settle(&state, id).await;
@@ -1022,14 +1172,20 @@ sleep 30"#;
     async fn back_to_back_turns_do_not_collide() {
         let (_, service) = fake_agent(OK);
         let (state, _) = chat_state(service);
-        let id = start(&state, None, "claude-cli", None, None, "one").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "one")
+            .await
+            .unwrap();
         for prompt in ["two", "three", "four"] {
             settle(&state, id).await;
             send(&state, id, prompt).await.unwrap();
             settle(&state, id).await;
         }
         let history = rows(&state, id);
-        assert_eq!(history.len(), 8, "四轮各一条用户消息、一条回答：{history:?}");
+        assert_eq!(
+            history.len(),
+            8,
+            "四轮各一条用户消息、一条回答：{history:?}"
+        );
         assert!(history.iter().all(|row| row.0 != "system"), "{history:?}");
     }
 
@@ -1038,7 +1194,9 @@ sleep 30"#;
     async fn stale_events_are_ignored() {
         let (_, service) = fake_agent("sleep 30");
         let (state, _) = chat_state(service);
-        let id = start(&state, None, "claude-cli", None, None, "hi").await.unwrap();
+        let id = start(&state, None, "claude-cli", None, None, "hi")
+            .await
+            .unwrap();
         let stale = TurnEvent::Finished {
             turn_id: "424242".into(),
             text: "迟到的".into(),
@@ -1067,7 +1225,13 @@ sleep 30"#;
             },
         });
         let deadline = Instant::now() + Duration::from_secs(5);
-        while state.live.lock().unwrap().get(&id).is_some_and(|t| t.text != "本机") {
+        while state
+            .live
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|t| t.text != "本机")
+        {
             assert!(Instant::now() < deadline, "本机的增量应当被采纳");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1075,7 +1239,11 @@ sleep 30"#;
         settle(&state, id).await;
         let db = state.db.lock().unwrap();
         let count: i64 = db
-            .query_row("SELECT count(*) FROM sessions WHERE id = 424242", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE id = 424242",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0);
     }

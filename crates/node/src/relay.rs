@@ -97,10 +97,10 @@ fn parse() -> Result<Options, String> {
     if !options.listen.contains(':') {
         options.listen = format!("{}:7000", options.listen);
     }
-    if let Some(public) = &options.public {
-        if !(public.starts_with("wss://") || public.starts_with("ws://")) {
-            return Err("--public 应以 wss://（或反向代理前的 ws://）开头".into());
-        }
+    if let Some(public) = &options.public
+        && !(public.starts_with("wss://") || public.starts_with("ws://"))
+    {
+        return Err("--public 应以 wss://（或反向代理前的 ws://）开头".into());
     }
     Ok(options)
 }
@@ -201,8 +201,9 @@ fn shutdown_signal() -> watch::Receiver<bool> {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("订阅 SIGTERM");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("订阅 SIGTERM");
             tokio::select! {
                 _ = ctrl_c => {}
                 _ = term.recv() => {}
@@ -215,6 +216,9 @@ fn shutdown_signal() -> watch::Receiver<bool> {
     rx
 }
 
+/// 最大并发 TCP 连接数（防 FD / 内存耗尽）
+const MAX_CONNECTIONS: usize = 1024;
+
 async fn serve(
     listener: TcpListener,
     kind: Kind,
@@ -223,25 +227,40 @@ async fn serve(
 ) -> Result<(), String> {
     shutdown.borrow_and_update();
     let health = Arc::new(health);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _peer) = accepted.map_err(|e| format!("接受连接失败：{e}"))?;
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // 瞬时 accept 错误（如 EMFILE / ECONNABORTED）不得让整个中继崩溃
+                        eprintln!("[relay] 接受连接失败（将退避重试）：{e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+                    eprintln!("[relay] 并发连接已达上限（{MAX_CONNECTIONS}），拒绝新连接");
+                    drop(stream);
+                    continue;
+                };
                 let task = match &kind {
                     Kind::Tls { relay, acceptor } => Task::Tls((Arc::clone(relay), acceptor.clone())),
                     Kind::Plain(relay) => Task::Plain(Arc::clone(relay)),
                 };
                 let health = Arc::clone(&health);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let result = match task {
                         Task::Tls((relay, acceptor)) => relay.handle_tls(stream, acceptor, &health).await,
                         Task::Plain(relay) => relay.handle_plain(stream, &health).await,
                     };
                     // 普通的 HTTP 请求（健康检查）已经回过应答，不算错误
-                    if let Err(e) = result {
-                        if e != net::PLAIN_HTTP {
-                            eprintln!("[relay] {e}");
-                        }
+                    if let Err(e) = result
+                        && e != net::PLAIN_HTTP
+                    {
+                        eprintln!("[relay] {e}");
                     }
                 });
             }
@@ -258,37 +277,38 @@ enum Task {
 fn load_or_create_token(path: &Path) -> Result<String, String> {
     match std::fs::read_to_string(path) {
         Ok(token) if !token.trim().is_empty() => Ok(token.trim().to_string()),
-        _ => {
+        Ok(_) => {
             let token = relay::generate_token();
-            write_private(path, token.as_bytes())?;
+            net::write_private(path, token.as_bytes())?;
             Ok(token)
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let token = relay::generate_token();
+            net::write_private(path, token.as_bytes())?;
+            Ok(token)
+        }
+        Err(e) => Err(format!("读取 {} 失败：{e}", path.display())),
     }
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("创建 {} 失败：{e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
-}
-
-/// 贴进 AutoAgents 的连接串：地址、证书指纹、令牌都在里面
+/// 贴进 AutoAgents 的连接串：地址、证书指纹、令牌都在里面（URL 编码防特殊字符截断）
 fn connect_string(public: &str, fingerprint: Option<&Fingerprint>, token: &str) -> String {
-    let mut text = format!("autoagents://relay?addr={public}&token={token}");
+    let encode = |raw: &str| -> String {
+        let mut out = String::with_capacity(raw.len());
+        for b in raw.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':' | b'/') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    };
+    let mut text = format!(
+        "autoagents://relay?addr={}&token={}",
+        encode(public),
+        encode(token)
+    );
     if let Some(fingerprint) = fingerprint {
         text.push_str(&format!("&fp={fingerprint}"));
     }

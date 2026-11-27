@@ -90,6 +90,9 @@ export default function ModelPicker({ options, custom, defaultModel, value, onCh
     <div className={`relative w-full ${className ?? "max-w-md"}`}>
       <input
         ref={inputRef}
+        role="combobox"
+        aria-expanded={open}
+        aria-autocomplete="list"
         value={text}
         data-testid={testid}
         onChange={(e) => {
@@ -105,7 +108,7 @@ export default function ModelPicker({ options, custom, defaultModel, value, onCh
             setActive((a) => Math.min(a + 1, items.length - 1));
           } else if (e.key === "ArrowUp") {
             e.preventDefault();
-            setActive((a) => Math.max(a - 1, 1));
+            setActive((a) => Math.max(a - 1, 0));
           } else if (e.key === "Enter") {
             e.preventDefault();
             confirm();
@@ -120,7 +123,10 @@ export default function ModelPicker({ options, custom, defaultModel, value, onCh
       />
 
       {open && (
-        <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl shadow-black/50">
+        <div
+          role="listbox"
+          className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl shadow-black/50"
+        >
           <Item active={active === 0} onPick={() => pick("")}>
             <span className="text-slate-300">默认</span>
             <span className="ml-2 truncate font-mono text-[11px] text-slate-500">
@@ -155,14 +161,12 @@ function Item({
   children: ReactNode;
 }) {
   return (
-    // 鼠标：用 onMouseDown 抢在输入框失焦之前选中；
-    // 键盘回车 / 辅助功能触发的是 click，也要响应
+    // onMouseDown 仅阻止输入框失焦，真正选中交给 onClick（避免拖拽离开仍误选）
     <button
       type="button"
-      onMouseDown={(e) => {
-        e.preventDefault();
-        onPick();
-      }}
+      role="option"
+      aria-selected={active}
+      onMouseDown={(e) => e.preventDefault()}
       onClick={onPick}
       className={`flex w-full items-baseline gap-1 px-3 py-1.5 text-left text-xs ${
         active ? "bg-sky-950/60 text-white" : "hover:bg-slate-800"

@@ -84,7 +84,7 @@ export default function DirPicker({
         {ls.data?.entries.map((entry) => (
           <button
             key={entry.name}
-            onClick={() => go(join(path, entry.name))}
+            onClick={() => go(join(ls.data?.path ?? path, entry.name))}
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-300 transition hover:bg-slate-800"
           >
             <span className="text-slate-500">📁</span>

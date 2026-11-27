@@ -21,8 +21,28 @@ use crate::tasks::{self, Task};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tauri::State;
+
+/// 工作流引擎运行时状态：按工作流 ID 串行化 advance / cancel，防止 10 秒轮询与命令并发触发重复步骤
+#[derive(Default)]
+pub struct WorkflowEngine {
+    locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl WorkflowEngine {
+    async fn lock(&self, wf_id: i64) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut map = self.locks.lock().unwrap();
+            Arc::clone(
+                map.entry(wf_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        mutex.lock_owned().await
+    }
+}
 
 /// 工作流的状态：pending 建好没启动；waiting 只剩人工门没处理
 pub const STATUSES: &[&str] = &[
@@ -256,10 +276,11 @@ struct WfRow {
     pr_number: Option<i64>,
     status: String,
     detail: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
-const WF_COLS: &str =
-    "id, name, template, repo, issue_number, issue_title, instructions, pr_number, status, detail";
+const WF_COLS: &str = "id, name, template, repo, issue_number, issue_title, instructions, pr_number, status, detail, created_at, updated_at";
 
 fn row_to_wf(row: &rusqlite::Row) -> rusqlite::Result<WfRow> {
     Ok(WfRow {
@@ -273,6 +294,8 @@ fn row_to_wf(row: &rusqlite::Row) -> rusqlite::Result<WfRow> {
         pr_number: row.get(7)?,
         status: row.get(8)?,
         detail: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -412,15 +435,8 @@ pub struct WorkflowView {
     pub steps: Vec<StepView>,
 }
 
-fn view(db: &Connection, wf: &WfRow) -> Result<WorkflowView, String> {
-    let (created_at, updated_at): (String, String) = db
-        .query_row(
-            "SELECT created_at, updated_at FROM workflows WHERE id = ?1",
-            params![wf.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(WorkflowView {
+fn view_with_steps(wf: &WfRow, steps: Vec<StepRow>) -> WorkflowView {
+    WorkflowView {
         id: wf.id,
         name: wf.name.clone(),
         template: wf.template.clone(),
@@ -431,10 +447,15 @@ fn view(db: &Connection, wf: &WfRow) -> Result<WorkflowView, String> {
         pr_number: wf.pr_number,
         status: wf.status.clone(),
         detail: wf.detail.clone(),
-        created_at,
-        updated_at,
-        steps: steps_of(db, wf.id)?.iter().map(StepRow::view).collect(),
-    })
+        created_at: wf.created_at.clone(),
+        updated_at: wf.updated_at.clone(),
+        steps: steps.iter().map(StepRow::view).collect(),
+    }
+}
+
+fn view(db: &Connection, wf: &WfRow) -> Result<WorkflowView, String> {
+    let steps = steps_of(db, wf.id)?;
+    Ok(view_with_steps(wf, steps))
 }
 
 fn load_view(db: &Connection, id: i64) -> Result<WorkflowView, String> {
@@ -564,6 +585,7 @@ pub async fn tick(state: &Arc<AppState>) {
 }
 
 async fn advance(state: &Arc<AppState>, wf_id: i64) -> Result<(), String> {
+    let _guard = state.workflow.lock(wf_id).await;
     let (wf, steps) = {
         let db = state.db.lock().unwrap();
         let wf = load_wf(&db, wf_id)?;
@@ -881,7 +903,7 @@ async fn start_session_step(
         state,
         Some(&step.conf_str("node_id")),
         &adapter,
-        step.config["model"].as_str().map(Into::into),
+        step.config["model"].as_str(),
         workdir.as_deref(),
         &prompt,
     )
@@ -901,7 +923,7 @@ async fn build_session_prompt(
     wf: &WfRow,
     step: &StepRow,
 ) -> Result<String, String> {
-    let mut prompt = step.config["prompt"]
+    let prompt = step.config["prompt"]
         .as_str()
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| "这一步没有提示词".to_string())?
@@ -990,16 +1012,29 @@ async fn build_session_prompt(
         ));
     }
 
-    for (placeholder, value) in [
-        ("{repo}", wf.repo.clone()),
-        ("{task}", task_desc),
-        ("{pr}", pr),
-        ("{diff}", diff),
-        ("{reviews}", reviews),
-    ] {
-        prompt = prompt.replace(placeholder, &value);
+    // 单遍扫描替换占位符，避免 diff / task 内容里出现 `{reviews}` 等字面量被二次展开
+    let replacements: [(&str, &str); 5] = [
+        ("{repo}", &wf.repo),
+        ("{task}", &task_desc),
+        ("{pr}", &pr),
+        ("{diff}", &diff),
+        ("{reviews}", &reviews),
+    ];
+    let mut rendered = String::with_capacity(prompt.len());
+    let mut rest = prompt.as_str();
+    while !rest.is_empty() {
+        if let Some((token, value)) = replacements
+            .iter()
+            .find(|(token, _)| rest.starts_with(token))
+        {
+            rendered.push_str(value);
+            rest = &rest[token.len()..];
+        } else if let Some(ch) = rest.chars().next() {
+            rendered.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
     }
-    Ok(prompt)
+    Ok(rendered)
 }
 
 /// 一个任务工作树里的全部改动（逐文件拼成 patch）
@@ -1051,10 +1086,9 @@ async fn recompute(state: &Arc<AppState>, wf_id: i64) -> Result<(), String> {
     let mut detail = Some(format!("进行中：{done}/{} 步完成", steps.len()));
     let mut event: Option<(&str, &str, String)> = None;
     if !all_terminal && any_waiting {
-        // 人工门开着：先等人，其余稍后再说
+        // 人工门开着：先等人，其余稍后再说（事件仅在状态首次切到 waiting 时记一次，避免 10 秒刷屏）
         status = "waiting";
         detail = Some("等你在候选方案里选一个".into());
-        event = Some(("workflow.gate", "warning", "等你处理人工步骤".into()));
     } else if all_terminal && any_done {
         // 都有了结局（软依赖的分支失败也算走完），只要有一路成了就是完成
         status = "done";
@@ -1074,18 +1108,19 @@ async fn recompute(state: &Arc<AppState>, wf_id: i64) -> Result<(), String> {
         detail = Some(clip(&reason, 300));
         event = Some(("workflow.failed", "warning", "所有步骤都没能完成".into()));
     } else if let Some(step) = steps.iter().find(|s| s.status == "failed") {
-        // 还有步骤没走完，但已经有失败：等收尾，状态先标成失败（软依赖会把能跑的继续跑完）
-        status = "failed";
-        detail = step.failure.clone();
-        event = Some((
-            "workflow.failed",
-            "warning",
-            format!("「{}」失败", step.name),
+        // 还有步骤在跑或待跑（例如竞争模式另一路还在跑）：保持 running，不能提前标 failed，
+        // 否则下一次 tick 会跳过整个工作流，导致软依赖门永远打不开。
+        detail = Some(format!(
+            "进行中：{done}/{} 步完成（「{}」失败，其余分支继续）",
+            steps.len(),
+            step.name
         ));
     }
     let db = state.db.lock().unwrap();
     set_wf_status(&db, wf_id, status, detail.as_deref())?;
-    if let Some((kind, level, message)) = event {
+    if status != wf.status
+        && let Some((kind, level, message)) = event
+    {
         record(&db, &wf, kind, level, &message);
     }
     Ok(())
@@ -1280,6 +1315,7 @@ pub async fn workflow_start(
 
 /// 取消：正在跑的任务与会话都停掉，没跑的步骤标记跳过
 pub async fn cancel(state: &Arc<AppState>, id: i64) -> Result<WorkflowView, String> {
+    let _guard = state.workflow.lock(id).await;
     let wf = {
         let db = state.db.lock().unwrap();
         let wf = load_wf(&db, id)?;
@@ -1428,17 +1464,79 @@ pub async fn workflow_retry(
     retry(state.inner(), id).await
 }
 
-#[tauri::command]
-pub fn workflow_list(state: State<'_, Arc<AppState>>) -> Result<Vec<WorkflowView>, String> {
-    let db = state.db.lock().unwrap();
-    let ids: Vec<i64> = db
-        .prepare_cached("SELECT id FROM workflows ORDER BY id DESC LIMIT 100")
-        .map_err(|e| e.to_string())?
-        .query_map([], |row| row.get(0))
+/// 批量加载最近 100 条工作流及其全部步骤（2 次查询，消除原先最高 301 次 SQL 的 N+1 阻塞）
+fn list_views(db: &Connection) -> Result<Vec<WorkflowView>, String> {
+    let mut stmt = db
+        .prepare_cached(&format!(
+            "SELECT {WF_COLS} FROM workflows ORDER BY id DESC LIMIT 100"
+        ))
+        .map_err(|e| e.to_string())?;
+    let wfs: Vec<WfRow> = stmt
+        .query_map([], row_to_wf)
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    ids.iter().map(|id| load_view(&db, *id)).collect()
+    if wfs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..wfs.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT workflow_id, {STEP_COLS} FROM workflow_steps WHERE workflow_id IN ({placeholders}) ORDER BY workflow_id, seq"
+    );
+    let mut step_stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
+    let id_params: Vec<rusqlite::types::Value> = wfs
+        .iter()
+        .map(|w| rusqlite::types::Value::Integer(w.id))
+        .collect();
+    let mut by_wf: HashMap<i64, Vec<StepRow>> = HashMap::new();
+    let rows = step_stmt
+        .query_map(rusqlite::params_from_iter(id_params), |row| {
+            let wf_id: i64 = row.get(0)?;
+            let depends_on: String = row.get(5)?;
+            let config: String = row.get(6)?;
+            Ok((
+                wf_id,
+                StepRow {
+                    id: row.get(1)?,
+                    seq: row.get(2)?,
+                    name: row.get(3)?,
+                    kind: row.get(4)?,
+                    depends_on: serde_json::from_str(&depends_on).unwrap_or_default(),
+                    config: serde_json::from_str(&config).unwrap_or_else(|_| json!({})),
+                    status: row.get(7)?,
+                    task_id: row.get(8)?,
+                    session_id: row.get(9)?,
+                    outcome: row.get(10)?,
+                    detail: row.get(11)?,
+                    failure: row.get(12)?,
+                    started_at: row.get(13)?,
+                    finished_at: row.get(14)?,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (wf_id, step) = row.map_err(|e| e.to_string())?;
+        by_wf.entry(wf_id).or_default().push(step);
+    }
+    Ok(wfs
+        .into_iter()
+        .map(|wf| {
+            let steps = by_wf.remove(&wf.id).unwrap_or_default();
+            view_with_steps(&wf, steps)
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn workflow_list(state: State<'_, Arc<AppState>>) -> Result<Vec<WorkflowView>, String> {
+    let state = Arc::clone(state.inner());
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.lock().unwrap();
+        list_views(&db)
+    })
+    .await
+    .map_err(|e| format!("读取工作流列表失败：{e}"))?
 }
 
 #[tauri::command]
@@ -1446,14 +1544,20 @@ pub fn workflow_get(state: State<'_, Arc<AppState>>, id: i64) -> Result<Workflow
     load_view(&state.db.lock().unwrap(), id)
 }
 
-/// 应用启动后调用：立刻做一次对账（重启时被中断的会话步骤会在这里判失败），然后定期推
+/// 应用启动后调用：立刻做一次对账（重启时被中断的会话步骤会在这里判失败），然后定期推（响应关闭信号优雅退出）
 pub fn start_polling(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    shutdown.borrow_and_update();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            tick(&state).await;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    tick(&state).await;
+                }
+                _ = shutdown.changed() => return,
+            }
         }
     });
 }
@@ -1612,6 +1716,7 @@ exit 7"#;
     }
 
     /// 建一个工作流（还没启动）
+    #[allow(clippy::too_many_arguments)]
     async fn make(
         state: &Arc<AppState>,
         template: &str,
@@ -1959,17 +2064,17 @@ exit 7"#;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while running.is_none() {
             assert!(std::time::Instant::now() < deadline, "第一步一直没启动");
-            let db = ts.state.db.lock().unwrap();
-            running = db
-                .query_row(
+            running = {
+                let db = ts.state.db.lock().unwrap();
+                db.query_row(
                     "SELECT s.task_id, t.session_id FROM workflow_steps s
                      JOIN tasks t ON t.id = s.task_id
                      WHERE s.workflow_id = ?1 AND s.seq = 1 AND t.session_id IS NOT NULL",
                     params![wf.id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )
-                .ok();
-            drop(db);
+                .ok()
+            };
             if running.is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -2085,7 +2190,7 @@ exit 7"#;
             std::fs::create_dir_all(workdir.parent().unwrap()).unwrap();
             assert!(
                 git(
-                    &workdir.parent().unwrap(),
+                    workdir.parent().unwrap(),
                     &["clone", "-q", remote.to_str().unwrap(), "greet"]
                 )
                 .status
@@ -2145,30 +2250,31 @@ exit 7"#;
                 .expect("评审阶段要给 AUTOAGENTS_RACE_DEMO_CHOSEN=<任务号>")
                 .parse()
                 .expect("任务号要是数字");
-            let db = state.db.lock().unwrap();
-            let gate_row: Option<(i64, i64)> = db.query_row(
-                "SELECT w.id, s.id FROM workflows w JOIN workflow_steps s ON s.workflow_id = w.id AND s.kind = 'gate'
-                 WHERE w.status IN ('running', 'waiting') ORDER BY w.id DESC LIMIT 1",
-                [], |r| Ok((r.get(0)?, r.get(1)?)),
-            ).optional().unwrap();
-            let (wf_id, gate_id) = match gate_row {
-                Some(pair) => pair,
-                None => {
-                    let wf_id: i64 = db
-                        .query_row(
-                            "SELECT id FROM workflows ORDER BY id DESC LIMIT 1",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .unwrap()
-                        .expect("没有工作流可评审");
-                    let wf = load_view(&db, wf_id).unwrap();
-                    println!("工作流 #{} 已经是 {}，不用再评审", wf.id, wf.status);
-                    return;
+            let (wf_id, gate_id) = {
+                let db = state.db.lock().unwrap();
+                let gate_row: Option<(i64, i64)> = db.query_row(
+                    "SELECT w.id, s.id FROM workflows w JOIN workflow_steps s ON s.workflow_id = w.id AND s.kind = 'gate'
+                     WHERE w.status IN ('running', 'waiting') ORDER BY w.id DESC LIMIT 1",
+                    [], |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional().unwrap();
+                match gate_row {
+                    Some(pair) => pair,
+                    None => {
+                        let wf_id: i64 = db
+                            .query_row(
+                                "SELECT id FROM workflows ORDER BY id DESC LIMIT 1",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .unwrap()
+                            .expect("没有工作流可评审");
+                        let wf = load_view(&db, wf_id).unwrap();
+                        println!("工作流 #{} 已经是 {}，不用再评审", wf.id, wf.status);
+                        return;
+                    }
                 }
             };
-            drop(db);
             let wf = gate(&state, wf_id, gate_id, chosen).await.unwrap();
             println!("=== 评审完成 ===");
             println!("工作流 #{} 状态：{}", wf.id, wf.status);

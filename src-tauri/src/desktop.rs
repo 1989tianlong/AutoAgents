@@ -33,17 +33,44 @@ fn mac_only() -> Result<(), String> {
     Err("桌面 Agent 的控制目前只支持 macOS".into())
 }
 
-/// 这个应用在跑吗：拿 .app 的完整路径去匹配进程命令行，只有它自己会命中
+/// 校验目标是合法的 `.app` 应用包目录
+fn validate_app_bundle(path: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("应用路径不合法".into());
+    }
+    let p = Path::new(trimmed);
+    if !p.is_absolute() || !trimmed.ends_with(".app") {
+        return Err(format!("仅允许操作 .app 应用包：{trimmed}"));
+    }
+    if !p.is_dir() || !p.join("Contents/Info.plist").is_file() {
+        return Err(format!("应用不在了或不是有效的 .app 包：{trimmed}"));
+    }
+    p.canonicalize()
+        .map_err(|e| format!("无法访问应用 {trimmed}：{e}"))
+}
+
+/// Tauri 命令入口：只允许操作本机发现清单里登记的桌面应用
+fn ensure_discovered_app(path: &str) -> Result<String, String> {
+    let target = validate_app_bundle(path)?;
+    let discovered = autoagents_core::discovery::desktop_apps();
+    for app in discovered {
+        if let Ok(canon) = Path::new(&app.path).canonicalize()
+            && canon == target
+        {
+            return Ok(app.path);
+        }
+    }
+    Err(format!("应用不在本机已发现的桌面 Agent 清单中：{path}"))
+}
+
+/// 这个应用在跑吗：用 sysinfo 对 `.app` 完整路径做精确字面匹配（不用正则 pgrep）
 #[cfg(target_os = "macos")]
 fn running(path: &str) -> bool {
-    let needle = format!("{path}/");
-    std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg(&needle)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    let Ok(bundle) = validate_app_bundle(path) else {
+        return false;
+    };
+    autoagents_core::machine::app_running(&bundle)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -54,11 +81,10 @@ fn running(_path: &str) -> bool {
 /// 启动桌面应用：`open -g -j` 后台启动、不抢焦点
 #[cfg(target_os = "macos")]
 fn launch_inner(path: &str) -> Result<(), String> {
-    if !Path::new(path).exists() {
-        return Err(format!("应用不在了：{path}"));
-    }
+    let bundle = validate_app_bundle(path)?;
     let out = std::process::Command::new("open")
-        .args(["-g", "-j", path])
+        .args(["-g", "-j", "--"])
+        .arg(&bundle)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("启动失败：{e}"))?;
@@ -76,31 +102,57 @@ fn launch_inner(_path: &str) -> Result<(), String> {
     Err("桌面 Agent 的控制目前只支持 macOS".into())
 }
 
-/// 退出桌面应用：先请它自己优雅退出（AppleScript），不奏效再按路径精确杀进程
+/// 退出桌面应用：先请它自己优雅退出（AppleScript 参数传递，防止脚本注入），不奏效再按精确路径逐 PID 终止
 #[cfg(target_os = "macos")]
 fn quit_inner(path: &str, name: &str) -> Result<(), String> {
-    if !running(path) {
+    let bundle = validate_app_bundle(path)?;
+    if !autoagents_core::machine::app_running(&bundle) {
         return Ok(());
     }
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &format!("tell application \"{name}\" to quit")])
-        .stdin(std::process::Stdio::null())
-        .output();
+    let clean_name = name.trim();
+    if !clean_name.is_empty() && !clean_name.chars().any(char::is_control) {
+        // 用 on run argv 传参防脚本注入，并限制 2 秒超时防 macOS 弹出 "Where is ...?" 对话框卡死
+        if let Ok(mut child) = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application \"System Events\"",
+                "-e",
+                "if (name of every process) contains (item 1 of argv) then tell application (item 1 of argv) to quit",
+                "-e",
+                "end tell",
+                "-e",
+                "end run",
+                "--",
+                clean_name,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            for _ in 0..20 {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
     // 给它一点时间自己退
     for _ in 0..20 {
-        if !running(path) {
+        if !autoagents_core::machine::app_running(&bundle) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    // 还不走：按 .app 路径精确匹配再杀（路径是唯一的，不会伤到别的进程）
-    let needle = format!("{path}/");
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", &needle])
-        .stdin(std::process::Stdio::null())
-        .output();
+    // 还不走：按 `.app` 路径精确字面匹配发 SIGTERM
+    autoagents_core::machine::terminate_app(&bundle);
     for _ in 0..20 {
-        if !running(path) {
+        if !autoagents_core::machine::app_running(&bundle) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -183,38 +235,64 @@ pub fn restart(state: &AppState, node_id: &str, path: &str, name: &str) -> Resul
 }
 
 #[tauri::command]
-pub fn desktop_states() -> Result<Vec<DesktopState>, String> {
-    states_inner()
+pub async fn desktop_states() -> Result<Vec<DesktopState>, String> {
+    tokio::task::spawn_blocking(states_inner)
+        .await
+        .map_err(|e| format!("读取桌面应用状态失败：{e}"))?
 }
 
 #[tauri::command]
-pub fn desktop_launch(
+pub async fn desktop_launch(
     state: State<'_, Arc<AppState>>,
     node_id: String,
     path: String,
     name: String,
 ) -> Result<(), String> {
-    launch(&state, &node_id, &path, &name)
+    let state = Arc::clone(state.inner());
+    tokio::task::spawn_blocking(move || {
+        local_only(&node_id)?;
+        mac_only()?;
+        let allowed = ensure_discovered_app(&path)?;
+        launch(&state, &node_id, &allowed, &name)
+    })
+    .await
+    .map_err(|e| format!("启动任务执行失败：{e}"))?
 }
 
 #[tauri::command]
-pub fn desktop_quit(
+pub async fn desktop_quit(
     state: State<'_, Arc<AppState>>,
     node_id: String,
     path: String,
     name: String,
 ) -> Result<(), String> {
-    quit(&state, &node_id, &path, &name)
+    let state = Arc::clone(state.inner());
+    tokio::task::spawn_blocking(move || {
+        local_only(&node_id)?;
+        mac_only()?;
+        let allowed = ensure_discovered_app(&path)?;
+        quit(&state, &node_id, &allowed, &name)
+    })
+    .await
+    .map_err(|e| format!("退出任务执行失败：{e}"))?
 }
 
 #[tauri::command]
-pub fn desktop_restart(
+pub async fn desktop_restart(
     state: State<'_, Arc<AppState>>,
     node_id: String,
     path: String,
     name: String,
 ) -> Result<(), String> {
-    restart(&state, &node_id, &path, &name)
+    let state = Arc::clone(state.inner());
+    tokio::task::spawn_blocking(move || {
+        local_only(&node_id)?;
+        mac_only()?;
+        let allowed = ensure_discovered_app(&path)?;
+        restart(&state, &node_id, &allowed, &name)
+    })
+    .await
+    .map_err(|e| format!("重启任务执行失败：{e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +306,7 @@ mod tests {
     use autoagents_core::service::{Service, ServiceOptions};
 
     /// 造一个最小的假 .app：可执行文件是个睡 60 秒的脚本
-    fn fake_app(dir: &std::path::PathBuf, label: &str) -> String {
+    fn fake_app(dir: &Path, label: &str) -> String {
         let app = dir.join(format!("Fake{label}.app"));
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();

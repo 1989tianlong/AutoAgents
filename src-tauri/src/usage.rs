@@ -3,7 +3,7 @@
 //! 所以费用与 token 分开统计，不互相折算。
 
 use crate::AppState;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,6 +87,13 @@ pub fn set_budget(db: &Connection, budget: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// 清除每日预算（恢复不限）
+pub fn clear_budget(db: &Connection) -> Result<(), String> {
+    db.execute("DELETE FROM settings WHERE key = ?1", params![BUDGET_KEY])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 今天（本地日）的全部 Agent 花费
 pub fn today_cost(db: &Connection) -> f64 {
     db.query_row(
@@ -110,7 +117,8 @@ pub fn over_budget(db: &Connection) -> Option<(f64, f64)> {
 }
 
 /// 只统计 Agent 的回答：用户消息与系统提示没有用量
-const ASSISTANT: &str = "FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.role = 'assistant'";
+const ASSISTANT: &str =
+    "FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.role = 'assistant'";
 
 fn buckets(
     db: &Connection,
@@ -203,10 +211,13 @@ fn summary(db: &Connection, days: u32) -> Result<UsageSummary, String> {
     let by_repo = buckets(
         db,
         &format!(
-            "SELECT COALESCE(t.repo, '（没有关联仓库）'), {BUCKET_COLS}
+            "SELECT COALESCE(t.repo, w.repo, '（没有关联仓库）'), {BUCKET_COLS}
              FROM messages m JOIN sessions s ON s.id = m.session_id
              LEFT JOIN tasks t ON t.session_id = s.id
-             WHERE m.role = 'assistant' GROUP BY t.repo ORDER BY 3 DESC LIMIT 20"
+             LEFT JOIN workflow_steps ws ON ws.session_id = s.id
+             LEFT JOIN workflows w ON w.id = COALESCE(t.workflow_id, ws.workflow_id)
+             WHERE m.role = 'assistant'
+             GROUP BY COALESCE(t.repo, w.repo) ORDER BY 3 DESC LIMIT 20"
         ),
         &|row| row.get(0),
     )?;
@@ -216,8 +227,9 @@ fn summary(db: &Connection, days: u32) -> Result<UsageSummary, String> {
             "SELECT r.name, {BUCKET_COLS}
              FROM messages m
              JOIN sessions s ON s.id = m.session_id
-             JOIN tasks t ON t.session_id = s.id AND t.workflow_id IS NOT NULL
-             JOIN workflows w ON w.id = t.workflow_id
+             LEFT JOIN tasks t ON t.session_id = s.id AND t.workflow_id IS NOT NULL
+             LEFT JOIN workflow_steps ws ON ws.session_id = s.id
+             JOIN workflows w ON w.id = COALESCE(t.workflow_id, ws.workflow_id)
              JOIN rule_runs rr ON rr.workflow_id = w.id
              JOIN rules r ON r.id = rr.rule_id
              WHERE m.role = 'assistant' GROUP BY r.id ORDER BY 3 DESC LIMIT 20"
@@ -282,14 +294,24 @@ fn buckets_day(db: &Connection, days: u32) -> Result<Vec<UsageDay>, String> {
         .map_err(|e| e.to_string())?
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
+    // 单次递归 CTE 生成连续日期序列，避免 N 次 SQL 往返
     let mut label = db
-        .prepare_cached("SELECT date('now', 'localtime', ?1)")
+        .prepare_cached(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT ?1
+                 UNION ALL
+                 SELECT n - 1 FROM seq WHERE n > 0
+             )
+             SELECT date('now', 'localtime', '-' || n || ' days') FROM seq",
+        )
         .map_err(|e| e.to_string())?;
-    let mut list = Vec::with_capacity(days as usize);
-    for back in (0..days).rev() {
-        let day: String = label
-            .query_row(params![format!("-{back} days")], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
+    let day_labels: Vec<String> = label
+        .query_map(params![days as i64 - 1], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut list = Vec::with_capacity(day_labels.len());
+    for day in day_labels {
         let (turns, cost_usd, tokens) = found.get(&day).copied().unwrap_or_default();
         list.push(UsageDay {
             day,
@@ -302,12 +324,18 @@ fn buckets_day(db: &Connection, days: u32) -> Result<Vec<UsageDay>, String> {
 }
 
 #[tauri::command]
-pub fn usage_summary(
+pub async fn usage_summary(
     state: State<'_, Arc<AppState>>,
     days: Option<u32>,
 ) -> Result<UsageSummary, String> {
-    let db = state.db.lock().unwrap();
-    summary(&db, days.unwrap_or(14))
+    let state = Arc::clone(state.inner());
+    let days = days.unwrap_or(14);
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.lock().unwrap();
+        summary(&db, days)
+    })
+    .await
+    .map_err(|e| format!("统计用量失败：{e}"))?
 }
 
 /// 设每日预算（美元）。超了之后自动化（规则触发、守护修复）不再自动开工，只记事件
@@ -317,13 +345,19 @@ pub fn usage_budget_set(state: State<'_, Arc<AppState>>, budget: f64) -> Result<
     set_budget(&db, budget)
 }
 
+/// 清除每日预算限制
+#[tauri::command]
+pub fn usage_budget_clear(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let db = state.db.lock().unwrap();
+    clear_budget(&db)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::automation;
     use crate::secrets::SecretStore;
-    use crate::testutil::{fake_agent, test_state, TestState};
-
+    use crate::testutil::{TestState, fake_agent, test_state};
 
     /// 直接往库里塞一条有花费的助手消息（今天，本地时区）
     fn seed_cost(db: &Connection, cost: f64, repo: Option<&str>, workflow: Option<i64>) {
@@ -354,7 +388,7 @@ mod tests {
         }
         db.execute(
             "INSERT INTO messages (session_id, role, content, cost_usd, input_tokens, output_tokens, created_at)
-             VALUES (?1, 'assistant', 'ok', ?2, 10, 5, datetime('now', 'localtime'))",
+             VALUES (?1, 'assistant', 'ok', ?2, 10, 5, datetime('now'))",
             params![session, cost],
         )
         .unwrap();
@@ -395,7 +429,12 @@ mod tests {
                 .iter()
                 .any(|b| b.name == "octo/other" && (b.cost_usd - 0.02).abs() < 1e-9)
         );
-        assert!(summary.by_repo.iter().any(|b| b.name.contains("没有关联仓库")));
+        assert!(
+            summary
+                .by_repo
+                .iter()
+                .any(|b| b.name.contains("没有关联仓库"))
+        );
         assert_eq!(summary.by_rule.len(), 1, "{:?}", summary.by_rule);
         assert_eq!(summary.by_rule[0].name, "盯标签");
         assert!((summary.by_rule[0].cost_usd - 0.06).abs() < 1e-9);
@@ -466,7 +505,10 @@ mod tests {
     async fn settle(state: &Arc<AppState>, id: i64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while state.live.lock().unwrap().contains_key(&id) {
-            assert!(std::time::Instant::now() < deadline, "会话 #{id} 一直停在运行中");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "会话 #{id} 一直停在运行中"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -492,19 +534,35 @@ mod tests {
     async fn turns_are_audited_and_counted() {
         let service = fake_agent(OK).1;
         let TestState { state, .. } = test_state(service);
-        let id = crate::chat::start(&state, None, "claude-cli", None, None, "audit me").await.unwrap();
+        let id = crate::chat::start(&state, None, "claude-cli", None, None, "audit me")
+            .await
+            .unwrap();
         settle(&state, id).await;
         {
             let db = state.db.lock().unwrap();
             assert_eq!(
                 events(&db),
                 [
-                    ("session.started".into(), "info".into(), "本机 · claude-cli".into(), "#/sessions?s=1".into()),
-                    ("session.finished".into(), "info".into(), "本机 · claude-cli".into(), "#/sessions?s=1".into()),
+                    (
+                        "session.started".into(),
+                        "info".into(),
+                        "本机 · claude-cli".into(),
+                        "#/sessions?s=1".into()
+                    ),
+                    (
+                        "session.finished".into(),
+                        "info".into(),
+                        "本机 · claude-cli".into(),
+                        "#/sessions?s=1".into()
+                    ),
                 ]
             );
             let message: String = db
-                .query_row("SELECT message FROM events WHERE kind = 'session.finished'", [], |row| row.get(0))
+                .query_row(
+                    "SELECT message FROM events WHERE kind = 'session.finished'",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
             assert!(message.contains("≈ $0.0200"), "{message}");
         }
@@ -524,7 +582,9 @@ mod tests {
         // 没能启动的一轮：以失败事件留痕
         let broken = crate::testutil::service_for(std::path::PathBuf::from("/no/such/agent"), None);
         let TestState { state, .. } = test_state(broken);
-        let id = crate::chat::start(&state, None, "codex-cli", None, None, "will fail").await.unwrap();
+        let id = crate::chat::start(&state, None, "codex-cli", None, None, "will fail")
+            .await
+            .unwrap();
         settle(&state, id).await;
         let db = state.db.lock().unwrap();
         let kinds: Vec<String> = events(&db).into_iter().map(|row| row.0).collect();

@@ -8,14 +8,22 @@ import type { NodeStatusEvent } from "./types";
 export function useNodeEvents() {
   const qc = useQueryClient();
   useEffect(() => {
+    let cancelled = false;
     let un: UnlistenFn | undefined;
     listen<NodeStatusEvent>("node-event", () => {
+      if (cancelled) return;
       for (const key of ["machines", "agentsAll", "relayStatus"]) {
         qc.invalidateQueries({ queryKey: [key] });
       }
     })
-      .then((f) => (un = f))
+      .then((f) => {
+        if (cancelled) f();
+        else un = f;
+      })
       .catch(() => {});
-    return () => un?.();
+    return () => {
+      cancelled = true;
+      un?.();
+    };
   }, [qc]);
 }

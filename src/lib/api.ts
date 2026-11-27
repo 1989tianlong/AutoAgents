@@ -24,6 +24,7 @@ import type {
   MachineView,
   Metrics,
   ModelList,
+  NodeView,
   RelayStatusView,
   RelayView,
   Task,
@@ -141,7 +142,7 @@ export const chatLive = () => invoke<LiveTurn[]>("chat_live");
 // ---------- 机器 ----------
 
 export const machinesList = () => invoke<MachineView[]>("machines_list");
-export const nodesList = () => invoke<MachineView[]>("nodes_list");
+export const nodesList = () => invoke<NodeView[]>("nodes_list");
 
 /** 某台机器此刻的资源占用 */
 export const nodeMetrics = (nodeId: string) => invoke<Metrics>("node_metrics", { nodeId });
@@ -149,14 +150,6 @@ export const nodeMetrics = (nodeId: string) => invoke<Metrics>("node_metrics", {
 /** 列出某台机器上的子目录（远程选择工作目录用） */
 export const nodeLs = (nodeId: string, path: string) =>
   invoke<LsResult>("node_ls", { nodeId, path });
-
-/** 在某台机器上的指定目录执行 git */
-export const nodeGit = (nodeId: string, workdir: string, args: string[]) =>
-  invoke<{ code: number | null; stdout: string; stderr: string }>("node_git", {
-    nodeId,
-    workdir,
-    args,
-  });
 
 export const relayGet = () => invoke<RelayView>("relay_get");
 export const relayClear = () => invoke<void>("relay_clear");
@@ -178,17 +171,17 @@ export const nodeInstallCommand = (name: string, allow: string[]) =>
 
 /** 与中继上一台在线、尚未配对的机器配对 */
 export const nodePair = (nodeId: string, code: string, name?: string | null) =>
-  invoke<MachineView>("node_pair", { nodeId, code, name });
+  invoke<NodeView>("node_pair", { nodeId, code, name });
 
 /** 直连配对：粘贴那台机器上 `agentd pair` 打印的连接串 */
-export const nodePairDirect = (text: string) => invoke<MachineView>("node_pair_direct", { text });
+export const nodePairDirect = (text: string) => invoke<NodeView>("node_pair_direct", { text });
 
 /** 让一台已配对的机器为另一台设备（另一台电脑上的 AutoAgents）开放配对 */
 export const nodeAuthorize = (nodeId: string) => invoke<string>("node_authorize", { nodeId });
 
 export const nodeRemove = (nodeId: string) => invoke<void>("node_remove", { nodeId });
 export const nodeRename = (nodeId: string, name: string) =>
-  invoke<MachineView>("node_rename", { nodeId, name });
+  invoke<NodeView>("node_rename", { nodeId, name });
 
 /** 立刻重连某台机器 */
 export const nodeConnectNow = (nodeId: string) => invoke<void>("node_connect_now", { nodeId });
@@ -368,7 +361,10 @@ export const automationScan = () => invoke<number>("automation_scan");
 export const inboxList = () => invoke<Inbox>("inbox_list");
 
 /** 合并任务的 PR：验收的最后一步，合并后任务自动标完成 */
-export const inboxMergePr = (taskId: number) => invoke<unknown>("inbox_merge_pr", { taskId });
+export const inboxMergePr = (taskId: number) => invoke<Task>("inbox_merge_pr", { taskId });
+
+/** 清除每日预算限制 */
+export const usageBudgetClear = () => invoke<void>("usage_budget_clear");
 
 // ---------------------------------------------------------------------------
 // 桌面 Agent 的进程控制（本机 macOS）

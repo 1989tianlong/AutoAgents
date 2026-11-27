@@ -75,7 +75,11 @@ fn claude_models(home: &Path) -> Loaded {
     let parsed = read(&home.join(".claude/settings.json"))
         .and_then(|text| serde_json::from_str::<Json>(&text).ok());
     let Some(v) = parsed else {
-        return (None, builtin_claude(), format!("{rel}（未找到，使用内置清单）"));
+        return (
+            None,
+            builtin_claude(),
+            format!("{rel}（未找到，使用内置清单）"),
+        );
     };
     let default = v["model"].as_str().map(str::to_string);
     let options: Vec<ModelOption> = v["modelPicker"]["options"]
@@ -119,7 +123,10 @@ fn codex_models(home: &Path) -> Loaded {
     let Some(cfg) = parsed else {
         return (None, Vec::new(), format!("{rel}（未找到）"));
     };
-    let default = cfg.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    let default = cfg
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
     let Some(catalog) = cfg.get("model_catalog_json").and_then(|p| p.as_str()) else {
         return (
             default,
@@ -191,34 +198,27 @@ async fn pi_models(home: &Path) -> Loaded {
     let mut default = None;
     if let Some(v) = read(&home.join(".pi/agent/settings.json"))
         .and_then(|text| serde_json::from_str::<Json>(&text).ok())
+        && let (Some(provider), Some(model)) =
+            (v["defaultProvider"].as_str(), v["defaultModel"].as_str())
     {
-        if let (Some(provider), Some(model)) = (
-            v["defaultProvider"].as_str(),
-            v["defaultModel"].as_str(),
-        ) {
-            default = Some(format!("{provider}/{model}"));
-        }
+        default = Some(format!("{provider}/{model}"));
     }
     let rel = "pi --list-models";
     let Some(bin) = adapters::resolve_binary("pi") else {
         return (default, Vec::new(), format!("{rel}（未找到 pi）"));
     };
-    let output = tokio::time::timeout(
-        LIST_MODELS_TIMEOUT,
-        Command::new(bin)
-            .arg("--list-models")
-            .env("PATH", discovery::child_path())
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await;
+    let mut cmd = Command::new(bin);
+    cmd.arg("--list-models")
+        .env("PATH", discovery::child_path())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(LIST_MODELS_TIMEOUT, cmd.output()).await;
     let Ok(Ok(output)) = output else {
-        return (
-            default,
-            Vec::new(),
-            format!("{rel}（执行超时或失败）"),
-        );
+        return (default, Vec::new(), format!("{rel}（执行超时或失败）"));
     };
+    if !output.status.success() {
+        return (default, Vec::new(), format!("{rel}（退出码异常）"));
+    }
     // 表格列：provider  model  context  max-out  thinking  images
     let options = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -226,13 +226,8 @@ async fn pi_models(home: &Path) -> Loaded {
             let mut cols = line.split_whitespace();
             let provider = cols.next()?;
             let model = cols.next()?;
-            (provider != "provider").then(|| {
-                opt(
-                    &format!("{provider}/{model}"),
-                    Some(model),
-                    Some(provider),
-                )
-            })
+            (provider != "provider")
+                .then(|| opt(&format!("{provider}/{model}"), Some(model), Some(provider)))
         })
         .collect();
     (default, options, rel.to_string())
@@ -262,7 +257,9 @@ mod tests {
     use super::*;
 
     fn opt_strs(list: &[ModelOption]) -> Vec<(&str, &str)> {
-        list.iter().map(|m| (m.value.as_str(), m.label.as_str())).collect()
+        list.iter()
+            .map(|m| (m.value.as_str(), m.label.as_str()))
+            .collect()
     }
 
     #[test]
@@ -348,7 +345,10 @@ default = "magpie/zai/glm-5.3"
         .unwrap();
         let (default, options, source) = codex_models(dir.path());
         assert_eq!(default.as_deref(), Some("workbuddy/deepseek-v4.1-flash"));
-        assert_eq!(opt_strs(&options), [("auto/glm-5.3-flash", "GLM-5.3-Flash")]);
+        assert_eq!(
+            opt_strs(&options),
+            [("auto/glm-5.3-flash", "GLM-5.3-Flash")]
+        );
         assert!(source.ends_with("catalog.json"), "{source}");
     }
 

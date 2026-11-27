@@ -153,6 +153,9 @@ export function Button({
   );
 }
 
+// 维护模态框栈：嵌套 Modal 时按 Esc 仅关闭最顶层对话框
+const modalStack: symbol[] = [];
+
 /** 对话框：点遮罩或按 Esc 关闭 */
 export function Modal({
   title,
@@ -168,11 +171,19 @@ export function Modal({
   width?: string;
 }) {
   useEffect(() => {
+    const id = Symbol("modal");
+    modalStack.push(id);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && modalStack[modalStack.length - 1] === id) {
+        onClose();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      const idx = modalStack.lastIndexOf(id);
+      if (idx >= 0) modalStack.splice(idx, 1);
+      window.removeEventListener("keydown", onKey);
+    };
   }, [onClose]);
   return (
     <div
@@ -180,12 +191,20 @@ export function Modal({
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         className={`w-full ${width} rounded-xl border border-slate-800 bg-slate-900 shadow-2xl`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-slate-800/80 px-5 py-3">
           <h2 className="text-sm font-medium text-white">{title}</h2>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-300">
+          <button
+            type="button"
+            aria-label="关闭"
+            onClick={onClose}
+            className="text-slate-500 hover:text-slate-300"
+          >
             ✕
           </button>
         </div>

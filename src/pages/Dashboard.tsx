@@ -154,8 +154,8 @@ export default function Dashboard() {
         <Card className="p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-medium text-slate-300">近 14 天用量</h2>
-            <Link to="/activity" className="text-xs text-sky-400 hover:text-sky-300">
-              活动记录 →
+            <Link to="/usage" className="text-xs text-sky-400 hover:text-sky-300">
+              用量详情 →
             </Link>
           </div>
           {usage.data && usage.data.turns === 0 ? (

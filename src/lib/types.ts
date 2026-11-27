@@ -491,6 +491,18 @@ export interface DeployStatus {
   cloudflare: DeployProviderStatus;
 }
 
+/** 远程节点详情（Rust `remote::NodeView`） */
+export interface NodeView {
+  id: string;
+  name: string;
+  online: boolean;
+  status: string;
+  relayUrl: string;
+  addr: string;
+  info: MachineInfo | null;
+  agents: DiscoveredAgent[];
+}
+
 /** 可以回滚到的一次部署 */
 export interface DeployHistoryItem {
   id: string;
@@ -500,6 +512,8 @@ export interface DeployHistoryItem {
   current: boolean;
   /** Workers：这一次部署用的版本 */
   versionId: string | null;
+  /** 最近一次健康检查结果 */
+  health: string | null;
 }
 
 // ---------- 工作流编排 ----------
@@ -566,7 +580,7 @@ export interface WorkflowTemplate {
 
 // ---------- 自动化规则 ----------
 
-export type RuleKind = "issue-label" | "new-pr";
+export type RuleKind = "issue-label" | "new-pr" | "pr-check-failed";
 
 export interface AutomationRule {
   id: number;

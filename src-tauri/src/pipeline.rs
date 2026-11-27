@@ -35,6 +35,60 @@ impl Pipeline {
     fn release(&self, id: i64) {
         self.busy.lock().unwrap().remove(&id);
     }
+
+    fn claim_guard(state: &Arc<AppState>, id: i64) -> Option<ClaimGuard> {
+        if state.pipeline.claim(id) {
+            Some(ClaimGuard {
+                state: Arc::clone(state),
+                id,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct ClaimGuard {
+    state: Arc<AppState>,
+    id: i64,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.state.pipeline.release(self.id);
+    }
+}
+
+fn validate_git_ref(name: &str, what: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("{what}格式不合法：{name}"));
+    }
+    Ok(())
+}
+
+fn validate_repo_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.starts_with("ext::")
+        || trimmed.contains('\0')
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(format!("仓库地址不合法：{url}"));
+    }
+    let ok = trimmed.starts_with("https://")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("git@");
+    if !ok {
+        return Err("仓库地址只支持 https://、ssh:// 或 git@ 形式".into());
+    }
+    Ok(())
 }
 
 /// 启动一个任务
@@ -194,6 +248,8 @@ pub async fn prepare_worktree(
         None if remote.is_empty() => return Err(format!("{repo_dir} 没有名为 origin 的远程仓库")),
         None => return Err(format!("{repo_dir} 的 origin（{remote}）不是 GitHub 仓库")),
     }
+    validate_git_ref(base, "基础分支")?;
+    validate_git_ref(branch, "任务分支")?;
     git_ok(
         state,
         node,
@@ -259,12 +315,16 @@ pub async fn clone_repo(
     if url.is_empty() || dir.is_empty() {
         return Err("请给出仓库地址和目标目录".into());
     }
+    validate_repo_url(url)?;
+    if dir.starts_with('-') || dir.contains('\0') {
+        return Err("目标目录格式不合法".into());
+    }
     let parent = Path::new(dir)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    git_ok(state, node, &parent, &["clone", url, dir], "克隆仓库")
+    git_ok(state, node, &parent, &["clone", "--", url, dir], "克隆仓库")
         .await
         .map_err(|e| {
             format!("{e}\n（那台机器上有权限访问这个仓库吗？SSH 地址需要它上面有对应的密钥）")
@@ -354,9 +414,9 @@ pub async fn start(
     if task.status == "running" {
         return Err("任务正在进行中；要从头来先停止它".into());
     }
-    if state.pipeline.busy.lock().unwrap().contains(&task_id) {
-        return Err("任务正在收尾，稍等一下再启动".into());
-    }
+    let Some(_guard) = Pipeline::claim_guard(state, task_id) else {
+        return Err("任务正在启动或收尾，稍等一下再试".into());
+    };
     let Some(repo) = task.repo.clone() else {
         return Err("这个任务没有关联仓库".into());
     };
@@ -420,6 +480,8 @@ pub async fn start(
             !state.live.lock().unwrap().contains_key(&session)
         };
         if settled {
+            // 先释放启动占坑，再由 after_turn 独占收尾
+            drop(_guard);
             let ok = last_is_answer(state, session);
             after_turn(state, task_id, ok).await?;
         }
@@ -440,22 +502,29 @@ pub async fn start(
 /// 会话里最后一条某种角色的消息；`role` 留空表示任意角色
 fn last_message(state: &AppState, session_id: i64, role: Option<&str>) -> Option<(String, String)> {
     let db = state.db.lock().unwrap();
-    let (sql, role) = match role {
-        Some(role) => (
-            "SELECT role, content FROM messages WHERE session_id = ?1 AND role = ?2 ORDER BY id DESC LIMIT 1",
-            Some(role.to_string()),
-        ),
-        None => (
-            "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-            None,
-        ),
+    let res = match role {
+        Some(role) => db
+            .query_row(
+                "SELECT role, content FROM messages WHERE session_id = ?1 AND role = ?2 ORDER BY id DESC LIMIT 1",
+                params![session_id, role],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional(),
+        None => db
+            .query_row(
+                "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional(),
     };
-    db.query_row(sql, params![session_id, role], |row| {
-        Ok((row.get(0)?, row.get(1)?))
-    })
-    .optional()
-    .ok()
-    .flatten()
+    match res {
+        Ok(val) => val,
+        Err(e) => {
+            eprintln!("[pipeline] 读取会话 #{session_id} 最后一条消息失败：{e}");
+            None
+        }
+    }
 }
 
 /// 会话里最后一条消息是不是 Agent 的回答（是：这一轮正常结束）
@@ -670,7 +739,19 @@ pub async fn diff_file(
         return Err("这个任务还没有启动过".into());
     };
     let path = path.trim();
-    if path.is_empty() || path.starts_with('-') {
+    if path.is_empty()
+        || path.starts_with('-')
+        || path.contains('\0')
+        || Path::new(path).is_absolute()
+        || Path::new(path).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
         return Err("文件路径不对".into());
     }
     let out = if untracked {
@@ -928,7 +1009,7 @@ pub async fn refresh(state: &Arc<AppState>, task_id: i64) -> Result<Task, String
             pr.success, pr.pending, pr.failure
         )
     };
-    {
+    let transitioned_to_done = {
         let db = state.db.lock().unwrap();
         db.execute(
             "UPDATE tasks SET checks = ?1, head_sha = ?2 WHERE id = ?3",
@@ -937,24 +1018,38 @@ pub async fn refresh(state: &Arc<AppState>, task_id: i64) -> Result<Task, String
         .map_err(|e| e.to_string())?;
         if pr.merged {
             let detail = format!("PR #{number} 已合并");
-            tasks::set_status(&db, task_id, "done", Some(&detail), None)?;
-            let task = tasks::load(&db, task_id)?;
-            tasks::record(&db, &task, "task.merged", "info", &detail);
+            // 原子判断：仅在首次从非 done 转为 done 时记录并触发自动部署，防止并发重复部署
+            let changed = db
+                .execute(
+                    "UPDATE tasks SET status = 'done', detail = ?1, failure = NULL, updated_at = datetime('now') \
+                     WHERE id = ?2 AND status != 'done'",
+                    params![&detail, task_id],
+                )
+                .map_err(|e| e.to_string())?;
+            if changed > 0 {
+                let task = tasks::load(&db, task_id)?;
+                tasks::record(&db, &task, "task.merged", "info", &detail);
+            }
+            changed > 0
         } else if pr.state == "closed" {
             let reason = format!("PR #{number} 被关闭了，没有合并");
             tasks::set_status(&db, task_id, "failed", None, Some(&reason))?;
             let task = tasks::load(&db, task_id)?;
             tasks::record(&db, &task, "task.failed", "warning", &reason);
+            false
         } else if task.status == "reviewing" {
             db.execute(
                 "UPDATE tasks SET detail = ?1 WHERE id = ?2",
                 params![format!("PR #{number} 等审查：{summary}"), task_id],
             )
             .map_err(|e| e.to_string())?;
+            false
+        } else {
+            false
         }
-    }
+    };
     // PR 合并了：开了「合并即部署」的部署目标自动发起部署（网络请求，放在锁外）
-    if pr.merged && !pr.base_branch.is_empty() {
+    if transitioned_to_done && !pr.base_branch.is_empty() {
         let sha = pr.merge_commit_sha.clone().or(Some(pr.head_sha.clone()));
         crate::deploy::on_pr_merged(state, &repo, &pr.base_branch, sha.as_deref()).await;
     }
@@ -1065,13 +1160,19 @@ async fn recover(state: &Arc<AppState>) {
     }
 }
 
-/// 应用启动后调用：补做被中断的收尾，然后定期刷新各个 PR
+/// 应用启动后调用：补做被中断的收尾，然后定期刷新各个 PR（响应关闭信号优雅退出）
 pub fn start_polling(state: Arc<AppState>) {
+    let mut shutdown = state.shutdown.subscribe();
+    shutdown.borrow_and_update();
     tauri::async_runtime::spawn(async move {
         recover(&state).await;
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let _ = refresh_all(&state).await;
+            tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => {
+                    let _ = refresh_all(&state).await;
+                }
+                _ = shutdown.changed() => return,
+            }
         }
     });
 }
@@ -1081,6 +1182,7 @@ pub fn start_polling(state: Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn task_start(
     state: State<'_, Arc<AppState>>,
     id: i64,
@@ -1314,17 +1416,18 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
             test_state(service_for(fake_script("claude", AGENT), None));
         *state.gh_api.lock().unwrap() = github.addr.clone();
         secrets.set("github_pat", "test-token").unwrap();
-        let db = state.db.lock().unwrap();
-        let issue_task = tasks::create_issue(
-            &db,
-            "加一句问候",
-            "o/r",
-            7,
-            "https://github.test/o/r/issues/7",
-        )
-        .unwrap()
-        .id;
-        drop(db);
+        let issue_task = {
+            let db = state.db.lock().unwrap();
+            tasks::create_issue(
+                &db,
+                "加一句问候",
+                "o/r",
+                7,
+                "https://github.test/o/r/issues/7",
+            )
+            .unwrap()
+            .id
+        };
         let opts = StartOptions {
             adapter: "claude-cli".into(),
             workdir: workdir.to_string_lossy().into_owned(),
@@ -1610,11 +1713,12 @@ printf '%s\n' '{"type":"result","is_error":false,"result":"新增了问候语，
         // 没有可用的 GitHub 接口：连不上一个不存在的地址
         *state.gh_api.lock().unwrap() = "http://127.0.0.1:9".to_string();
         secrets.set("github_pat", "test-token").unwrap();
-        let db = state.db.lock().unwrap();
-        let id = tasks::create_manual(&db, "不会成功", "o/r", "随便改改。")
-            .unwrap()
-            .id;
-        drop(db);
+        let id = {
+            let db = state.db.lock().unwrap();
+            tasks::create_manual(&db, "不会成功", "o/r", "随便改改。")
+                .unwrap()
+                .id
+        };
         let opts = StartOptions {
             adapter: "claude-cli".into(),
             workdir: workdir.to_string_lossy().into_owned(),
